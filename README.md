@@ -22,6 +22,13 @@ creative-agent review path/to/design.md --oracle sutton
 Exit codes: `0` clean/Info-only · `1` findings ≥ Major · `2` Blocker or charter-review STOP ·
 `3` review failed (incomplete verification log) · `4` config/oracle error · `5` unexpected error.
 
+Add `--verbose` (INFO) or `--debug` (every stage and LLM call, with durations), and
+`--log-format json` to emit one JSON object per line for a log store:
+
+```bash
+creative-agent --debug --log-format json review design.md --offline
+```
+
 ## Architecture
 
 ```
@@ -46,7 +53,16 @@ Three rules keep it modular:
 
 Copy `src/creative_agent/data/oracles/sutton.v2.yaml`, change `oracle_id`, edit the rows, and
 run `creative-agent oracles validate <name>`. Place overrides in `./data/oracles/` or point
-`CREATIVE_AGENT_ORACLE_SEARCH_PATHS` at a directory — packaged data is the fallback.
+`CREATIVE_AGENT_ORACLE_SEARCH_PATHS` at one or more directories — packaged data is the
+fallback. List-valued settings accept `a,b`, `a:b`, or JSON:
+
+```bash
+CREATIVE_AGENT_ORACLE_SEARCH_PATHS=/srv/oracles:/etc/oracles
+CREATIVE_AGENT_AGENT_TOOLS=Read,WebFetch
+```
+
+A second oracle needs **no code**: `tests/integration/test_cli_review.py::
+TestSecondOracleNeedsNoCode` runs a review against a non-sutton corpus to prove it.
 
 ## Adding a new agent
 

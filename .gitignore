@@ -24,3 +24,6 @@ config/settings.yaml
 
 # Review runtime artifacts (audit bundles are per-machine unless deliberately committed)
 docs/review-log/*/cycle-*/transcript.jsonl
+# Advisory lock files created by FileStateStore
+docs/review-log/.*.lock
+**/.*.md.tmp

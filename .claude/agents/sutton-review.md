@@ -26,8 +26,11 @@ the `creative-agent` harness — never re-implement or second-guess them.
    ```
 
    Use `--offline` only when no API access is available (deterministic checks only —
-   say so when reporting). Exit codes: 0 clean/Info · 1 ≥Major · 2 Blocker or
-   charter-review STOP · 3 review failed (incomplete verification log) · 4 config error.
+   say so when reporting). Add `--verbose` or `--debug` when diagnosing a surprising
+   verdict: every stage and LLM call is logged with its duration and outcome.
+
+   Exit codes: 0 clean/Info · 1 ≥Major · 2 Blocker or charter-review STOP · 3 review
+   failed (incomplete verification log) · 4 config/oracle error · 5 unexpected error.
 
 3. Relay the rendered report **unmodified**. Do not soften language, reorder findings,
    drop the verification log, or add praise — the report contract is authoritative and

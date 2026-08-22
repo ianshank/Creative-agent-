@@ -6,7 +6,32 @@
       "Bash(uv run pytest:*)",
       "Bash(uv run ruff:*)",
       "Bash(uv run mypy:*)",
-      "Bash(uv sync:*)"
+      "Bash(uv sync:*)",
+      "Bash(uv run lint-imports:*)",
+      "Bash(uv run python scripts/*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/session-start.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/validate-oracles.sh"
+          }
+        ]
+      }
     ]
   }
 }
