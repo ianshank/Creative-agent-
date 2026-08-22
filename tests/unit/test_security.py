@@ -206,6 +206,53 @@ class TestPathWithinRootsPredicate:
     def test_unresolvable_path_is_denied_not_raised(self) -> None:
         assert not is_path_within_roots("\x00bad", [Path("/tmp")])
 
+    def test_relative_path_is_joined_against_the_given_cwd(self, tmp_path: Path) -> None:
+        """A relative path must resolve against the tool call's own reported cwd, not
+        this process's cwd (`os.getcwd()`) — a mismatch there is a scoping bypass, not
+        just a wrong answer, since a tool call under a different cwd than this process
+        would otherwise resolve to an unintended location and be allowed or denied
+        incorrectly."""
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        (root / "doc.md").write_text("x", encoding="utf-8")
+        assert is_path_within_roots("doc.md", [root], cwd=str(root))
+
+    def test_relative_path_without_cwd_falls_back_to_process_cwd(self, tmp_path: Path) -> None:
+        """Documents the fallback: omitting `cwd` keeps the old (weaker) behavior rather
+        than raising, for callers that have no cwd to give."""
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        assert not is_path_within_roots("doc.md", [root])
+
+    def test_relative_path_escaping_via_wrong_cwd_is_denied(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        other_dir = tmp_path / "elsewhere"
+        other_dir.mkdir()
+        (other_dir / "secret.env").write_text("s3cret", encoding="utf-8")
+        assert not is_path_within_roots("secret.env", [root], cwd=str(other_dir))
+
+    def test_absolute_path_ignores_cwd_entirely(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        target = root / "doc.md"
+        target.write_text("x", encoding="utf-8")
+        assert is_path_within_roots(str(target), [root], cwd=str(tmp_path / "unrelated"))
+
+    def test_wrong_process_cwd_would_wrongly_allow_without_the_cwd_param(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The bypass this fix closes: if this process's own cwd happens to sit inside an
+        allowed root, a relative path from a tool call whose REAL cwd is elsewhere must
+        still resolve against that real cwd, not silently succeed because the process
+        cwd coincidentally matched a root."""
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        real_tool_cwd = tmp_path / "elsewhere"
+        real_tool_cwd.mkdir()
+        monkeypatch.chdir(root)
+        assert not is_path_within_roots("secret.env", [root], cwd=str(real_tool_cwd))
+
 
 class TestReadScoping:
     def test_roots_are_artifact_oracle_and_repo(self, tmp_path: Path) -> None:

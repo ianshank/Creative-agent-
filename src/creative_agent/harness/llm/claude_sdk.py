@@ -52,7 +52,10 @@ def _pre_tool_use_hook(prompt: AssembledPrompt) -> Any:
     not a fresh internal-host check, which would permit any public host rather than only
     the oracle- and artifact-derived set the model was told about in the system prompt.
     Read/Grep/Glob (DEC-F11b) are checked against the computed read roots; Grep/Glob's
-    `path` argument is optional and defaults to the session's cwd when absent.
+    `path` argument is optional and defaults to the session's cwd when absent. A relative
+    `path`/`file_path` is resolved against the tool call's own reported `cwd`, not this
+    process's — the two can differ, and resolving against the wrong one is a scoping
+    bypass, not just a wrong answer.
     """
 
     async def hook(
@@ -73,11 +76,9 @@ def _pre_tool_use_hook(prompt: AssembledPrompt) -> Any:
             )
             return _deny("WebFetch host is not in this review's computed allowlist")
         if tool_name in ("Read", "Grep", "Glob"):
-            target = next(
-                (tool_input[k] for k in _READ_PATH_KEYS if tool_input.get(k)),
-                input_data.get("cwd", ""),
-            )
-            if is_path_within_roots(str(target), prompt.allowed_read_roots):
+            cwd = str(input_data.get("cwd", ""))
+            target = next((tool_input[k] for k in _READ_PATH_KEYS if tool_input.get(k)), cwd)
+            if is_path_within_roots(str(target), prompt.allowed_read_roots, cwd=cwd):
                 return {}
             log_event(
                 _LOG,

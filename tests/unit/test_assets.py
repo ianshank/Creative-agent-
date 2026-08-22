@@ -128,8 +128,10 @@ class TestSkillContracts:
 
     def test_inspect_state_commands_actually_resolve(self) -> None:
         """A skill's prose is a claim, not a test — verify every command it names still
-        exists, the way TestHookBehaviour runs the real hooks instead of only checking
-        they're present. A renamed or removed subcommand would otherwise rot silently."""
+        exists by actually invoking it through the real Typer app (in-process, via
+        CliRunner), the same spirit as TestHookBehaviour running the real hooks instead of
+        only checking they're present. A renamed or removed subcommand would otherwise rot
+        silently."""
         _, body = parse_front_matter(CLAUDE_DIR / "skills" / "inspect-state" / "SKILL.md")
         pattern = r"creative-agent ([a-z]+(?:-[a-z]+)*(?: [a-z]+(?:-[a-z]+)*)?)"
         commands = sorted(set(re.findall(pattern, body)))

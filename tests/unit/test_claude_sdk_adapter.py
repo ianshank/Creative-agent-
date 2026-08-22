@@ -252,6 +252,28 @@ class TestPreToolUseReadEnforcement:
         )
         assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
 
+    async def test_relative_explicit_path_resolves_against_reported_cwd(
+        self, tmp_path: Path
+    ) -> None:
+        """A relative `path` argument must resolve against the SDK tool call's own
+        reported `cwd` — not this process's cwd. Getting this wrong is a scoping bypass:
+        a relative path allowed here because it happened to resolve against wherever
+        pytest itself was invoked from, rather than where the tool call actually ran."""
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        (root / "doc.md").write_text("x", encoding="utf-8")
+        hook = self._wired_hook(prompt().model_copy(update={"allowed_read_roots": [root]}))
+        result = await hook(
+            {
+                "tool_name": "Read",
+                "tool_input": {"file_path": "doc.md"},
+                "cwd": str(root),
+            },
+            "t1",
+            None,
+        )
+        assert result == {}
+
     async def test_grep_with_an_explicit_path_uses_it_over_cwd(self, tmp_path: Path) -> None:
         root = tmp_path / "artifact-dir"
         root.mkdir()
