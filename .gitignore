@@ -30,8 +30,10 @@ config/settings.yaml
 
 # Review runtime artifacts. Cycle state (docs/review-log/<id>.md) IS committed on
 # purpose: recurrence tracking and the cycle-3 escalation depend on its history. The
-# per-cycle audit bundles and lock files are machine-local.
-docs/review-log/*/cycle-*/transcript.jsonl
+# per-cycle audit bundles and lock files are machine-local — this previously named only
+# transcript.jsonl, so calls.json and tool-evidence.json were committed against the
+# stated intent. Ignore the bundle directories wholesale.
+docs/review-log/*/cycle-*/
 docs/review-log/.*.lock
 **/.*.md.tmp
 

@@ -7,6 +7,7 @@ list is the one place a module can quietly leave the gate.
 
 from __future__ import annotations
 
+import os
 import re
 import tomllib
 from pathlib import Path, PurePosixPath
@@ -16,6 +17,7 @@ import yaml
 from mutmut.configuration import Config
 from scripts.check_coverage_floors import APPROVED_OMITS, FLOORS
 
+from creative_agent.config import HarnessSettings
 from creative_agent.errors import ExitCode
 
 PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
@@ -152,6 +154,53 @@ class TestDocumentationIsHonest:
         config = (self.ROOT / ".gitleaks.toml").read_text(encoding="utf-8")
         assert "useDefault = true" in config, "a bespoke ruleset would miss known secrets"
         assert "sk-ant-" in config, "the one credential this project uses is unpinned"
+
+
+class TestTheSuiteDoesNotMutateTheRepository:
+    """A test that writes into the checkout corrupts the next run and gets committed.
+
+    This happened: `review_log_dir` defaults to `docs/review-log` relative to the
+    working directory, so integration tests invoking `review` wrote real state, audit
+    bundles, and a lock file into the repository, appending a cycle per run. Fourteen
+    cycles of it reached the pull request before anyone noticed.
+    """
+
+    ROOT = PYPROJECT.parent
+
+    def test_review_state_is_redirected_outside_the_checkout(self) -> None:
+        """Asserts the autouse isolation fixture in conftest is actually in effect."""
+        configured = os.environ.get("CREATIVE_AGENT_REVIEW_LOG_DIR")
+        assert configured, (
+            "the isolate_review_state fixture is not active; tests would write review "
+            "state into the repository"
+        )
+        assert not Path(configured).resolve().is_relative_to(self.ROOT), (
+            f"review state is directed at {configured}, inside the checkout"
+        )
+
+    def test_the_default_would_land_in_the_repository(self) -> None:
+        """The reason the fixture must exist — if this stops being true, say so there."""
+        assert HarnessSettings.model_fields["review_log_dir"].default == Path("docs/review-log")
+
+    @pytest.mark.parametrize(
+        "pattern",
+        ["docs/review-log/*/cycle-*/", "docs/review-log/.*.lock"],
+    )
+    def test_gitignore_covers_machine_local_review_artifacts(self, pattern: str) -> None:
+        """Audit bundles and lock files are per-machine; only `<id>.md` is committed."""
+        ignored = (self.ROOT / ".gitignore").read_text(encoding="utf-8")
+        assert pattern in ignored, f".gitignore no longer excludes {pattern}"
+
+    def test_only_the_placeholder_is_tracked_in_the_review_log(self) -> None:
+        """Catches leaked state at the point it would otherwise be committed."""
+        review_log = self.ROOT / "docs/review-log"
+        if not review_log.is_dir():  # pragma: no cover - present in every checkout
+            pytest.skip("no review-log directory")
+        stray = [p.name for p in review_log.iterdir() if p.name != ".gitkeep"]
+        assert not stray, (
+            f"review state escaped into the repository: {sorted(stray)}; a test is "
+            "writing to the default review_log_dir"
+        )
 
 
 class TestCiWorkflowIsWired:

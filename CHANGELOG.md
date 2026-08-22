@@ -91,6 +91,15 @@ regression test.
 
 ### Changed
 
+- **The test suite no longer writes into the repository.** `review_log_dir` defaults to
+  `docs/review-log` resolved against the working directory, which under pytest is the
+  checkout, so integration tests invoking `review` wrote real state, audit bundles, and
+  a lock file into the developer's tree and appended a cycle on every run. Fourteen
+  cycles of it had been committed. An autouse fixture now redirects review state to a
+  temporary directory, four tests guard the mechanism and the outcome, and `.gitignore`
+  excludes the whole per-cycle bundle directory rather than only `transcript.jsonl` —
+  which is what its comment already claimed.
+
 - **Doctrine is fully data.** Impersonation patterns, decision-log grammar, consistency
   tuning, blocker tiers, pseudo-gates, required-section support kinds, the placeholder
   row id, and the offline artifact class all moved from code into oracle fields. A second
