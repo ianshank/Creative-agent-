@@ -91,7 +91,7 @@ make gate            # everything CI runs, fail-fast
 make format          # apply ruff fixes and formatting
 make test            # suite + branch coverage gate
 make live            # live Claude Agent SDK tests (needs ANTHROPIC_API_KEY)
-make mutation        # mutation testing over the enforcement core (slow, advisory)
+make mutation        # mutation testing over the enforcement core (slow, real kill-rate gate)
 make secrets         # gitleaks scan
 make assets          # validate the Claude Code agents, skills and hooks
 ```

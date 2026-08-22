@@ -84,12 +84,30 @@ and adding it retroactively is harder than leaving the hook now. Add a
 `_MIGRATIONS: dict[int, Callable]` chain in `harness/oracle.py` and `harness/state.py`,
 plus frozen v1 fixtures for the oracle YAML and report contract (state already has one).
 
-### 6. Mutation-testing sandbox
+### 6. Mutation-testing sandbox — **done**
 
-The configuration is correct and mutants generate, but mutmut 3.x copies the tree into
-`mutants/` and re-runs pytest there, which needs the package metadata to resolve in the
-copy. The weekly job is advisory and says so. Finishing this turns a currently-decorative
-signal into a real one for the enforcement core.
+**The suspected cause was wrong.** It wasn't package metadata — reproducing the failure
+locally showed `mutmut` only copies the four files it mutates into `./mutants`, not the
+rest of the package, so any test importing outside them (`test_assets.py` importing
+`creative_agent.cli`, `test_project_config.py` importing `scripts.check_coverage_floors`)
+failed collection before a single mutant ran. Fixed with `also_copy` (mirrors the package
+and `scripts/`) and by narrowing `pytest_add_cli_args_test_selection` to the four direct
+unit-test files for the mutated modules rather than all of `tests/unit/` — the broader
+selection also pulled in tests whose behavior depends on `git rev-parse --show-toplevel`
+resolving to the *sandbox* root, which silently validates the real repo instead inside the
+nested copy.
+
+Along the way: a hypothesis property test needed
+`suppress_health_check=[HealthCheck.differing_executors]` (mutmut's multi-process re-import
+model triggers a documented hypothesis/mutation-tool interaction, not real flakiness), and
+`SeverityPolicy.cap_all` turned out to have zero *direct* unit coverage — only indirect
+coverage through pipeline integration tests outside the scoped selection — so its mutants
+surfaced as `no_tests` until three unit tests were added.
+
+**Result:** 452/452 mutants killed. `docs/mutation-baseline.json` checks that in;
+`scripts/check_mutation_baseline.py` fails the weekly job on any regression in
+survived/no_tests/suspicious/timeout counts. `continue-on-error: true` is gone — this is a
+real gate now, not a decorative signal.
 
 ### 7. Cost and latency budgets under real load
 

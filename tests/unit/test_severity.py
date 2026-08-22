@@ -3,7 +3,7 @@
 from datetime import date
 
 import pytest
-from hypothesis import given
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from creative_agent.harness.severity import SeverityPolicy
@@ -188,6 +188,36 @@ class TestStalenessCap:
         assert uncapped.cap_reason is None
 
 
+class TestCapAll:
+    """`cap_all` had zero direct unit coverage — only indirect coverage through pipeline
+    integration tests, which fall outside mutmut's narrowed test selection (scoped to the
+    four enforcement-core unit test files, not the full suite; see pyproject.toml
+    [tool.mutmut]). Its four mutants (returning [], returning `findings` unmutated,
+    applying `cap` to the wrong argument, off-by-one iteration) survived with "no tests"
+    status until this was added."""
+
+    def test_caps_each_finding_the_same_way_cap_does(self) -> None:
+        policy = SeverityPolicy(make_oracle())
+        findings = [
+            make_finding(severity=Severity.BLOCKER, original_severity=Severity.BLOCKER),
+            make_finding(severity=Severity.INFO, original_severity=Severity.INFO),
+        ]
+        assert policy.cap_all(findings, "advisory") == [
+            policy.cap(findings[0], "advisory"),
+            policy.cap(findings[1], "advisory"),
+        ]
+
+    def test_preserves_order_and_length(self) -> None:
+        policy = SeverityPolicy(make_oracle())
+        findings = [make_finding(key=make_key()) for _ in range(5)]
+        capped = policy.cap_all(findings, "conformance")
+        assert len(capped) == 5
+        assert [c.key for c in capped] == [f.key for f in findings]
+
+    def test_empty_list_returns_empty_list(self) -> None:
+        assert SeverityPolicy(make_oracle()).cap_all([], "conformance") == []
+
+
 _SEVERITIES = st.sampled_from(list(Severity))
 _MODES = st.sampled_from(["conformance", "advisory"])
 _SUPPORT_SETS = st.lists(
@@ -205,6 +235,12 @@ _SUPPORT_SETS = st.lists(
 
 
 class TestProperties:
+    # mutmut re-imports this module fresh per mutant across its worker pool, so the same
+    # hypothesis-decorated test runs under a different executor identity each time —
+    # exactly the "tool reruns the same test across processes" case hypothesis's own docs
+    # say is safe to suppress, not a real flakiness signal. A normal `pytest`/`make test`
+    # run (single process, single import) never triggers this.
+    @settings(suppress_health_check=[HealthCheck.differing_executors])
     @given(severity=_SEVERITIES, mode=_MODES, supports=_SUPPORT_SETS)
     def test_cap_never_raises_severity_and_is_idempotent(
         self, severity: Severity, mode: ReviewMode, supports: list[SupportRef]

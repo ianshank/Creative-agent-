@@ -47,6 +47,32 @@ Post-merge next-steps work, not yet in `main`.
   optional and falls back to the session's working directory when omitted. `docs/decision-
   log.md` DEC-F11 now covers both halves.
 
+- **Mutation testing sandbox fixed; the weekly job is now a real gate, not advisory.**
+  `mutmut run` copies the four `[tool.mutmut].source_paths` files into `./mutants` and
+  re-runs pytest there — the roadmap suspected a package-metadata resolution problem, but
+  reproducing the failure locally showed the actual cause: `mutmut` only copies files it
+  mutates, so `test_assets.py` importing `creative_agent.cli`, `test_project_config.py`
+  importing `scripts.check_coverage_floors`, and `.claude/` asset-validation tests all
+  failed collection with `ModuleNotFoundError` before a single mutant ran. Two changes fix
+  it: `also_copy = ["src/creative_agent", "scripts"]` mirrors the rest of the package the
+  scoped tests need, and `pytest_add_cli_args_test_selection` now runs only the four direct
+  unit-test files for the mutated modules (`test_severity.py`, `test_gates.py`,
+  `test_verification.py`, `test_consistency.py`) rather than all of `tests/unit/` — the
+  broader selection was also pulling in tests whose behavior depends on
+  `git rev-parse --show-toplevel` resolving to the *sandbox* root
+  (`TestHookBehaviour`'s subprocess-run hooks), which silently validated the real repo
+  instead inside the nested copy.
+  Also found and fixed along the way: a hypothesis property test failed its own
+  `differing_executors` health check under mutmut's multi-process re-import model (a
+  documented hypothesis/mutation-tool interaction, not real flakiness — suppressed with a
+  comment explaining why); `SeverityPolicy.cap_all` had zero direct unit coverage (only
+  indirect, through pipeline integration tests outside the scoped selection), so its four
+  mutants survived as `no_tests` — three new unit tests close that.
+  Result: **452/452 mutants killed**, checked into `docs/mutation-baseline.json` and
+  enforced by the new `scripts/check_mutation_baseline.py`, which fails the job on any
+  regression in survived/no_tests/suspicious/timeout counts rather than the previous
+  `continue-on-error: true` silently swallowing them.
+
 ### Fixed
 
 - The Unreleased section itself said the framework was "not yet on `main`" after PR #1 had

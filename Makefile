@@ -83,9 +83,11 @@ gate: lint types layering oracles assets test coverage-floors ## Everything CI r
 # --- deeper, slower checks ---------------------------------------------------
 
 .PHONY: mutation
-mutation: ## Mutation testing over the enforcement core (slow, advisory)
-	$(RUN) mutmut run --max-children 4 || true
+mutation: ## Mutation testing over the enforcement core (slow, real kill-rate gate)
+	$(RUN) mutmut run --max-children 4
 	$(RUN) mutmut results
+	$(RUN) mutmut export-cicd-stats
+	$(RUN) python scripts/check_mutation_baseline.py
 
 .PHONY: live
 live: ## Live Claude Agent SDK tests (requires ANTHROPIC_API_KEY)
