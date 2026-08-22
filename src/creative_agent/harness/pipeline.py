@@ -441,7 +441,9 @@ class ReviewPipeline:
                 headline=self._guard.launder_prose(final_synthesis.headline),
             ),
             findings=findings,
-            row_dispositions=[sweep.rows[k] for k in sorted(sweep.rows)],
+            row_dispositions=[
+                sweep.rows[row.id] for row in self._oracle.rows if row.id in sweep.rows
+            ],
             what_survives=self._guard.launder_all(final_synthesis.what_survives),
             residual_risks=self._guard.launder_all(final_synthesis.residual_risks),
             scope_items=sweep.judgement.scope if sweep.judgement else [],

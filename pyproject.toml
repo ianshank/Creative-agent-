@@ -71,6 +71,11 @@ ignore = [
 # prompting: function-level import breaks a models<->harness cycle; autoescape=False is
 # correct for plain-text prompts (no HTML sink).
 "src/creative_agent/harness/prompting.py" = ["PLC0415", "S701"]
+# cli is the composition root: heavy/optional deps (SDK, pipeline) import lazily per
+# command, and typer commands legitimately take many options.
+"src/creative_agent/cli.py" = ["PLC0415", "PLR0913", "PLR0917"]
+# claude_sdk imports the optional SDK lazily so the [llm] extra stays optional.
+"src/creative_agent/harness/llm/claude_sdk.py" = ["PLC0415"]
 
 [tool.mypy]
 python_version = "3.11"
