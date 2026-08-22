@@ -51,6 +51,15 @@ Post-merge next-steps work, not yet in `main`.
 
 - The Unreleased section itself said the framework was "not yet on `main`" after PR #1 had
   already merged.
+- **D2's transcribed author order was wrong.** `sutton.v2.yaml`'s D2 row cited
+  arXiv:2212.10420 as "Bowling, Martin, Dabney, Abel"; the paper's own front matter has
+  Bowling and Martin as equal-contribution first authors, then Abel, then Dabney — Dabney
+  and Abel were transposed. Found by independently fetching the paper during planning, not
+  deferred to a future rebaseline run; it's a live instance of the exact defect class this
+  oracle's own header comment exists to catch. Source now marked `verified: true`. A new
+  `TestStalenessCap` round-trip test proves this class of fix actually changes downstream
+  severity capping (a `verified: false → true` transition), not just the loader's shape —
+  nothing exercised that integration path before.
 
 ## [PR #1 merge] - 2026-08-22
 

@@ -20,14 +20,30 @@ The default branch is currently the feature branch, an artifact of the repo bein
 when the first push landed. Consequences: CodeRabbit skips auto-review, clones land on the
 feature branch, and `main` is not treated as primary. Fix in Settings → General.
 
-### 3. First real re-baseline of the sutton oracle
+### 3. First real re-baseline of the sutton oracle — **in progress, one row down**
 
-Eleven of the thirteen doctrine rows carry `verified: false` — their citations were
+Ten of the thirteen doctrine rows still carry no verified source; their citations were
 transcribed from the specification, not resolved. That is deliberate (the staleness rule
 caps findings from unverified rows at Minor), but it means the oracle is currently weaker
-than it looks. Run `make rebaseline`, resolve what the resolver cannot reach by hand per
-the `oracle-rebaseline` skill, and expect some rows to stay unverified — for a talk or an
-unpublished preprint, that is the correct end state, not a failure.
+than it looks.
+
+**D2 fixed** (arXiv:2212.10420, "Settling the Reward Hypothesis"): the transcribed author
+order was wrong — Bowling/Martin/Dabney/Abel instead of the paper's own
+Bowling/Martin/Abel/Dabney (Dabney and Abel transposed). Found and fixed by independently
+fetching the paper rather than deferring to a future rebaseline run — a live instance of
+the exact defect class this oracle's own header comment warns about. A synthetic-oracle
+round-trip test (`tests/unit/test_severity.py::
+TestStalenessCap::test_rebaselining_a_rows_source_removes_the_staleness_cap`) now proves a
+`verified: false → true` transition actually changes downstream severity capping, not just
+the loader's shape — nothing tested that integration path before.
+
+**Remaining, deliberately not attempted in one pass:** run `creative-agent oracles
+rebaseline sutton --dry-run`, then resolve what the resolver reaches automatically and what
+the `oracle-rebaseline` skill's manual fallback reaches for the rest. Ship incrementally
+(one row or a small batch per PR), not as one big-bang PR against a live external API — a
+single bad resolution or transient rate-limit shouldn't block or force a partial revert of
+the whole batch, and the skill's own docs already anticipate some rows staying unverified
+as the correct end state, not a failure, for a talk or an unpublished preprint.
 
 ## Near term
 

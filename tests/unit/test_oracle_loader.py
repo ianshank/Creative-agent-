@@ -138,8 +138,13 @@ class TestShippedSuttonOracle:
         ]
 
     def test_d2_author_list_is_the_corrected_one(self, sutton: OracleTable) -> None:
+        """Order matches arXiv:2212.10420's front matter, independently re-verified — the
+        spec's own transcription had Dabney and Abel transposed (Bowling/Martin/Dabney/
+        Abel instead of the paper's Bowling/Martin/Abel/Dabney), a live instance of the
+        exact defect class this oracle exists to catch, not merely v1's wholly wrong
+        Sutton-instead-of-Dabney insertion this test used to guard against alone."""
         authors = sutton.row("D2").sources[0].authors
-        assert authors == ["Michael Bowling", "John D. Martin", "Will Dabney", "David Abel"]
+        assert authors == ["Michael Bowling", "John D. Martin", "David Abel", "Will Dabney"]
 
     def test_d6a_is_a_disclosed_gap(self, sutton: OracleTable) -> None:
         row = sutton.row("D6a")

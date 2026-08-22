@@ -158,6 +158,35 @@ class TestStalenessCap:
         )
         assert policy.cap(finding, "conformance").severity is Severity.MAJOR
 
+    def test_rebaselining_a_rows_source_removes_the_staleness_cap(self) -> None:
+        """The round-trip a rebaseline is supposed to accomplish: the exact same finding
+        against the exact same row, before and after its one source's `verified` flag
+        flips false -> true (what `oracles rebaseline` actually changes, e.g. the D2
+        author-order fix). Not just two different rows side by side (the test above) —
+        the same row, so the transition itself is what's under test."""
+        finding = make_finding(
+            severity=Severity.MAJOR,
+            original_severity=Severity.MAJOR,
+            doctrine_refs=["D1"],
+            supports=[doctrine("D1")],
+        )
+
+        before = oracle_with(
+            [make_row("D1", sources=[make_source(verified=False)])],
+            freshness=STALE_FRESHNESS,
+        )
+        capped = SeverityPolicy(before).cap(finding, "conformance")
+        assert capped.severity is Severity.MINOR
+        assert capped.cap_reason and "re-baseline" in capped.cap_reason
+
+        after = oracle_with(
+            [make_row("D1", sources=[make_source(verified=True)])],
+            freshness=STALE_FRESHNESS,
+        )
+        uncapped = SeverityPolicy(after).cap(finding, "conformance")
+        assert uncapped.severity is Severity.MAJOR
+        assert uncapped.cap_reason is None
+
 
 _SEVERITIES = st.sampled_from(list(Severity))
 _MODES = st.sampled_from(["conformance", "advisory"])
