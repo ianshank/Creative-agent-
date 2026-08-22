@@ -11,6 +11,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from mutmut.configuration import Config
 from scripts.check_coverage_floors import APPROVED_OMITS, FLOORS
 
 PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
@@ -36,6 +37,13 @@ class TestMutationConfig:
         mutmut = config["tool"]["mutmut"]
         assert "paths_to_mutate" not in mutmut, "renamed to source_paths in mutmut 3.x"
         assert "runner" not in mutmut, "not a mutmut 3.x key; it is silently ignored"
+        # Deprecated AND fatal: mutmut concatenates it with the list-valued selection key.
+        assert "tests_dir" not in mutmut, "deprecated; breaks the run when both keys are set"
+
+    def test_config_actually_loads(self) -> None:
+        """The guard that would have caught every previous breakage of this config."""
+        Config.ensure_loaded()
+        assert Config.get().source_paths
 
     def test_enforcement_core_is_covered(self, config: dict) -> None:
         targets = " ".join(config["tool"]["mutmut"]["source_paths"])

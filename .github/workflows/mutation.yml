@@ -24,9 +24,15 @@ jobs:
           enable-cache: true
       - run: uv python install 3.11
       - run: uv sync --all-extras --locked
+      # mutmut 3.x copies the tree into ./mutants and re-runs pytest there, which needs
+      # the package metadata to resolve in that copy. Advisory (continue-on-error) until
+      # that sandbox setup is settled; the mutants themselves generate correctly, and
+      # tests/unit/test_project_config.py guards the config from silently rotting again.
       - name: Run mutation testing on the enforcement core
         continue-on-error: true
-        run: uv run mutmut run --max-children 4
+        run: |
+          cp README.md mutants/README.md 2>/dev/null || true
+          uv run mutmut run --max-children 4
       - name: Report surviving mutants
         if: always()
         run: uv run mutmut results || true

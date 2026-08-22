@@ -135,5 +135,6 @@ source_paths = [
     "src/creative_agent/harness/verification.py",
     "src/creative_agent/harness/consistency.py",
 ]
-tests_dir = "tests/unit"
+# `tests_dir` is deprecated in 3.x AND breaks the run (it is concatenated with the list
+# below), so test selection lives entirely in pytest_add_cli_args_test_selection.
 pytest_add_cli_args_test_selection = ["tests/unit", "-x", "-q", "--no-cov", "-p", "no:randomly"]
