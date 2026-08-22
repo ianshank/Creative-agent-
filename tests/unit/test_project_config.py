@@ -12,6 +12,7 @@ import tomllib
 from pathlib import Path, PurePosixPath
 
 import pytest
+import yaml
 from mutmut.configuration import Config
 from scripts.check_coverage_floors import APPROVED_OMITS, FLOORS
 
@@ -151,6 +152,65 @@ class TestDocumentationIsHonest:
         config = (self.ROOT / ".gitleaks.toml").read_text(encoding="utf-8")
         assert "useDefault = true" in config, "a bespoke ruleset would miss known secrets"
         assert "sk-ant-" in config, "the one credential this project uses is unpinned"
+
+
+class TestCiWorkflowIsWired:
+    """CI misconfiguration fails in ways that read as something else.
+
+    The secret scan is the case that motivated these: the gitleaks action exits
+    non-zero *before scanning* when `GITHUB_TOKEN` is absent on a `pull_request`
+    event, which looks like a leak. It passed on every push and only failed on the
+    first PR.
+    """
+
+    ROOT = PYPROJECT.parent
+
+    @classmethod
+    def _workflow(cls, name: str) -> dict:
+        text = (cls.ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+        loaded = yaml.safe_load(text)
+        assert isinstance(loaded, dict)
+        return loaded
+
+    @classmethod
+    def _steps(cls, name: str) -> list[dict]:
+        return [
+            step
+            for job in cls._workflow(name).get("jobs", {}).values()
+            for step in job.get("steps", [])
+        ]
+
+    def test_gitleaks_receives_a_token_so_it_can_scan_pull_requests(self) -> None:
+        steps = [s for s in self._steps("ci.yml") if "gitleaks-action" in str(s.get("uses", ""))]
+        assert steps, "the secret-scan step vanished"
+        for step in steps:
+            assert "GITHUB_TOKEN" in step.get("env", {}), (
+                "gitleaks-action fails before scanning on pull_request events without "
+                "GITHUB_TOKEN, and the failure is indistinguishable from a real leak"
+            )
+
+    @pytest.mark.parametrize("workflow", ["ci.yml", "mutation.yml", "live.yml"])
+    def test_actions_are_pinned_to_a_commit_sha(self, workflow: str) -> None:
+        """A moving tag is an unreviewed dependency with write access to the build."""
+        unpinned = [
+            uses
+            for step in self._steps(workflow)
+            if (uses := str(step.get("uses", "")))
+            and not re.search(r"@[0-9a-f]{40}$", uses)
+            and not uses.startswith("./")
+        ]
+        assert not unpinned, f"{workflow} uses unpinned actions: {unpinned}"
+
+    def test_every_job_running_make_installs_the_environment_first(self) -> None:
+        """`make lint` without `make install` fails on a missing interpreter, not a defect."""
+        for job_name, job in self._workflow("ci.yml").get("jobs", {}).items():
+            runs = [str(step.get("run", "")) for step in job.get("steps", [])]
+            make_calls = [r for r in runs if r.startswith("make ")]
+            if not make_calls:
+                continue
+            assert any(r.startswith("make install") for r in make_calls), (
+                f"job {job_name!r} runs {make_calls} without installing the environment"
+            )
 
 
 class TestContainerTestStageCanActuallyRunTheSuite:

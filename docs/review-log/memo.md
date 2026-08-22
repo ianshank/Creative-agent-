@@ -1,7 +1,7 @@
 ---
 schema_version: 1
 artifact_id: memo
-cycle: 13
+cycle: 14
 history:
 - cycle: 1
   completed_at: '2026-08-22T03:48:54.010569Z'
@@ -81,9 +81,15 @@ history:
   artifact_class: policy_memo
   content_sha256: 05c145af06e14323c2ec7cd2df99eb4649a37f9be0a47830238689ae9d28c6e9
   findings: []
+- cycle: 14
+  completed_at: '2026-08-22T04:14:51.336348Z'
+  mode: advisory
+  artifact_class: policy_memo
+  content_sha256: 05c145af06e14323c2ec7cd2df99eb4649a37f9be0a47830238689ae9d28c6e9
+  findings: []
 ---
 
-# Review: memo — cycle 13
+# Review: memo — cycle 14
 
 Oracle: other v1.0 (contract v1)
 

@@ -36,6 +36,9 @@ jobs:
   secrets:
     name: Secret scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # the action enumerates a PR's commits through the API
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
@@ -44,6 +47,11 @@ jobs:
         uses: gitleaks/gitleaks-action@83373cf2f8c4db6e24b41c1a9b086bb9619e9cd3 # v2.3.7
         env:
           GITLEAKS_CONFIG: .gitleaks.toml
+          # Required on pull_request events since v2: without it the action exits
+          # non-zero before scanning anything, which reads as a leak but is a
+          # configuration failure. Push events do not need it, so the gap is invisible
+          # until the first PR.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   data-validate:
     name: Oracle and asset data

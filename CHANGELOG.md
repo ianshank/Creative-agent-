@@ -107,6 +107,11 @@ regression test.
   required and a key the tool ignores — and is now guarded by a test that loads it.
 - **CI restructured** to call `Makefile` targets, with added secret-scanning and
   container-build jobs.
+- **Secret scan fixed on pull requests.** The gitleaks action exits non-zero *before
+  scanning* without `GITHUB_TOKEN` on `pull_request` events, so the job passed on every
+  push and failed on the first PR with something that reads as a leak. Tests now assert
+  the token is present, that every action is pinned to a commit SHA, and that no job
+  calls a `make` target without installing the environment first.
 - **Container test stage repaired.** It ran a hand-copied subset of the gate (no
   format check, layering, oracle or asset validation) over a build context missing
   every configuration file the suite audits — so `make docker-test` passed vacuously
