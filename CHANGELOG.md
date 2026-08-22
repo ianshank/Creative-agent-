@@ -11,8 +11,10 @@ compatible for data, or the reverse. Changes to any of those are called out expl
 
 ## [Unreleased]
 
-Everything below is on `claude/implementation-plan-agent-framework-dbqgvv` and not yet on
-`main`, which currently contains only the M0 bootstrap commit.
+Everything below merged to `main` via PR #1 (commit `2d4bea6`) on 2026-08-22, from the
+`claude/implementation-plan-agent-framework-dbqgvv` branch. `main` previously contained only
+the M0 bootstrap commit. No package version has been tagged yet — this section will be
+renamed to a dated release when one is.
 
 ### Added
 
@@ -137,4 +139,4 @@ regression test.
 - Secret scanning in CI (full history) and pre-commit; the container runs unprivileged and
   ships no credentials.
 
-[Unreleased]: https://github.com/ianshank/Creative-agent-/compare/main...claude/implementation-plan-agent-framework-dbqgvv
+[Unreleased]: https://github.com/ianshank/Creative-agent-/commit/2d4bea6
