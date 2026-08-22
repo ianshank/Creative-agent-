@@ -11,7 +11,26 @@ compatible for data, or the reverse. Changes to any of those are called out expl
 
 ## [Unreleased]
 
-Everything below merged to `main` via PR #1 (commit `2d4bea6`) on 2026-08-22, from the
+Post-merge next-steps work, not yet in `main`.
+
+### Added
+
+- **`inspect-state` skill**: documents the CLI commands that had no skill/agent coverage
+  (`oracles list`, `agents list`, `decisions check`, `state show`, `assets validate`, plus
+  `review --mode`/`--output-json` and the global `--log-format` flag). A new
+  `TestSkillContracts` case subprocess-confirms every command it names actually resolves,
+  the same pattern `TestHookBehaviour` already uses for hooks — a purely descriptive skill
+  with no runnable check was found to be a real gap in this repo's own documentation-honesty
+  philosophy.
+
+### Fixed
+
+- The Unreleased section itself said the framework was "not yet on `main`" after PR #1 had
+  already merged.
+
+## [PR #1 merge] - 2026-08-22
+
+Everything below merged to `main` via PR #1 (commit `2d4bea6`), from the
 `claude/implementation-plan-agent-framework-dbqgvv` branch. `main` previously contained only
 the M0 bootstrap commit. No package version has been tagged yet — this section will be
 renamed to a dated release when one is.
@@ -139,4 +158,5 @@ regression test.
 - Secret scanning in CI (full history) and pre-commit; the container runs unprivileged and
   ships no credentials.
 
-[Unreleased]: https://github.com/ianshank/Creative-agent-/commit/2d4bea6
+[Unreleased]: https://github.com/ianshank/Creative-agent-/compare/2d4bea6...HEAD
+[PR #1 merge]: https://github.com/ianshank/Creative-agent-/commit/2d4bea6

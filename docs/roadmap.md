@@ -33,14 +33,25 @@ unpublished preprint, that is the correct end state, not a failure.
 
 ### 4. Enforce the tool scope in the SDK session, or narrow the claim
 
-`ThreatGuard.allowed_read_roots` and the per-review fetch allowlist are currently
-*advisory*: they are computed, logged, and stated in the prompt, and the verification
-checker refuses evidence from tools outside the fetch set — but nothing stops the session
-itself from reading outside the artifact directory. DEC-F9 should either gain real
-enforcement (a `can_use_tool` callback or equivalent permission wiring in
-`ClaudeSDKAdapter`) or be amended to say the scoping is prompt-level plus post-hoc. The
-current wording overstates it. Deciding this needs the live SDK (item 1) to know which
-mechanism actually exists.
+The gap is worse than "advisory" for one half of it: `ThreatGuard.allowed_read_roots` is
+computed and unit-tested but never passed to the SDK or rendered into any prompt — read-path
+scoping is currently fully disconnected, not merely advisory. The fetch-domain allowlist
+*is* genuinely advisory (it reaches the model via the system prompt), but nothing stops a
+`WebFetch` call to an off-allowlist host from executing; only the downstream tool-honesty
+check later refuses to credit any resulting "evidence."
+
+**Correction to the previous wording:** deciding the enforcement mechanism does *not* need
+the live SDK (item 1) — `ClaudeAgentOptions.hooks` exposes a `PreToolUse` hook that fires on
+every tool call regardless of `allowed_tools`, and this project's `permission_mode =
+"dontAsk"` (`config.py`) means the alternative `can_use_tool` callback is very likely never
+invoked here, since it only fires when permission evaluation would otherwise prompt.
+`PreToolUse` is implementable and unit-testable now, against the existing mocked-transport
+`ClaudeSDKAdapter` tests; only the *final live confirmation* needs the API key. Plan: split
+into WebFetch host enforcement (higher severity — a live outbound network primitive) and
+Read/Grep/Glob path enforcement (lower severity, defense-in-depth), each requiring a new
+`DEC-F` decision-log entry before implementation, with the decision logic living in
+`security.py` (coverage-counted) rather than inline in `claude_sdk.py` (the one approved
+coverage omit, DEC-F8) so a broken check can't ship with zero measured coverage.
 
 ### 5. Schema migration paths
 
