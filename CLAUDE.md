@@ -2,12 +2,19 @@
 
 ## Commands
 
-- Install: `uv sync --all-extras` (or `pip install -e ".[dev,llm]"`)
-- Test: `uv run pytest` (coverage gate: branch, 90% global; live tests excluded by default)
-- Lint/format: `uv run ruff check .` / `uv run ruff format .`
-- Types: `uv run mypy`
-- Layering: `uv run lint-imports` — `harness/` and `models/` must never import `agents/`
-- Oracle check: `uv run creative-agent oracles validate --all`
+Prefer the Makefile: it is the single definition of the gates, and CI calls the same
+targets, so anything green locally should be green in CI.
+
+- `make install` — locked dev environment
+- `make gate` — lint, types, layering, oracle + asset validation, tests, coverage floors
+- `make format` — apply ruff fixes and formatting
+- `make test` / `make live` / `make mutation` / `make secrets`
+- `make docker-test` — run the gate inside the container
+- `make help` — every target
+
+Underlying commands, if you need one in isolation: `uv run pytest`,
+`uv run ruff check .`, `uv run mypy`, `uv run lint-imports`,
+`uv run creative-agent oracles validate --all`, `uv run creative-agent assets validate`.
 
 ## Non-negotiable conventions
 
@@ -28,6 +35,11 @@
 - **Observability:** log through `harness/logging.py` (`get_logger`, `log_event`,
   `timed_stage`) with stable event names — never `print`. Never log prompts or artifact
   text; log sizes, ids, counts, and durations.
+- **Assets are data too:** changes under `.claude/` must keep `make assets` green —
+  agent filenames match their `name`, skills have trigger-worthy descriptions, hooks stay
+  executable and use `set -e`.
+- **Record the change:** user-visible changes get a `CHANGELOG.md` entry under
+  Unreleased; deferred work goes in `docs/roadmap.md` rather than a TODO comment.
 
 ## Reviewing artifacts in other repos (worktree workflow)
 

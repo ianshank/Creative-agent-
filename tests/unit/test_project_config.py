@@ -7,12 +7,15 @@ list is the one place a module can quietly leave the gate.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
 import pytest
 from mutmut.configuration import Config
 from scripts.check_coverage_floors import APPROVED_OMITS, FLOORS
+
+from creative_agent.errors import ExitCode
 
 PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 
@@ -85,3 +88,66 @@ class TestLintConfig:
             and "creative_agent.harness" in c["source_modules"]
             for c in forbidden
         )
+
+
+class TestDocumentationIsHonest:
+    """Docs rot silently. These assert the claims that would mislead a reader most —
+    a referenced file that does not exist, or a command that no longer works."""
+
+    ROOT = PYPROJECT.parent
+
+    @pytest.mark.parametrize(
+        "document",
+        ["README.md", "CLAUDE.md", "CHANGELOG.md", "docs/roadmap.md", "docs/architecture.md"],
+    )
+    def test_referenced_documents_exist(self, document: str) -> None:
+        assert (self.ROOT / document).is_file(), f"{document} is referenced but missing"
+
+    def test_readme_make_targets_exist(self) -> None:
+        """Every `make X` in the README must be a real target."""
+        makefile = (self.ROOT / "Makefile").read_text(encoding="utf-8")
+        targets = set(re.findall(r"^([a-zA-Z][\w-]*):", makefile, re.MULTILINE))
+        readme = (self.ROOT / "README.md").read_text(encoding="utf-8")
+        referenced = set(re.findall(r"\bmake ([a-z][\w-]*)", readme))
+        missing = referenced - targets
+        assert not missing, f"README references non-existent make targets: {sorted(missing)}"
+
+    def test_gate_target_covers_every_ci_check(self) -> None:
+        """`make gate` is documented as 'everything CI runs'; keep that true."""
+        makefile = (self.ROOT / "Makefile").read_text(encoding="utf-8")
+        gate_line = next(line for line in makefile.splitlines() if line.startswith("gate:"))
+        gate_deps = set(gate_line.split(":")[1].split("##")[0].split())
+        workflow = (self.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        ci_targets = set(re.findall(r"run: make ([a-z][\w-]*)", workflow))
+        # install/install-unlocked are setup, not checks.
+        checks = ci_targets - {"install", "install-unlocked"}
+        assert checks <= gate_deps, (
+            f"CI runs targets `make gate` omits: {sorted(checks - gate_deps)}"
+        )
+
+    def test_changelog_documents_the_exit_code_contract(self) -> None:
+        changelog = (self.ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+
+        for code in ExitCode:
+            assert str(int(code)) in changelog
+
+    def test_dockerfile_runs_unprivileged(self) -> None:
+        """The container reads untrusted documents; root would be a real exposure."""
+        dockerfile = (self.ROOT / "Dockerfile").read_text(encoding="utf-8")
+        assert "USER reviewer" in dockerfile
+        assert "useradd" in dockerfile
+
+    def test_dockerignore_excludes_local_state_and_secrets(self) -> None:
+        ignored = (self.ROOT / ".dockerignore").read_text(encoding="utf-8")
+        for entry in ("config/settings.yaml", ".env", ".git", ".venv"):
+            assert entry in ignored, f"{entry} would be copied into the build context"
+
+    def test_gitignore_protects_key_material(self) -> None:
+        ignored = (self.ROOT / ".gitignore").read_text(encoding="utf-8")
+        for entry in ("config/settings.yaml", ".env", "*.pem", "*.key"):
+            assert entry in ignored
+
+    def test_gitleaks_config_present_and_extends_defaults(self) -> None:
+        config = (self.ROOT / ".gitleaks.toml").read_text(encoding="utf-8")
+        assert "useDefault = true" in config, "a bespoke ruleset would miss known secrets"
+        assert "sk-ant-" in config, "the one credential this project uses is unpinned"

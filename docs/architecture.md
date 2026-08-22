@@ -87,7 +87,7 @@ flowchart TB
     subgraph claudeassets[".claude assets — Claude Code integration"]
         subagent["agents/sutton-review.md<br/>thin delegator, relays the report unmodified"]
         skills["skills/<br/>add-oracle, review-gate, oracle-rebaseline"]
-        hooks["hooks/<br/>SessionStart: uv sync<br/>PostToolUse: re-validate oracles on edit"]
+        hooks["hooks/<br/>SessionStart: uv sync<br/>PostToolUse: re-validate oracle data<br/>and .claude assets on edit"]
     end
 
     state["State store on disk<br/>docs/review-log/&lt;artifact-id&gt;.md<br/>YAML front matter = machine truth<br/>cycle-N/ audit bundles"]
@@ -123,6 +123,13 @@ Override discipline is identical for oracles and prompts: earlier search-path en
 packaged data is the last fallback. Search paths, tool names, budgets, model ids, and
 thresholds all come from `HarnessSettings` (env prefix `CREATIVE_AGENT_`, or a YAML file
 named by `CREATIVE_AGENT_CONFIG`), never from a literal at a call site.
+
+The `.claude/` assets are treated as executable configuration rather than documentation:
+`harness/assets.py` is their schema — agent and skill front matter, hook executability,
+settings shape — surfaced as `creative-agent assets validate` and re-run by the
+`PostToolUse` hook (`.claude/hooks/validate-data.sh`) whenever an oracle file or a
+`.claude` asset is edited, so a break surfaces at edit time rather than mid-review in
+someone else's session. Like the oracle loader, it imports nothing from `agents/`.
 
 ---
 
@@ -222,24 +229,25 @@ sequenceDiagram
     CLI->>CLI: resolve artifact id — flag, then front matter, then filename slug
     CLI->>P: run(ReviewRequest)
 
-    P->>S: load(artifact_id) — cycle history, prior open Major keys
+    P->>S: load(artifact_id) — cycle history and prior open Major keys
     P->>P: read_artifact — size-capped, decoded
-    P->>G: fetch_domain_allowlist + rejected hosts, delimit_artifact as data
+    P->>G: fetch_domain_allowlist, rejected hosts, delimit_artifact as data
 
     Note over P,L: Step 3 — classify, fail-closed mode (DEC-F6)
     P->>A: assemble(classify)
     A->>L: AssembledPrompt with output_schema
-    L-->>P: ClassifyResult + tool evidence
-    P->>P: unknown artifact_class triggers one re-probe, else LLMOutputError
-    P->>P: conformance only on a verbatim quote found in the artifact;<br/>markers without a quote re-probe once, then advisory + mode_uncertain
+    L-->>P: ClassifyResult and tool evidence
+    P->>P: unknown artifact_class re-probes once, else LLMOutputError
+    P->>P: conformance only on a verbatim quote found in the artifact
+    P->>P: markers without a quote re-probe once, then advisory plus mode_uncertain
 
     Note over P,D: Steps 4-5 — deterministic sweeps
-    P->>D: ConsistencyChecker, SourceQualityChecker,<br/>DecisionGate, LabelConformanceChecker
+    P->>D: ConsistencyChecker, SourceQualityChecker, DecisionGate, LabelConformanceChecker
     D-->>P: deterministic candidate findings
 
-    Note over P,L: Step 6 — doctrine sweep, one call per row<br/>skipped for source_quality_only classes
+    Note over P,L: Step 6 — doctrine sweep, one call per row (skipped for source_quality_only classes)
     loop for each oracle row
-        P->>A: assemble(row, ref=row.id) with rendered row + prior keys
+        P->>A: assemble(row, ref=row.id) with the rendered row and prior keys
         A->>L: AssembledPrompt
         L-->>P: RowDisposition — verdict, quotes, findings, verification entries
     end
@@ -247,7 +255,7 @@ sequenceDiagram
     Note over P,D: Step 7 — claims and gates
     P->>L: claims call
     L-->>P: ClaimsResult
-    P->>P: sections present determined from the document's own headings, never the model's word
+    P->>P: sections read from the document's own headings, never the model's word
     P->>D: MeasurementGateChecker.findings_for(claims, class, sections)
     D-->>P: gate, provenance and missing-section candidates
 
@@ -259,14 +267,15 @@ sequenceDiagram
 
     Note over P,R: Verification and repair loop, bounded by max_regeneration_attempts
     loop until clean or budget exhausted
-        P->>P: assemble candidates into Findings; ThreatGuard launders prose
+        P->>P: assemble candidates into Findings, ThreatGuard launders prose
         P->>D: SeverityPolicy.cap_all(findings, mode)
-        D-->>P: capped findings with original_severity and cap_reason preserved
+        D-->>P: capped findings, original_severity and cap_reason preserved
         P->>L: synthesis call — headline, confidence, survives, residual risks
         L-->>P: SynthesisResult
         P->>D: VerificationLogChecker.check — completeness, tool honesty, attribution
-        D-->>P: defect list; empty is the only pass
-        P->>P: repair only the row calls a defect names, on a word boundary;<br/>no repairable call means stop — the budget cannot change the outcome
+        D-->>P: defect list, and an empty list is the only pass
+        P->>P: repair only the row calls a defect names, matched on a word boundary
+        P->>P: no repairable call means stop — the budget cannot change the outcome
     end
 
     P->>D: CycleEscalator.check(state, result)
@@ -277,12 +286,12 @@ sequenceDiagram
     alt verification defects remain
         P-->>CLI: raise ReviewFailedError — exit 3, never softened, never published
     else clean verification log
-        P->>S: save(new state) — atomic tmp + rename under flock
-        P->>P: write audit bundle — calls.json, tool-evidence.json under cycle-N/
+        P->>S: save(new state) — atomic tmp plus rename under flock
+        P->>P: write audit bundle — calls.json and tool-evidence.json under cycle-N/
         P-->>CLI: PipelineOutcome — report, result, rendered, state_path
     end
 
-    CLI->>CLI: print report; exit 2 on Blocker or STOP, 1 on Major, else 0
+    CLI->>CLI: print report, then exit 2 on Blocker or STOP, 1 on Major, else 0
 ```
 
 Two ordering details worth keeping in mind: assembly and capping happen **inside** the
