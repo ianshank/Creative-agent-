@@ -78,11 +78,15 @@ class OracleLoader:
 
     def load(self, oracle_id: str) -> OracleTable:
         """Load by oracle_id; first match across the search path wins."""
+        return self.find(oracle_id)[1]
+
+    def find(self, oracle_id: str) -> tuple[Path, OracleTable]:
+        """Like load, but also returns the file the oracle came from."""
         seen: list[str] = []
         for path in self.candidate_files():
             table = self.load_file(path)
             if table.oracle_id == oracle_id:
-                return table
+                return path, table
             seen.append(table.oracle_id)
         raise ConfigError(
             f"oracle {oracle_id!r} not found; available: {sorted(set(seen)) or 'none'}"

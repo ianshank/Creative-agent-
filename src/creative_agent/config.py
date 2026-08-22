@@ -85,6 +85,10 @@ class HarnessSettings(BaseSettings):
     max_oracle_bytes: int = 2_000_000
     max_artifact_bytes: int = 20_000_000
 
+    # Citation resolution (oracles rebaseline).
+    arxiv_api_url: str = "https://export.arxiv.org/api/query"
+    citation_timeout_seconds: float = 30.0
+
     # Rendering limits (output laundering, DEC-F9).
     max_prose_chars: int = 4_000
 

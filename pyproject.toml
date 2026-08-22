@@ -17,6 +17,7 @@ dependencies = [
     "typer>=0.12",
     "jinja2>=3.1",
     "httpx>=0.27",
+    "defusedxml>=0.7",
 ]
 
 [project.optional-dependencies]
@@ -76,6 +77,8 @@ ignore = [
 "src/creative_agent/cli.py" = ["PLC0415", "PLR0913", "PLR0917"]
 # claude_sdk imports the optional SDK lazily so the [llm] extra stays optional.
 "src/creative_agent/harness/llm/claude_sdk.py" = ["PLC0415"]
+# citation resolver: the early-return dispatch over resolution outcomes is the design.
+"src/creative_agent/harness/citations.py" = ["PLR0911"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -85,7 +88,7 @@ mypy_path = "src"
 packages = ["creative_agent"]
 
 [[tool.mypy.overrides]]
-module = ["claude_agent_sdk.*"]
+module = ["claude_agent_sdk.*", "defusedxml.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

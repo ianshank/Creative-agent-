@@ -86,6 +86,54 @@ def oracles_validate(
         _fail(exc)
 
 
+@oracles_app.command("rebaseline")
+def oracles_rebaseline(
+    name: Annotated[str, typer.Argument(help="Oracle id to re-baseline")],
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Report resolutions without writing")
+    ] = False,
+    output: Annotated[
+        Path | None,
+        typer.Option(help="Write the updated oracle here (default: the source file)"),
+    ] = None,
+) -> None:
+    """Resolve every source against arXiv, diff author lists, bump freshness metadata.
+
+    Note: rewriting the YAML drops hand-written comments; review the diff before
+    committing, and log a decision-log entry for any invariant change (see CLAUDE.md).
+    """
+    import yaml as yaml_module
+
+    from creative_agent.harness.citations import ArxivCitationResolver, OracleRebaseliner
+    from creative_agent.harness.clock import SystemClock
+
+    settings = _settings()
+    try:
+        source_path, table = _loader(settings).find(name)
+    except CreativeAgentError as exc:
+        _fail(exc)
+    resolver = ArxivCitationResolver(settings.arxiv_api_url, settings.citation_timeout_seconds)
+    rebaseliner = OracleRebaseliner(resolver, SystemClock())
+    updated, report = asyncio.run(rebaseliner.rebaseline(table))
+    for line in report:
+        typer.echo(line)
+    if dry_run:
+        typer.echo("dry run: no file written")
+        return
+    target = output or source_path
+    target.write_text(
+        yaml_module.safe_dump(
+            updated.model_dump(mode="json", exclude_none=True),
+            sort_keys=False,
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
+    typer.echo(f"wrote {target} (rebaseline_count={updated.freshness.rebaseline_count})")
+    if any("MISMATCH" in line for line in report):
+        raise typer.Exit(code=int(ExitCode.FINDINGS_MAJOR))
+
+
 @app.command()
 def review(
     artifact: Annotated[Path, typer.Argument(exists=True, dir_okay=False, readable=True)],
