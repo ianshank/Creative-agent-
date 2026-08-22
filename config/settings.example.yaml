@@ -1,17 +1,55 @@
 # Example configuration for creative-agent. Copy to config/settings.yaml (gitignored) and
 # point CREATIVE_AGENT_CONFIG at it, or set individual CREATIVE_AGENT_* env vars instead.
 # Precedence: CLI/init kwargs > env > this file > packaged defaults.
+#
+# Every field below is a real knob — this file is the discoverable surface, so it lists
+# all of them. List fields accept JSON (["a","b"]) or the shorthand `a,b` / `a:b` in env.
 
+# --- LLM backend -------------------------------------------------------------
 model: inherit            # "inherit" uses the Claude Agent SDK default; or an alias/full ID
 fallback_model: null
 max_turns: 12
 max_budget_usd: null      # e.g. 2.50 to cap a review's spend
 max_regeneration_attempts: 2
+llm_timeout_seconds: 600.0
 
+# --- Tool scoping (threat model, DEC-F9) -------------------------------------
 agent_tools: [Read, Grep, Glob, WebFetch, WebSearch]
-permission_mode: dontAsk
+# Which of those tools can back a `fetched=true` verification entry. WebSearch is
+# excluded deliberately: snippets support existence, never content.
+fetch_tool_names: [WebFetch, Read]
+permission_mode: dontAsk  # default | acceptEdits | plan | dontAsk | auto | bypassPermissions
 
+# --- Data search paths (packaged resources are the fallback) ------------------
 oracle_search_paths: [data/oracles]
 prompt_search_paths: [data/prompts]
+
+# --- State and logs ----------------------------------------------------------
 review_log_dir: docs/review-log
 decision_log_filename: docs/decision-log.md
+
+# --- Plugin defaults (rebrandable without a code edit) -----------------------
+default_agent: sutton-review
+
+# --- Loader hardening bounds -------------------------------------------------
+max_oracle_bytes: 2000000
+max_oracle_depth: 32
+max_artifact_bytes: 20000000
+
+# --- Citation resolution (oracles rebaseline) --------------------------------
+arxiv_api_url: https://export.arxiv.org/api/query
+citation_timeout_seconds: 30.0
+
+# --- Observability (DEC-F10) -------------------------------------------------
+log_level: WARNING        # DEBUG | INFO | WARNING | ERROR; --verbose/--debug override
+log_format: text          # text | json
+
+# --- Output laundering (DEC-F9) ----------------------------------------------
+max_prose_chars: 4000
+
+# --- Fetch-allowlist policy (DEC-F9) -----------------------------------------
+# Hosts harvested from the untrusted artifact are filtered so a planted URL cannot point
+# the session at loopback, private, link-local, or cloud-metadata addresses. Extend the
+# suffix list for your own internal domains; opt out only for an internal mirror.
+blocked_host_suffixes: [localhost, .localhost, .local, .internal, .home.arpa]
+allow_internal_fetch_hosts: false

@@ -79,6 +79,16 @@ All time comes from an injected `Clock` protocol (aware-UTC); `datetime.now`/`ut
 visibly omitted from the gate (tested via mocked transport + weekly live run); adding any
 other omit or `# pragma: no cover` requires a new decision-log entry.
 
+## DEC-F10 — Observability — CONFIRMED
+
+Structured logging over the `creative_agent` namespace only (never the root logger, so
+importing the library cannot reconfigure a host application). Every stage emits a stable,
+greppable `event` name with contextual fields; `text` and `json` formats are both
+supported and selected by configuration (`log_level`, `log_format`) with `--verbose` /
+`--debug` / `--log-format` raising it for one invocation. Prompts and artifact text are
+never logged — only sizes, identifiers, counts, and durations. `timed_stage` wraps the
+review and each LLM call so a wrong verdict can be traced to the stage that decided it.
+
 ## DEC-F9 — Threat model — CONFIRMED
 
 Reviewed artifacts are untrusted input. The SDK session's tools are scoped: `Read`/`Grep`/

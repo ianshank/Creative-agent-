@@ -13,14 +13,32 @@ build/
 .ruff_cache/
 .hypothesis/
 .mutmut-cache
+mutants/
 coverage.xml
 .coverage
 .coverage.*
 htmlcov/
+.diff_cover*
 
-# Local settings / secrets
+# Local settings and secrets — never commit a real key or a local override
 config/settings.yaml
 .env
+.env.*
+!.env.example
+*.pem
+*.key
 
-# Review runtime artifacts (audit bundles are per-machine unless deliberately committed)
-docs/review-log/*/cycle-*/transcript.jsonl
+# Review runtime artifacts. Cycle state (docs/review-log/<id>.md) IS committed on
+# purpose: recurrence tracking and the cycle-3 escalation depend on its history. The
+# per-cycle audit bundles and lock files are machine-local — this previously named only
+# transcript.jsonl, so calls.json and tool-evidence.json were committed against the
+# stated intent. Ignore the bundle directories wholesale.
+docs/review-log/*/cycle-*/
+docs/review-log/.*.lock
+**/.*.md.tmp
+
+# Editor and OS noise
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

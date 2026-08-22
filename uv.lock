@@ -439,6 +439,7 @@ name = "creative-agent"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "defusedxml" },
     { name = "httpx" },
     { name = "jinja2" },
     { name = "pydantic" },
@@ -456,6 +457,7 @@ dev = [
     { name = "mypy" },
     { name = "pre-commit" },
     { name = "pytest" },
+    { name = "pytest-asyncio" },
     { name = "pytest-cov" },
     { name = "pytest-randomly" },
     { name = "respx" },
@@ -469,17 +471,19 @@ llm = [
 [package.metadata]
 requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'llm'", specifier = ">=0.1" },
+    { name = "defusedxml", specifier = ">=0.7" },
     { name = "diff-cover", marker = "extra == 'dev'", specifier = ">=9.0" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "hypothesis", marker = "extra == 'dev'", specifier = ">=6.100" },
     { name = "import-linter", marker = "extra == 'dev'", specifier = ">=2.0" },
     { name = "jinja2", specifier = ">=3.1" },
-    { name = "mutmut", marker = "extra == 'dev'", specifier = ">=2.5" },
+    { name = "mutmut", marker = "extra == 'dev'", specifier = ">=3.7,<4" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.7" },
     { name = "pydantic", specifier = ">=2.7,<3" },
     { name = "pydantic-settings", specifier = ">=2.2,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.2" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "pytest-cov", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "pytest-randomly", marker = "extra == 'dev'", specifier = ">=3.15" },
     { name = "pyyaml", specifier = ">=6.0" },
@@ -544,6 +548,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/1a/15b92b25eb6ce3089cd49377ae990a0f3ad485a510f968aed1f19dbdcdf2/cryptography-50.0.0-pp311-pypy311_pp73-manylinux_2_34_aarch64.whl", hash = "sha256:62598a8a57f815db4c6259a4e97d857dab56697e7de8e8ab02352ab74da1995d", size = 4691924, upload-time = "2026-07-31T14:24:58.082Z" },
     { url = "https://files.pythonhosted.org/packages/62/15/219075012ab13e8905f3cd572204f4acb4b111df787104346b9bc0cea789/cryptography-50.0.0-pp311-pypy311_pp73-manylinux_2_34_x86_64.whl", hash = "sha256:07479a1cb08219ab719147e742e76090c9c773321959bb94946fffdd397a6437", size = 4699593, upload-time = "2026-07-31T14:24:59.951Z" },
     { url = "https://files.pythonhosted.org/packages/8e/b5/c2c5fce26f0ee40d21bafe7f191d29a34b35a65ac4fe8a1191d1983612e9/cryptography-50.0.0-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:c99c003e088647b8a5b7c145d6f78c335f6348332b62e142d411c4b63d1460b9", size = 3813796, upload-time = "2026-07-31T14:25:02.298Z" },
+]
+
+[[package]]
+name = "defusedxml"
+version = "0.7.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/d5/c66da9b79e5bdb124974bfe172b4daf3c984ebd9c2a06e2b8a4dc7331c72/defusedxml-0.7.1.tar.gz", hash = "sha256:1bb3032db185915b62d7c6209c5a8792be6a32ab2fedacc84e01b52c51aa3e69", size = 75520, upload-time = "2021-03-08T10:59:26.269Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/07/6c/aa3f2f849e01cb6a001cd8554a88d4c77c5c1a31c95bdf1cf9301e6d9ef4/defusedxml-0.7.1-py2.py3-none-any.whl", hash = "sha256:a352e7e428770286cc899e2542b6cdaedb2b4953ff269a210103ec58f6198a61", size = 25604, upload-time = "2021-03-08T10:59:24.45Z" },
 ]
 
 [[package]]
@@ -1586,6 +1599,19 @@ wheels = [
 ]
 
 [[package]]
+name = "pytest-asyncio"
+version = "1.4.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pytest" },
+    { name = "typing-extensions", marker = "python_full_version < '3.13'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/43/7c/d36d04db312ecf4298932ef77e6e4a9e8ad017906e24e34f0b0c361a2473/pytest_asyncio-1.4.0.tar.gz", hash = "sha256:c6c0d2259945122819f171a32ecea2c349ead889ee28176caaf492143424be42", size = 58514, upload-time = "2026-05-26T09:56:04.083Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/e2/08a497ef684b88559c9cc5f4ad53a37e7b99e727094a86d6ea32536d5d3c/pytest_asyncio-1.4.0-py3-none-any.whl", hash = "sha256:933ca923a23075a87fb7070c0ec272a6848489824d887c85c812670932835aa1", size = 16930, upload-time = "2026-05-26T09:56:02.576Z" },
+]
+
+[[package]]
 name = "pytest-cov"
 version = "7.1.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2192,8 +2218,8 @@ name = "uvicorn"
 version = "0.52.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "click" },
-    { name = "h11" },
+    { name = "click", marker = "python_full_version != '3.12.*' or sys_platform != 'emscripten'" },
+    { name = "h11", marker = "python_full_version != '3.12.*' or sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/f2/0f/3f86e61397dd33bf2ccf28188c40db6a740658aeebbbf6e7dbc101a1f487/uvicorn-0.52.4.tar.gz", hash = "sha256:73acfee47a0b133c5de13d219492d62d8a31e935f4fe6e41a232451a15379f86", size = 100627, upload-time = "2026-08-19T06:27:41.821Z" }
 wheels = [

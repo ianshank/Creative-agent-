@@ -1,0 +1,38 @@
+name: Mutation testing
+
+# The enforcement core (severity capping, gates, verification, consistency) is where a
+# softened comparison is the worst silent failure the harness can have. Line and branch
+# coverage cannot see that; a surviving mutant can. Weekly rather than per-PR because a
+# full run is slow, and advisory rather than blocking until a kill-rate baseline exists.
+
+on:
+  schedule:
+    - cron: "0 4 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mutmut:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@887a942a15af3a7626099df99e897a18d9e5ab3a # v5.1.0
+        with:
+          enable-cache: true
+      - run: uv python install 3.11
+      - run: uv sync --all-extras --locked
+      # mutmut 3.x copies the tree into ./mutants and re-runs pytest there, which needs
+      # the package metadata to resolve in that copy. Advisory (continue-on-error) until
+      # that sandbox setup is settled; the mutants themselves generate correctly, and
+      # tests/unit/test_project_config.py guards the config from silently rotting again.
+      - name: Run mutation testing on the enforcement core
+        continue-on-error: true
+        run: |
+          cp README.md mutants/README.md 2>/dev/null || true
+          uv run mutmut run --max-children 4
+      - name: Report surviving mutants
+        if: always()
+        run: uv run mutmut results || true

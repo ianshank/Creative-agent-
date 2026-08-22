@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from creative_agent.harness.llm.base import AssembledPrompt, CallKind, RawLLMResult
+    from creative_agent.harness.llm.base import AssembledPrompt, RawLLMResult
     from creative_agent.models.oracle import OracleTable, SourceRef
     from creative_agent.models.review import ReviewRequest
     from creative_agent.models.state import ReviewState
@@ -37,7 +37,7 @@ class StateStore(Protocol):
 
     def load(self, artifact_id: str) -> ReviewState: ...
 
-    def save(self, state: ReviewState) -> Path: ...
+    def save(self, state: ReviewState, summary_markdown: str = "") -> Path: ...
 
 
 @runtime_checkable
@@ -75,8 +75,8 @@ class ReviewAgent(Protocol):
 
     def default_oracle(self) -> str: ...
 
-    def prompt_template(self, kind: CallKind) -> str:
-        """Return the jinja2 template name for a call kind."""
+    def prompt_template_dir(self) -> str:
+        """Template directory name under the prompt search paths (e.g. "sutton")."""
         ...
 
     def build_context(

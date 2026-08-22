@@ -12,33 +12,63 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Pinned so a local `make gate` and CI resolve the same environment.
+  UV_VERSION: "0.5.11"
+
 jobs:
   lint:
+    name: Lint, types, layering
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: astral-sh/setup-uv@887a942a15af3a7626099df99e897a18d9e5ab3a # v5.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           enable-cache: true
       - run: uv python install 3.11
-      - run: uv sync --all-extras --locked
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run mypy
-      - run: uv run lint-imports
+      - run: make install
+      # CI calls the same Makefile targets a contributor runs, so the two cannot drift.
+      - run: make lint
+      - run: make types
+      - run: make layering
 
-  oracle-validate:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # the action enumerates a PR's commits through the API
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0 # gitleaks scans history, not just the tip
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@83373cf2f8c4db6e24b41c1a9b086bb9619e9cd3 # v2.3.7
+        env:
+          GITLEAKS_CONFIG: .gitleaks.toml
+          # Required on pull_request events since v2: without it the action exits
+          # non-zero before scanning anything, which reads as a leak but is a
+          # configuration failure. Push events do not need it, so the gap is invisible
+          # until the first PR.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  data-validate:
+    name: Oracle and asset data
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: astral-sh/setup-uv@887a942a15af3a7626099df99e897a18d9e5ab3a # v5.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           enable-cache: true
       - run: uv python install 3.11
-      - run: uv sync --all-extras --locked
-      - run: uv run creative-agent oracles validate --all
+      - run: make install
+      - run: make oracles
+      - run: make assets
 
   test:
+    name: Tests (py${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -48,15 +78,16 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: astral-sh/setup-uv@887a942a15af3a7626099df99e897a18d9e5ab3a # v5.1.0
         with:
+          version: ${{ env.UV_VERSION }}
           enable-cache: true
       - run: uv python install ${{ matrix.python-version }}
-      - run: uv sync --all-extras --locked
-      # The coverage gate (branch, --cov-fail-under=90) lives in pyproject addopts so local
-      # runs and CI enforce the same bar. The 3.11 leg additionally checks per-package floors.
-      - run: uv run pytest
-      - name: Per-package coverage floors
+      - run: make install
+      # The coverage gate (branch, --cov-fail-under=90) lives in pyproject addopts so
+      # local runs and CI enforce the same bar.
+      - run: make test
+      - name: Per-package and per-module coverage floors
         if: matrix.python-version == '3.11'
-        run: uv run python scripts/check_coverage_floors.py coverage.xml
+        run: make coverage-floors
       - name: Upload coverage
         if: matrix.python-version == '3.11'
         uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
@@ -64,14 +95,33 @@ jobs:
           name: coverage-xml
           path: coverage.xml
 
+  container:
+    name: Container build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Build runtime image
+        uses: docker/build-push-action@4f58ea79222b3b9dc2c8bbdd6debcef730109a75 # v6.9.0
+        with:
+          context: .
+          target: runtime
+          push: false
+          load: true
+          tags: creative-agent:ci
+      - name: Image entrypoint works and ships valid oracle data
+        run: docker run --rm creative-agent:ci oracles validate --all
+
   canary-latest-deps:
-    # Weekly job also runs on schedule via live.yml; on PRs this is advisory only.
+    name: Unpinned dependency canary
+    # Advisory: catches upstream breakage deliberately rather than at upgrade time.
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: astral-sh/setup-uv@887a942a15af3a7626099df99e897a18d9e5ab3a # v5.1.0
+        with:
+          version: ${{ env.UV_VERSION }}
       - run: uv python install 3.11
-      - run: uv sync --all-extras --upgrade
-      - run: uv run pytest -q
+      - run: make install-unlocked
+      - run: make test

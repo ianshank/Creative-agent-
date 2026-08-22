@@ -2,12 +2,19 @@
 
 ## Commands
 
-- Install: `uv sync --all-extras` (or `pip install -e ".[dev,llm]"`)
-- Test: `uv run pytest` (coverage gate: branch, 90% global; live tests excluded by default)
-- Lint/format: `uv run ruff check .` / `uv run ruff format .`
-- Types: `uv run mypy`
-- Layering: `uv run lint-imports` — `harness/` and `models/` must never import `agents/`
-- Oracle check: `uv run creative-agent oracles validate --all`
+Prefer the Makefile: it is the single definition of the gates, and CI calls the same
+targets, so anything green locally should be green in CI.
+
+- `make install` — locked dev environment
+- `make gate` — lint, types, layering, oracle + asset validation, tests, coverage floors
+- `make format` — apply ruff fixes and formatting
+- `make test` / `make live` / `make mutation` / `make secrets`
+- `make docker-test` — run the gate inside the container
+- `make help` — every target
+
+Underlying commands, if you need one in isolation: `uv run pytest`,
+`uv run ruff check .`, `uv run mypy`, `uv run lint-imports`,
+`uv run creative-agent oracles validate --all`, `uv run creative-agent assets validate`.
 
 ## Non-negotiable conventions
 
@@ -23,8 +30,16 @@
   schemas all carry versions; changing one needs a migration path and a frozen old-version
   test fixture.
 - The shipped `sutton.v2.yaml` is used in tests only for validation + named invariants
-  (e.g. D2 author list). Engine behavior tests use synthetic mini-oracles in
-  `tests/fixtures/oracles/`.
+  (e.g. the D2 author list). Engine behavior tests build synthetic oracles with
+  `tests/factories.py::make_oracle` so product-data churn cannot break them.
+- **Observability:** log through `harness/logging.py` (`get_logger`, `log_event`,
+  `timed_stage`) with stable event names — never `print`. Never log prompts or artifact
+  text; log sizes, ids, counts, and durations.
+- **Assets are data too:** changes under `.claude/` must keep `make assets` green —
+  agent filenames match their `name`, skills have trigger-worthy descriptions, hooks stay
+  executable and use `set -e`.
+- **Record the change:** user-visible changes get a `CHANGELOG.md` entry under
+  Unreleased; deferred work goes in `docs/roadmap.md` rather than a TODO comment.
 
 ## Reviewing artifacts in other repos (worktree workflow)
 
@@ -43,5 +58,25 @@ Review state and audit bundles stay in **this** repo under `docs/review-log/`. T
 
 - `.claude/agents/sutton-review.md` — subagent that delegates to the CLI and relays the
   rendered report unmodified.
-- `.claude/skills/oracle-rebaseline/` — procedure for re-verifying doctrine sources
-  (DOI/arXiv resolution + author-list diff).
+- `.claude/skills/add-oracle/` — add a review corpus (data only, no code).
+- `.claude/skills/review-gate/` — run and interpret the full local quality gate.
+- `.claude/skills/oracle-rebaseline/` — re-verify doctrine sources (DOI/arXiv resolution
+  + mechanical author-list diff).
+- `.claude/hooks/session-start.sh` — SessionStart: `uv sync` so a fresh container can run
+  the suite immediately.
+- `.claude/hooks/validate-data.sh` — PostToolUse: re-validates oracle data after any
+  edit under `data/oracles`, blocking on a schema break (exit 2) so it surfaces at edit
+  time rather than in CI.
+
+## Recurring work (loops)
+
+Long-running checks are better as an interval than a habit:
+
+```
+/loop 30m run the review-gate skill and fix anything it reports
+/loop 1h  check PR CI status and address failures
+```
+
+Scheduled equivalents already run in CI: the weekly live-SDK verification
+(`.github/workflows/live.yml`) and weekly mutation testing
+(`.github/workflows/mutation.yml`).

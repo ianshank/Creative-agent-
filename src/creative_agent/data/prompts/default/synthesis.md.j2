@@ -1,0 +1,18 @@
+Synthesis — prose only. The findings table is assembled by the harness from the sweeps;
+do NOT restate findings here.
+
+Write:
+- headline: the single most consequential problem, stated plainly (never open with
+  agreement or praise).
+- confidence: Certain / Likely / Guessing — for the verdict as a whole.
+- what_survives: name specifically what in the design holds up.
+- residual_risks: risks that remain even if every finding is fixed.
+
+Findings summary for context (severities are final, do not dispute them):
+{% for f in findings_summary %}
+- [{{ f.severity }}] {{ f.summary }}
+{% else %}
+- (no findings)
+{% endfor %}
+
+Mode: {{ mode }} | class: {{ artifact_class }}

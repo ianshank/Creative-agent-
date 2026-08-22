@@ -1,0 +1,12 @@
+Extract every quantitative or measurable design claim from the artifact (protocol step 5).
+
+For each claim, report per-gate status using EXACTLY these gate names:
+{% for gate in oracle.gate_policy.gates %}
+- {{ gate.name }}: {{ gate.description }}{% if gate.anchors %} (anchor: {{ gate.anchors | join("; ") }}){% endif %}
+{% endfor %}
+
+Also report provenance flags for each numeric claim: {{ oracle.gate_policy.quant_claim_requires | join(", ") }}.
+A number with none of these is hand-asserted regardless of plausibility — report the
+flags honestly; the harness scores them.
+
+{{ artifact }}
