@@ -8,7 +8,7 @@ from hypothesis import strategies as st
 
 from creative_agent.harness.severity import SeverityPolicy
 from creative_agent.models.findings import Severity, SupportRef
-from creative_agent.models.oracle import FreshnessMeta, OracleTable
+from creative_agent.models.oracle import FreshnessMeta, OracleTable, SeverityPolicyConfig
 from creative_agent.models.review import ReviewMode
 from tests.factories import make_finding, make_key, make_oracle, make_row, make_source
 
@@ -193,3 +193,68 @@ class TestProperties:
         assert once.original_severity is severity
         twice = policy.cap(once, mode)
         assert twice.severity is once.severity
+
+
+class TestUnknownAndEmptySupports:
+    """SeverityPolicy is a public seam; it must fail closed on inputs the pipeline
+    would normally filter out."""
+
+    def test_unknown_row_in_supports_does_not_escape_the_staleness_cap(self) -> None:
+        policy = SeverityPolicy(
+            oracle_with(
+                [make_row("D1", sources=[make_source(verified=False)]), make_row("D2")],
+                freshness=STALE_FRESHNESS,
+            )
+        )
+        finding = make_finding(
+            severity=Severity.MAJOR,
+            original_severity=Severity.MAJOR,
+            doctrine_refs=["D1", "DZ9"],
+            supports=[doctrine("D1"), doctrine("DZ9")],
+        )
+        # An unknown ref must not become a laundering route around the cap.
+        assert policy.cap(finding, "conformance").severity is Severity.MINOR
+
+    def test_unknown_row_alone_cannot_justify_a_blocker(self) -> None:
+        policy = SeverityPolicy(make_oracle())
+        finding = make_finding(
+            severity=Severity.BLOCKER,
+            original_severity=Severity.BLOCKER,
+            doctrine_refs=["DZ9"],
+            supports=[doctrine("DZ9")],
+        )
+        assert policy.cap(finding, "conformance").severity is Severity.MAJOR
+
+    def test_restrictive_blocker_policy_downgrades_gate_only_findings(self) -> None:
+        """blocker_requires_any_of is data: a narrower list must actually bind."""
+        oracle = make_oracle(
+            severity_policy=SeverityPolicyConfig(
+                unverified_row_cap=Severity.MINOR,
+                blocker_requires_any_of=["tier_pr_or_ap_row"],
+            )
+        )
+        finding = make_finding(
+            severity=Severity.BLOCKER,
+            original_severity=Severity.BLOCKER,
+            doctrine_refs=[],
+            supports=[SupportRef(kind="gate_failure", ref="observable")],
+        )
+        assert SeverityPolicy(oracle).cap(finding, "conformance").severity is Severity.MAJOR
+
+    def test_blocker_tiers_are_configurable(self) -> None:
+        """An oracle can require peer review specifically, not PR-or-AP."""
+        oracle = make_oracle(
+            rows=[make_row("D1", tier="AP", sources=[make_source(tier="AP")])],
+            severity_policy=SeverityPolicyConfig(
+                unverified_row_cap=Severity.MINOR,
+                blocker_requires_any_of=["tier_pr_or_ap_row"],
+                blocker_tiers=["PR"],
+            ),
+        )
+        finding = make_finding(
+            severity=Severity.BLOCKER,
+            original_severity=Severity.BLOCKER,
+            doctrine_refs=["D1"],
+            supports=[doctrine("D1")],
+        )
+        assert SeverityPolicy(oracle).cap(finding, "conformance").severity is Severity.MAJOR

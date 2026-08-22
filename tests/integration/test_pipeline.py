@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from creative_agent.errors import ReviewFailedError
+from creative_agent.errors import LLMOutputError, ReviewFailedError
 from creative_agent.harness.llm.base import CallKind, ToolEvidence
 from creative_agent.harness.llm.fake import FakeLLMClient, script_key
 from creative_agent.models.findings import Severity
@@ -197,6 +197,49 @@ class TestEscalation:
         assert "STOP — charter review triggered" in outcome.rendered
 
 
+class TestDeterministicGatesCannotBeWaived:
+    """The model supplies judgement, never permission: a deterministic obligation must
+    not be clearable by the model's own say-so."""
+
+    async def test_model_cannot_waive_a_missing_required_section(self, tmp_path: Path) -> None:
+        # classify claims the safety section is present; the artifact has no such heading.
+        scripts = base_scripts(
+            classify=classify_payload(artifact_class="deployment_blueprint", safety=True)
+        )
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake)
+        outcome = await pipeline.run(request_for(tmp_path, PLAIN_ARTIFACT))
+        assert any("safety section" in f.summary for f in outcome.result.findings)
+
+    async def test_real_heading_satisfies_the_section_gate(self, tmp_path: Path) -> None:
+        scripts = base_scripts(
+            classify=classify_payload(artifact_class="deployment_blueprint", safety=False)
+        )
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake)
+        # CONFORMANT_ARTIFACT carries a real "## Safety" heading.
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert not any("safety section" in f.summary for f in outcome.result.findings)
+
+
+class TestUnrepairableDefects:
+    async def test_unrepairable_defect_fails_without_burning_the_budget(
+        self, tmp_path: Path
+    ) -> None:
+        """Tool-honesty and attribution defects name no row, so re-running the same
+        calls cannot fix them; the review must fail immediately rather than pay for
+        identical retries."""
+        scripts = base_scripts(synthesis_count=0)
+        bad = synthesis_payload(headline="Doe would say this is fine.")
+        scripts[script_key(CallKind.SYNTHESIS)] = [raw(CallKind.SYNTHESIS, bad)]
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake, max_regen=2)
+        with pytest.raises(ReviewFailedError, match="no repairable call"):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        synthesis_calls = [c for c in fake.calls if c.kind is CallKind.SYNTHESIS]
+        assert len(synthesis_calls) == 1, "must not re-synthesize when nothing is repairable"
+
+
 class TestSpecDeltaScenarios:
     async def test_oak_label_refusal_names_missing_elements(self, tmp_path: Path) -> None:
         oracle = make_oracle(
@@ -300,3 +343,119 @@ class TestSpecDeltaScenarios:
             f.key.render() == f"{placeholder}+dec-s1-missing-decision"
             for f in outcome.result.findings
         )
+
+
+class TestPipelineBranches:
+    """Paths the happy-path suite never reaches."""
+
+    async def test_explicit_mode_bypasses_auto_detection(self, tmp_path: Path) -> None:
+        scripts = base_scripts(classify=classify_payload(recommendation="advisory", evidence=None))
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake)
+        request = request_for(tmp_path, PLAIN_ARTIFACT, mode="conformance")
+        outcome = await pipeline.run(request)
+        assert outcome.result.mode == "conformance"
+        assert not outcome.result.mode_uncertain
+
+    async def test_unknown_artifact_class_reprobes_then_fails(self, tmp_path: Path) -> None:
+        bad = classify_payload(artifact_class="poem")
+        scripts = base_scripts(classify=bad)
+        scripts[script_key(CallKind.CLASSIFY)].append(raw(CallKind.CLASSIFY, bad))
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake)
+        with pytest.raises(LLMOutputError, match="unknown artifact class"):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+
+    async def test_unknown_artifact_class_recovers_on_reprobe(self, tmp_path: Path) -> None:
+        scripts = base_scripts(classify=classify_payload(artifact_class="poem"))
+        scripts[script_key(CallKind.CLASSIFY)].append(raw(CallKind.CLASSIFY, classify_payload()))
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake)
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert outcome.result.artifact_class == "architecture_design"
+
+    async def test_schema_violation_retries_then_raises(self, tmp_path: Path) -> None:
+        scripts = base_scripts()
+        scripts[script_key(CallKind.CLASSIFY)] = [
+            raw(CallKind.CLASSIFY, {"nonsense": True}),
+            raw(CallKind.CLASSIFY, {"nonsense": True}),
+        ]
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake, max_regen=1)
+        with pytest.raises(LLMOutputError, match="failed schema validation"):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+
+    async def test_mislabelled_row_response_is_normalized(self, tmp_path: Path) -> None:
+        """A model answering for the wrong row must not overwrite another row's verdict."""
+        scripts = base_scripts(
+            rows={"D2": [row_payload("D1", "not_applicable", na_reason="wrong row id")]}
+        )
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake)
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        by_row = {d.row_id: d for d in outcome.report.row_dispositions}
+        assert set(by_row) == {"D1", "D2"}
+        assert by_row["D2"].na_reason == "wrong row id"
+
+    async def test_source_quality_and_judgement_findings_are_assembled(
+        self, tmp_path: Path
+    ) -> None:
+        evidence = [
+            ToolEvidence(tool_name="WebFetch", target="https://arxiv.org/abs/2001.00001", ok=True)
+        ]
+        scripts = base_scripts(evidence=evidence)
+        scripts[script_key(CallKind.SOURCE_QUALITY)] = [
+            raw(
+                CallKind.SOURCE_QUALITY,
+                {
+                    "load_bearing_violations": [
+                        finding_payload(anchor="preprint-carries-two-conclusions")
+                    ],
+                    "regime_break_findings": [finding_payload(anchor="supervised-to-rl")],
+                    "verification_entries": [verified_entry("D1")],
+                },
+            )
+        ]
+        scripts[script_key(CallKind.JUDGEMENT)] = [
+            raw(
+                CallKind.JUDGEMENT,
+                {
+                    "baselines": [
+                        {
+                            "advantage": "faster",
+                            "simplest_baseline": "a linear model",
+                            "compared_in_artifact": False,
+                            "finding": finding_payload(anchor="no-baseline-comparison"),
+                        }
+                    ],
+                    "falsifiability": [
+                        {
+                            "prediction": "error drops",
+                            "surprising_result": "no drop at all",
+                            "above_null": False,
+                            "finding": finding_payload(anchor="threshold-below-null"),
+                        }
+                    ],
+                    "scope": [
+                        {
+                            "reference": "companion safety analysis",
+                            "supplied": False,
+                            "treated_as_unverified": True,
+                        }
+                    ],
+                    "verification_entries": [verified_entry("D1")],
+                },
+            )
+        ]
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake)
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        anchors = {f.key.slug for f in outcome.result.findings}
+        assert {
+            "preprint-carries-two-conclusions",
+            "supervised-to-rl",
+            "no-baseline-comparison",
+            "threshold-below-null",
+        } <= anchors
+        assert outcome.report.scope_items[0].reference == "companion safety analysis"
+        assert "companion safety analysis" in outcome.rendered

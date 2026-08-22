@@ -45,7 +45,11 @@ class SeverityPolicy:
 
     def _tier_cap(self, finding: Finding) -> tuple[Severity, str] | None:
         """The spec's "alone" semantics: a cap binds only when every support falls
-        inside the capped tiers and nothing else legitimizes the finding."""
+        inside the capped tiers and nothing else legitimizes the finding.
+
+        Unknown row references carry no evidence, so they are ignored rather than
+        treated as corroboration — otherwise citing a nonexistent row would lift a cap.
+        """
         doctrine = self._doctrine_supports(finding)
         if not doctrine:
             return None
@@ -54,7 +58,7 @@ class SeverityPolicy:
             return None
         for cap in self._policy.tier_caps:
             capped_tiers = set(cap.tiers)
-            tiers = {self._row_tier(s.ref) for s in doctrine}
+            tiers = {tier for s in doctrine if (tier := self._row_tier(s.ref)) is not None}
             if tiers and tiers <= capped_tiers:
                 return Severity.parse(cap.max_solo_severity), cap.reason
         return None
@@ -63,12 +67,14 @@ class SeverityPolicy:
         doctrine = self._doctrine_supports(finding)
         if not doctrine:
             return None
+        # Unknown refs contribute no freshness; a finding whose only *resolvable*
+        # support is stale must still be capped.
         rows = []
         for support in doctrine:
             try:
                 rows.append(self._oracle.row(support.ref))
             except KeyError:
-                return None
+                continue
         if rows and all(row.is_stale(self._oracle.freshness) for row in rows):
             cap = Severity.parse(self._policy.unverified_row_cap)
             return cap, (

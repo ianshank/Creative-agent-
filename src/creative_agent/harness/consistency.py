@@ -59,12 +59,17 @@ def extract_definitions(
     patterns = _build_patterns(max_symbol_length, max_definition_length)
     ignored = {word.casefold() for word in prose_symbols}
     definitions: dict[str, list[str]] = defaultdict(list)
-    in_code_fence = False
-    for line in text.splitlines():
-        if line.lstrip().startswith("```"):
-            in_code_fence = not in_code_fence
-            continue
-        if in_code_fence:
+    lines = text.splitlines()
+    # Only suppress fenced regions that actually close. An unterminated fence would
+    # otherwise blind the Blocker-tier duplicate-definition sweep for the whole
+    # remainder of the document — a fail-open an artifact could trigger with one stray
+    # backtick line.
+    fence_rows = [i for i, line in enumerate(lines) if line.lstrip().startswith("```")]
+    fenced: set[int] = set()
+    for opener, closer in zip(fence_rows[::2], fence_rows[1::2], strict=False):
+        fenced.update(range(opener, closer + 1))
+    for index, line in enumerate(lines):
+        if index in fenced or line.lstrip().startswith("```"):
             continue
         for pattern in patterns:
             match = pattern.search(line)

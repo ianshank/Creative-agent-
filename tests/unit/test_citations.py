@@ -81,6 +81,33 @@ class TestResolver:
         source = make_source(arxiv_id=None, url="https://example.org/x")
         assert (await resolver().resolve(source)).status == "skipped"
 
+    @respx.mock
+    async def test_arxiv_error_entry_is_unreachable_not_mismatch(self) -> None:
+        """A typo'd id must not be reported as the fabricated-citation defect class."""
+        error_feed = (
+            '<feed xmlns="http://www.w3.org/2005/Atom"><entry>'
+            "<id>http://arxiv.org/api/errors#incorrect_id_format</id>"
+            "<title>Error</title><author><name>arXiv api core</name></author>"
+            "</entry></feed>"
+        )
+        respx.get(API).mock(return_value=httpx.Response(200, text=error_feed))
+        result = await resolver().resolve(make_source(authors=["Jane Doe"]))
+        assert result.status == "unreachable"
+
+    @respx.mock
+    async def test_source_without_declared_authors_is_not_verified(self) -> None:
+        """An undeclared author list must not be laundered into a verified source."""
+        respx.get(API).mock(return_value=httpx.Response(200, text=atom("A Paper", ["Someone"])))
+        result = await resolver().resolve(make_source(authors=[]))
+        assert result.status == "unreachable"
+        assert "declares no authors" in result.detail
+
+    @respx.mock
+    async def test_blank_author_string_does_not_crash(self) -> None:
+        respx.get(API).mock(return_value=httpx.Response(200, text=atom("A Paper", ["Jane Doe"])))
+        result = await resolver().resolve(make_source(authors=["   ", "Jane Doe"]))
+        assert result.status == "resolved"
+
     async def test_null_resolver_skips(self) -> None:
         assert (await NullCitationResolver().resolve(make_source())).status == "skipped"
 

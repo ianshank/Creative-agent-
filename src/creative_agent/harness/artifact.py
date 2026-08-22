@@ -10,7 +10,9 @@ from creative_agent.errors import ConfigError
 from creative_agent.models.findings import normalize_slug
 
 _REVIEW_ID = re.compile(r"^review-id:\s*(?P<id>[A-Za-z0-9][A-Za-z0-9._-]*)\s*$", re.MULTILINE)
-_FRONT_MATTER = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
+# Tolerate a UTF-8 BOM and CRLF: a Windows checkout of the same document must resolve to
+# the same artifact id, or its cycle history and escalation counter silently reset.
+_FRONT_MATTER = re.compile(r"\A﻿?---\r?\n.*?\r?\n---\r?\n", re.DOTALL)
 
 # An artifact id becomes a path segment (docs/review-log/<id>.md and the audit bundle
 # directory), so it must be a single safe filename component: no separators, no traversal,
@@ -32,18 +34,26 @@ def validate_artifact_id(candidate: str, *, source: str) -> str:
 
 
 def read_artifact(path: Path, max_bytes: int) -> str:
+    """Read an artifact, refusing oversized files before loading them into memory."""
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise ConfigError(f"cannot read artifact {path}: {exc}") from exc
+    if size > max_bytes:
+        raise ConfigError(f"artifact {path} exceeds {max_bytes} bytes ({size} bytes)")
     try:
         data = path.read_bytes()
     except OSError as exc:
         raise ConfigError(f"cannot read artifact {path}: {exc}") from exc
-    if len(data) > max_bytes:
+    if len(data) > max_bytes:  # e.g. a file that grew between stat and read
         raise ConfigError(f"artifact {path} exceeds {max_bytes} bytes")
     return data.decode("utf-8", errors="replace")
 
 
 def content_sha256(text: str) -> str:
-    """Digest over LF-normalized bytes so CRLF checkouts don't change identity."""
-    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    """Digest over LF-normalized, BOM-stripped bytes so a CRLF or BOM-carrying checkout
+    of the same document hashes identically."""
+    normalized = text.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 

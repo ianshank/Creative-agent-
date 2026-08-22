@@ -6,9 +6,17 @@ from pydantic import ValidationError
 from creative_agent.models.findings import FindingKey, Severity, normalize_slug
 from creative_agent.models.oracle import (
     ArtifactClassRule,
+    AttributionConfig,
+    DecisionLogGrammar,
+    DecisionTrap,
     FreshnessMeta,
+    GateDefinition,
+    GatePolicy,
+    LabelElement,
+    OakConformanceSpec,
     OracleRow,
     OracleTable,
+    ProtocolConfig,
 )
 from creative_agent.models.sweeps import RowDisposition
 from creative_agent.models.verification import VerificationEntry
@@ -158,3 +166,84 @@ class TestStaleness:
             disclosed_gap=True,
         )
         assert not gap.is_stale(oracle.freshness.model_copy(update={"rebaseline_count": 99}))
+
+
+class TestOracleCrossReferenceInvariants:
+    """Every cross-field invariant needs a negative test, or the validator is decoration."""
+
+    def test_non_gap_row_without_sources_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="need at least one source"):
+            make_row(sources=[])
+
+    def test_duplicate_gate_names_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="duplicate gate names"):
+            GatePolicy(
+                gates=[
+                    GateDefinition(name="observable", description="a"),
+                    GateDefinition(name="observable", description="b"),
+                ],
+                missing_any_severity=Severity.MAJOR,
+                hand_asserted_severity=Severity.MAJOR,
+            )
+
+    def test_duplicate_artifact_class_names_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="duplicate artifact class names"):
+            make_oracle(
+                artifact_classes=[
+                    ArtifactClassRule(name="design"),
+                    ArtifactClassRule(name="design"),
+                ]
+            )
+
+    def test_decision_trap_must_reference_a_required_decision(self) -> None:
+        with pytest.raises(ValidationError, match="not in required_decisions"):
+            make_oracle(
+                required_decisions=["DEC-S1"],
+                decision_traps=[DecisionTrap(decision_id="DEC-S9", trap="x")],
+            )
+
+    def test_label_conformance_doctrine_ref_must_exist(self) -> None:
+        with pytest.raises(ValidationError, match="not a known row"):
+            make_oracle(
+                oak_conformance=OakConformanceSpec(
+                    label_pattern="X",
+                    doctrine_ref="Z9",
+                    missing_severity=Severity.MAJOR,
+                    features=[LabelElement(label="f", patterns=["f"])],
+                    stages=[LabelElement(label="s", patterns=["s"])],
+                )
+            )
+
+    def test_placeholder_row_id_must_not_look_like_a_row(self) -> None:
+        with pytest.raises(ValidationError, match="collide with a real doctrine row"):
+            make_oracle(
+                protocol=ProtocolConfig(
+                    escalation_cycle=3, unverified_marker="[U]", placeholder_row_id="G0"
+                )
+            )
+
+    def test_offline_artifact_class_must_be_declared(self) -> None:
+        with pytest.raises(ValidationError, match="not a declared artifact class"):
+            make_oracle(
+                protocol=ProtocolConfig(
+                    escalation_cycle=3,
+                    unverified_marker="[U]",
+                    offline_artifact_class="nonexistent",
+                )
+            )
+
+    def test_uncompilable_impersonation_pattern_rejected(self) -> None:
+        with pytest.raises(ValidationError, match="invalid regex"):
+            AttributionConfig(impersonation_patterns=["(unclosed"])
+
+    def test_decision_grammar_requires_named_groups(self) -> None:
+        with pytest.raises(ValidationError, match="named groups"):
+            DecisionLogGrammar(entry_pattern=r"^## DEC-\d+", confirmed_status="CONFIRMED")
+
+    def test_row_lookup_raises_for_unknown_id(self) -> None:
+        with pytest.raises(KeyError):
+            make_oracle().row("ZZ9")
+
+    def test_severity_parse_rejects_unsupported_type(self) -> None:
+        with pytest.raises(ValueError, match="cannot parse severity"):
+            Severity.parse(object())

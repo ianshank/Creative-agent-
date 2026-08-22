@@ -25,7 +25,11 @@ _LOG = get_logger(__name__)
 
 
 def _fold_surname(name: str) -> str:
-    decomposed = unicodedata.normalize("NFKD", name.strip().split()[-1])
+    """Last token, diacritic-folded. Blank names fold to "" rather than raising."""
+    parts = name.strip().split()
+    if not parts:
+        return ""
+    decomposed = unicodedata.normalize("NFKD", parts[-1])
     return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
 
 
@@ -60,11 +64,24 @@ class ArxivCitationResolver:
             for author in entry.findall(f"{_ATOM}author")
             if (name := author.findtext(f"{_ATOM}name"))
         ]
-        if not title or ("Error" in title and not authors):
+        # arXiv reports lookup failures as a normal entry titled "Error" whose author is
+        # the API itself — treat that as unreachable, never as an author mismatch, or a
+        # typo'd id would be reported as the fabricated-citation defect class.
+        entry_id = entry.findtext(f"{_ATOM}id") or ""
+        if not title or "arxiv.org/api/errors" in entry_id or title.strip() == "Error":
             return ResolutionResult("unreachable", detail=f"arXiv error entry: {title!r}")
-        declared = [_fold_surname(a) for a in ref.authors]
-        resolved = [_fold_surname(a) for a in authors]
-        if declared and declared != resolved:
+        declared = [folded for a in ref.authors if (folded := _fold_surname(a))]
+        resolved = [folded for a in authors if (folded := _fold_surname(a))]
+        if not declared:
+            # Nothing to diff: an undeclared author list must not be laundered into a
+            # verified source (that would lift the staleness cap for free).
+            return ResolutionResult(
+                "unreachable",
+                resolved_authors=authors,
+                resolved_title=title,
+                detail="source declares no authors; cannot verify attribution",
+            )
+        if declared != resolved:
             return ResolutionResult(
                 "mismatch",
                 resolved_authors=authors,

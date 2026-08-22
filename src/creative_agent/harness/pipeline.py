@@ -177,18 +177,31 @@ class ReviewPipeline:
     # ---- deterministic helpers ------------------------------------------
 
     def _sections_present(self, text: str, classify: ClassifyResult) -> set[str]:
+        """Which required sections the artifact actually contains.
+
+        Determined from the document's own headings ONLY. The model also reports what it
+        saw, but a required-section obligation is a deterministic gate: honouring the
+        model's word would let the reviewer of an untrusted artifact clear a Blocker by
+        asserting it. Disagreement is logged, never obeyed.
+        """
         headings = {m.group("title").strip().casefold() for m in _HEADING.finditer(text)}
-        present: set[str] = set()
-        for rule in self._oracle.artifact_classes:
-            for section in rule.requires_sections:
-                if any(section.casefold() in heading for heading in headings):
-                    present.add(section)
-        # The model reports which required sections it saw; the harness only trusts
-        # names the oracle actually declares.
         declared = {
             section for rule in self._oracle.artifact_classes for section in rule.requires_sections
         }
-        present.update(name for name in classify.sections_present if name in declared)
+        present = {
+            section
+            for section in declared
+            if any(section.casefold() in heading for heading in headings)
+        }
+        unsupported = {n for n in classify.sections_present if n in declared} - present
+        if unsupported:
+            log_event(
+                _LOG,
+                logging.WARNING,
+                "sections.claim_unsupported",
+                claimed=sorted(unsupported),
+                found=sorted(present),
+            )
         return present
 
     def _resolve_mode(
@@ -473,6 +486,22 @@ class ReviewPipeline:
                 row_id: [d for d in defects if _mentions_row(d, row_id)] for row_id in sweep.rows
             }
             defective_rows = sorted(row_id for row_id, matched in defects_by_row.items() if matched)
+            if not defective_rows:
+                # Nothing the repair loop can act on (tool-honesty or attribution
+                # defects, or a class with no row sweeps). Re-running the same calls
+                # would spend the budget to reach the identical outcome.
+                review_failed_reason = (
+                    "verification log defects with no repairable call: " + "; ".join(defects[:5])
+                )
+                log_event(
+                    _LOG,
+                    logging.ERROR,
+                    "verification.unrepairable",
+                    artifact_id=request.artifact_id,
+                    defect_count=len(defects),
+                    defects=defects[:5],
+                )
+                break
             log_event(
                 _LOG,
                 logging.INFO,

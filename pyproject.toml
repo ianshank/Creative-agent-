@@ -35,7 +35,7 @@ dev = [
     "pre-commit>=3.7",
     "import-linter>=2.0",
     "diff-cover>=9.0",
-    "mutmut>=2.5",
+    "mutmut>=3.7,<4",
 ]
 
 [project.scripts]
@@ -107,7 +107,7 @@ source = ["creative_agent"]
 # claude_sdk.py is exercised via mocked-transport unit tests and the weekly live workflow;
 # it is excluded from the line/branch gate so SDK event plumbing cannot be met with fake
 # coverage. Policy: DEC-F8 — any new omit entry requires a decision-log entry.
-omit = ["*/harness/llm/claude_sdk.py", "*/_spike/*"]
+omit = ["*/harness/llm/claude_sdk.py"]
 exclude_also = [
     "if TYPE_CHECKING:",
     "raise NotImplementedError",
@@ -125,5 +125,14 @@ source_modules = ["creative_agent.harness", "creative_agent.models"]
 forbidden_modules = ["creative_agent.agents"]
 
 [tool.mutmut]
-paths_to_mutate = "src/creative_agent/harness/severity.py,src/creative_agent/harness/gates.py,src/creative_agent/harness/verification.py,src/creative_agent/harness/consistency.py"
-runner = "python -m pytest -x -q -m 'not live' --no-cov tests/unit"
+# mutmut 3.x takes a LIST of paths under `source_paths`; the 2.x string form silently
+# iterated characters, so the tool never ran. Scoped to the enforcement core, where a
+# surviving mutant means a softened rule.
+source_paths = [
+    "src/creative_agent/harness/severity.py",
+    "src/creative_agent/harness/gates.py",
+    "src/creative_agent/harness/verification.py",
+    "src/creative_agent/harness/consistency.py",
+]
+tests_dir = "tests/unit"
+pytest_add_cli_args_test_selection = ["tests/unit", "-x", "-q", "--no-cov", "-p", "no:randomly"]

@@ -9,6 +9,7 @@ from creative_agent.errors import ConfigError, LLMTransportError
 from creative_agent.harness.artifact import (
     MAX_ARTIFACT_ID_LENGTH,
     content_sha256,
+    read_artifact,
     resolve_artifact_id,
     validate_artifact_id,
 )
@@ -38,6 +39,46 @@ class TestArtifactIdentity:
 
     def test_sha_ignores_line_endings(self) -> None:
         assert content_sha256("a\r\nb\r") == content_sha256("a\nb\n")
+
+    def test_sha_ignores_bom(self) -> None:
+        assert content_sha256("\ufeff# Doc\n") == content_sha256("# Doc\n")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "\ufeff---\nreview-id: rl-blueprint-7\n---\n",
+            "---\r\nreview-id: rl-blueprint-7\r\n---\r\n",
+            "\ufeff---\r\nreview-id: rl-blueprint-7\r\n---\r\n",
+        ],
+    )
+    def test_bom_and_crlf_do_not_defeat_front_matter(self, text: str, tmp_path: Path) -> None:
+        """A Windows checkout of the same document must keep its cycle history."""
+        assert resolve_artifact_id(tmp_path / "my-doc.md", text, None) == "rl-blueprint-7"
+
+    def test_front_matter_without_review_id_falls_back_to_slug(self, tmp_path: Path) -> None:
+        text = "---\ntitle: Something Else\n---\n"
+        assert resolve_artifact_id(tmp_path / "my-doc.md", text, None) == "my-doc"
+
+    def test_unslugifiable_filename_raises(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="cannot derive"):
+            resolve_artifact_id(tmp_path / "---.md", "no front matter", None)
+
+
+class TestReadArtifact:
+    def test_missing_file_is_config_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="cannot read artifact"):
+            read_artifact(tmp_path / "absent.md", 1000)
+
+    def test_oversized_artifact_rejected_before_reading(self, tmp_path: Path) -> None:
+        path = tmp_path / "big.md"
+        path.write_text("x" * 500, encoding="utf-8")
+        with pytest.raises(ConfigError, match="exceeds 100 bytes"):
+            read_artifact(path, 100)
+
+    def test_invalid_utf8_is_replaced_not_raised(self, tmp_path: Path) -> None:
+        path = tmp_path / "binary.md"
+        path.write_bytes(b"valid \xff\xfe bytes")
+        assert "valid" in read_artifact(path, 1000)
 
 
 class TestArtifactIdSafety:

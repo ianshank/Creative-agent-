@@ -5,10 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+import yaml
 from typer.testing import CliRunner
 
 from creative_agent.cli import app
-from creative_agent.errors import ExitCode
+from creative_agent.errors import ExitCode, ReviewFailedError
+from creative_agent.harness import pipeline as pipeline_module
+from creative_agent.models.oracle import ArtifactClassRule, ProtocolConfig
+from tests.factories import make_oracle
 
 runner = CliRunner()
 
@@ -94,3 +98,81 @@ class TestAgentsAndDecisions:
         log.write_text(f"# Log\n\n{entries}\n", encoding="utf-8")
         result = runner.invoke(app, ["decisions", "check", "--repo", str(tmp_path)])
         assert result.exit_code == 0, result.output
+
+
+class TestExitCodeContract:
+    """The exit-code table is a frozen contract CI consumers depend on."""
+
+    def test_blocker_exits_two_under_conformance_mode(self, env: Path) -> None:
+        # --mode conformance skips fail-closed auto-detection, so the duplicate-gamma
+        # internal contradiction keeps Blocker severity instead of the advisory cap.
+        result = runner.invoke(app, ["review", str(env), "--offline", "--mode", "conformance"])
+        assert result.exit_code == int(ExitCode.BLOCKER_OR_STOP), result.output
+        assert "mode=conformance" in result.output
+
+    def test_review_failure_exits_three(self, env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def boom(self: object, request: object) -> None:
+            raise ReviewFailedError("incomplete verification log")
+
+        monkeypatch.setattr(pipeline_module.ReviewPipeline, "run", boom)
+        result = runner.invoke(app, ["review", str(env), "--offline"])
+        assert result.exit_code == int(ExitCode.REVIEW_FAILED)
+
+    def test_missing_artifact_is_usage_error(self, tmp_path: Path) -> None:
+        result = runner.invoke(app, ["review", str(tmp_path / "absent.md"), "--offline"])
+        assert result.exit_code != 0
+
+    def test_debug_flag_emits_json_logs(self, env: Path) -> None:
+        result = runner.invoke(
+            app, ["--debug", "--log-format", "json", "review", str(env), "--offline"]
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_invalid_log_format_is_config_error(self, env: Path) -> None:
+        result = runner.invoke(app, ["--log-format", "yaml", "oracles", "list"])
+        assert result.exit_code == int(ExitCode.CONFIG_ERROR)
+
+    def test_state_show_lists_findings(self, env: Path) -> None:
+        runner.invoke(app, ["review", str(env), "--offline", "--mode", "conformance"])
+        result = runner.invoke(app, ["state", "show", "controller-design"])
+        assert result.exit_code == 0
+        assert "cycle 1" in result.output
+        assert "disposition=open" in result.output
+
+    def test_state_show_for_unknown_artifact_is_empty(self) -> None:
+        result = runner.invoke(app, ["state", "show", "never-reviewed"])
+        assert result.exit_code == 0
+        assert "cycles: 0" in result.output
+
+
+class TestSecondOracleNeedsNoCode:
+    """The framework's central claim: a new corpus is a new YAML file."""
+
+    def test_review_runs_against_a_non_sutton_oracle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        other = make_oracle(
+            oracle_id="other",
+            name="unrelated corpus",
+            artifact_classes=[
+                ArtifactClassRule(name="policy_memo"),
+                ArtifactClassRule(name="lit_review", source_quality_only=True),
+            ],
+            protocol=ProtocolConfig(
+                escalation_cycle=3,
+                unverified_marker="[unverified]",
+                offline_artifact_class="policy_memo",
+            ),
+        )
+        oracle_dir = tmp_path / "oracles"
+        oracle_dir.mkdir()
+        (oracle_dir / "other.yaml").write_text(
+            yaml.safe_dump(other.model_dump(mode="json", exclude_none=True), sort_keys=False),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("CREATIVE_AGENT_ORACLE_SEARCH_PATHS", str(oracle_dir))
+        artifact = tmp_path / "memo.md"
+        artifact.write_text("# A Memo\n\nNothing doctrinal here.\n", encoding="utf-8")
+        result = runner.invoke(app, ["review", str(artifact), "--oracle", "other", "--offline"])
+        assert result.exit_code == 0, result.output
+        assert "Oracle: other" in result.output

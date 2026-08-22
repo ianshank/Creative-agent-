@@ -19,6 +19,14 @@ class TestExtraction:
         text = "```python\nx = 1\nx = 2\n```\n"
         assert extract_definitions(text) == {}
 
+    def test_unterminated_fence_does_not_blind_the_document(self) -> None:
+        """One stray fence must not disable the Blocker sweep for the whole tail."""
+        text = "```\nsnippet\n\ngamma = 0.99\n\ngamma = 0.5\n"
+        assert extract_definitions(text)["gamma"] == ["0.99", "0.5"]
+
+    def test_configurable_prose_symbols(self) -> None:
+        assert extract_definitions("Nota = importante", prose_symbols=("nota",)) == {}
+
     def test_prose_words_ignored(self) -> None:
         assert extract_definitions("Note = this is important") == {}
 
