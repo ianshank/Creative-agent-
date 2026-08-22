@@ -145,6 +145,60 @@ class TestGenerate:
         assert query.captured["options"].model is None
 
 
+class TestPreToolUseWebFetchEnforcement:
+    """DEC-F11a: the fetch allowlist is enforced at the call boundary, not just stated in
+    the prompt. The mocked transport doesn't run the SDK's hook machinery, so these invoke
+    the wired hook function directly — same as the real SDK would."""
+
+    @staticmethod
+    def _wired_hook(assembled_prompt: AssembledPrompt) -> Any:
+        pytest.importorskip("claude_agent_sdk")
+        options = adapter()._options(assembled_prompt)
+        (matcher,) = options.hooks["PreToolUse"]
+        assert matcher.matcher == "WebFetch"
+        (hook,) = matcher.hooks
+        return hook
+
+    async def test_denies_a_host_outside_the_allowlist(self) -> None:
+        hook = self._wired_hook(
+            prompt().model_copy(update={"fetch_domain_allowlist": ["arxiv.org"]})
+        )
+        result = await hook(
+            {"tool_name": "WebFetch", "tool_input": {"url": "https://evil.example/x"}},
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_allows_a_host_inside_the_allowlist(self) -> None:
+        hook = self._wired_hook(
+            prompt().model_copy(update={"fetch_domain_allowlist": ["arxiv.org"]})
+        )
+        result = await hook(
+            {"tool_name": "WebFetch", "tool_input": {"url": "https://arxiv.org/abs/1"}},
+            "t1",
+            None,
+        )
+        assert result == {}
+
+    async def test_ignores_non_webfetch_tools(self) -> None:
+        """The hook is scoped to WebFetch calls; a Read call is untouched by DEC-F11a."""
+        hook = self._wired_hook(prompt().model_copy(update={"fetch_domain_allowlist": []}))
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": "/anywhere"}}, "t1", None
+        )
+        assert result == {}
+
+    async def test_empty_allowlist_denies_every_host(self) -> None:
+        hook = self._wired_hook(prompt().model_copy(update={"fetch_domain_allowlist": []}))
+        result = await hook(
+            {"tool_name": "WebFetch", "tool_input": {"url": "https://arxiv.org/abs/1"}},
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
 class TestTargetExtraction:
     @pytest.mark.parametrize(
         ("tool_input", "expected"),

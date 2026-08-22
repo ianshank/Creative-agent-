@@ -31,27 +31,28 @@ unpublished preprint, that is the correct end state, not a failure.
 
 ## Near term
 
-### 4. Enforce the tool scope in the SDK session, or narrow the claim
+### 4. Enforce the tool scope in the SDK session, or narrow the claim — **WebFetch half done**
 
-The gap is worse than "advisory" for one half of it: `ThreatGuard.allowed_read_roots` is
-computed and unit-tested but never passed to the SDK or rendered into any prompt — read-path
-scoping is currently fully disconnected, not merely advisory. The fetch-domain allowlist
-*is* genuinely advisory (it reaches the model via the system prompt), but nothing stops a
-`WebFetch` call to an off-allowlist host from executing; only the downstream tool-honesty
-check later refuses to credit any resulting "evidence."
+**Done (DEC-F11a):** a `PreToolUse` hook in `ClaudeSDKAdapter` now denies any `WebFetch`
+call whose host isn't in the review's computed allowlist — the allowlist was previously
+advisory only (stated in the system prompt, never enforced; only the downstream
+tool-honesty check would later refuse to credit resulting "evidence," after the call had
+already run). Uses `PreToolUse`, not `can_use_tool`: this project's
+`permission_mode="dontAsk"` means `can_use_tool` is very likely dead code here, since it
+only fires when permission evaluation would otherwise prompt, and `dontAsk`'s entire
+purpose is to skip that. Implemented and unit-tested against the mocked-transport
+`ClaudeSDKAdapter` with no API key needed; only final live confirmation is still
+owner-blocked (item 1). See `docs/decision-log.md` DEC-F11.
 
-**Correction to the previous wording:** deciding the enforcement mechanism does *not* need
-the live SDK (item 1) — `ClaudeAgentOptions.hooks` exposes a `PreToolUse` hook that fires on
-every tool call regardless of `allowed_tools`, and this project's `permission_mode =
-"dontAsk"` (`config.py`) means the alternative `can_use_tool` callback is very likely never
-invoked here, since it only fires when permission evaluation would otherwise prompt.
-`PreToolUse` is implementable and unit-testable now, against the existing mocked-transport
-`ClaudeSDKAdapter` tests; only the *final live confirmation* needs the API key. Plan: split
-into WebFetch host enforcement (higher severity — a live outbound network primitive) and
-Read/Grep/Glob path enforcement (lower severity, defense-in-depth), each requiring a new
-`DEC-F` decision-log entry before implementation, with the decision logic living in
-`security.py` (coverage-counted) rather than inline in `claude_sdk.py` (the one approved
-coverage omit, DEC-F8) so a broken check can't ship with zero measured coverage.
+**Still open (DEC-F11b):** `ThreatGuard.allowed_read_roots` is computed and unit-tested but
+still not passed to the SDK or rendered into any prompt — read-path scoping (`Read`/`Grep`/
+`Glob`) is fully disconnected, not merely advisory. Lower severity than the WebFetch half
+(worst case is unintended local file content in laundered, length-capped LLM prose, not
+network exfiltration), which is why it shipped second. Same mechanism
+(`PreToolUse`), same coverage-boundary discipline (decision logic in `security.py`, not
+inline in the `claude_sdk.py` coverage omit) — needs a symlink-safe path check
+(`Path.resolve()` + `is_relative_to()`, not string prefix matching) since the artifact
+directory being reviewed is untrusted content.
 
 ### 5. Schema migration paths
 

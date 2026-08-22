@@ -39,6 +39,18 @@ def _host_of(url: str) -> str | None:
         return None
 
 
+def is_fetch_allowed(url: str, allowlist: list[str]) -> bool:
+    """True when `url`'s host is one this review's computed allowlist actually names.
+
+    Deliberately not a fresh `is_internal_host` check: that would permit any public host,
+    not only the oracle- and artifact-derived set the model was told about in the system
+    prompt (DEC-F11a) — a call to an unrelated public host would defeat the allowlist's
+    purpose just as much as a call to an internal one.
+    """
+    host = _host_of(url)
+    return host is not None and host in allowlist
+
+
 def is_internal_host(host: str, blocked_suffixes: tuple[str, ...]) -> bool:
     """True when a host is loopback, private, link-local, reserved, or internal-only.
 

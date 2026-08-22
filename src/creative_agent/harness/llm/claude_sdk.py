@@ -6,6 +6,12 @@ bypassPermissions). Message handling dispatches on type names so the adapter can
 exercised against recorded/mocked transports without importing SDK classes; the weekly
 live workflow guards against surface drift.
 
+A `PreToolUse` hook enforces DEC-F9's WebFetch scoping at the call boundary (DEC-F11a):
+the allowlist was previously advisory-only (stated in the prompt, never enforced). The
+decision logic itself (`is_fetch_allowed`) lives in `harness/security.py`, which is
+coverage-counted — this module stays thin glue only, since it is the one file DEC-F8
+excludes from the coverage gate and a check written inline here could ship untested.
+
 Excluded from the coverage gate (visible omit, DEC-F8): exercised by mocked-transport
 tests here and by `pytest -m live` / scripts/sdk_spike.py against the real SDK.
 """
@@ -13,13 +19,55 @@ tests here and by `pytest -m live` / scripts/sdk_spike.py against the real SDK.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from creative_agent.config import HarnessSettings
 from creative_agent.errors import LLMOutputError, LLMTransportError
 from creative_agent.harness.llm.base import AssembledPrompt, RawLLMResult, ToolEvidence
+from creative_agent.harness.logging import get_logger, log_event
+from creative_agent.harness.security import is_fetch_allowed
 
+_LOG = get_logger(__name__)
 _TARGET_KEYS = ("url", "file_path", "path", "pattern", "query")
+
+
+def _deny(reason: str) -> dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def _pre_tool_use_hook(prompt: AssembledPrompt) -> Any:
+    """Builds a PreToolUse hook closed over this call's computed fetch allowlist.
+
+    Checked against the allowlist actually computed for this review (DEC-F11a) — not a
+    fresh internal-host check, which would permit any public host rather than only the
+    oracle- and artifact-derived set the model was told about in the system prompt.
+    """
+
+    async def hook(
+        input_data: dict[str, Any], tool_use_id: str | None, context: Any
+    ) -> dict[str, Any]:
+        if input_data.get("tool_name") != "WebFetch":
+            return {}
+        url = str(input_data.get("tool_input", {}).get("url", ""))
+        if is_fetch_allowed(url, prompt.fetch_domain_allowlist):
+            return {}
+        log_event(
+            _LOG,
+            logging.WARNING,
+            "security.pretooluse_denied",
+            call_kind=prompt.kind.value,
+            tool_name="WebFetch",
+        )
+        return _deny("WebFetch host is not in this review's computed allowlist")
+
+    return hook
 
 
 def _target_from_input(tool_input: Any) -> str:
@@ -39,7 +87,7 @@ class ClaudeSDKAdapter:
 
     def _options(self, prompt: AssembledPrompt) -> Any:
         try:
-            from claude_agent_sdk import ClaudeAgentOptions
+            from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
         except ImportError as exc:
             raise LLMTransportError(
                 "claude-agent-sdk is not installed; install with the [llm] extra"
@@ -50,6 +98,9 @@ class ClaudeSDKAdapter:
             "permission_mode": self._settings.permission_mode,
             "max_turns": self._settings.max_turns,
             "output_format": {"type": "json_schema", "schema": prompt.output_schema},
+            "hooks": {
+                "PreToolUse": [HookMatcher(matcher="WebFetch", hooks=[_pre_tool_use_hook(prompt)])]
+            },
         }
         if self._settings.model != "inherit":
             kwargs["model"] = self._settings.model

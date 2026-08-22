@@ -7,6 +7,7 @@ import pytest
 from creative_agent.harness.security import (
     DEFAULT_BLOCKED_HOST_SUFFIXES,
     ThreatGuard,
+    is_fetch_allowed,
     is_internal_host,
 )
 from tests.factories import make_oracle, make_row, make_source
@@ -110,6 +111,31 @@ class TestInternalHostPolicy:
         strict = guard(blocked_host_suffixes=(".corp.example",))
         allowlist = strict.fetch_domain_allowlist("https://wiki.corp.example/x")
         assert "wiki.corp.example" not in allowlist
+
+
+class TestFetchEnforcementPredicate:
+    """DEC-F11a: the predicate the PreToolUse hook calls at the SDK boundary. Deliberately
+    a subset check against a computed allowlist, not a fresh is_internal_host check — an
+    unrelated public host must be denied just as much as an internal one."""
+
+    def test_host_in_allowlist_is_allowed(self) -> None:
+        assert is_fetch_allowed("https://arxiv.org/abs/1", ["arxiv.org", "doi.org"])
+
+    def test_host_outside_allowlist_is_denied(self) -> None:
+        assert not is_fetch_allowed("https://openreview.net/x", ["arxiv.org"])
+
+    def test_public_host_not_in_this_reviews_allowlist_is_still_denied(self) -> None:
+        """A host that is entirely legitimate elsewhere is still not THIS review's set."""
+        assert not is_fetch_allowed("https://8.8.8.8/", ["arxiv.org"])
+
+    def test_empty_allowlist_denies_everything(self) -> None:
+        assert not is_fetch_allowed("https://arxiv.org/abs/1", [])
+
+    def test_unparseable_url_is_denied(self) -> None:
+        assert not is_fetch_allowed("not-a-url", ["arxiv.org"])
+
+    def test_port_and_case_do_not_defeat_the_check(self) -> None:
+        assert is_fetch_allowed("https://ARXIV.org:443/x", ["arxiv.org"])
 
 
 class TestReadScoping:

@@ -98,3 +98,55 @@ existence only and never count as `fetched=True`. Artifact content is delimited 
 prompts. All published text passes through the deterministic renderer; LLM prose fields are
 length-capped. Tool honesty is checked against tool **results** (`is_error == False`) with
 canonical arXiv/DOI identifier matching, not against tool-use events alone.
+
+**Superseded in part by DEC-F11**: the scoping described above was, until DEC-F11,
+enforced only for `WebFetch` (this entry), and not at all for `Read`/`Grep`/`Glob` (see
+DEC-F11b) — the wording above should be read as the *intent*, not as a claim that both
+halves were enforced from the start.
+
+## DEC-F11 — Real tool-scope enforcement via `PreToolUse` — CONFIRMED
+
+**Problem:** DEC-F9's scoping was computed but not enforced at the SDK call boundary.
+`ThreatGuard.fetch_domain_allowlist` reached the model as prose in the system prompt
+(advisory only — nothing stopped a `WebFetch` call to an off-allowlist host from actually
+executing); `ThreatGuard.allowed_read_roots` was computed and unit-tested but never reached
+the SDK or the prompt at all — read-path scoping was fully disconnected, not merely
+advisory. Only the downstream tool-honesty check (DEC-F9) would later refuse to credit any
+resulting "evidence" — after the call had already run.
+
+**Mechanism:** `ClaudeAgentOptions.hooks["PreToolUse"]` fires for every tool call
+unconditionally, regardless of `allowed_tools` or `permission_mode`. The alternative,
+`can_use_tool`, only fires when permission evaluation would otherwise prompt — and this
+project sets `permission_mode = "dontAsk"` (`config.py`) for the unrelated reason of
+running headless, whose entire purpose is to skip that prompt. `can_use_tool` is therefore
+very likely dead code in this project's actual runtime mode; `PreToolUse` is the only
+mechanism decoupled from a setting already fixed for other reasons.
+
+**Where the decision logic lives:** the path/host predicates (`is_fetch_allowed`,
+`is_path_within_roots`) are pure functions in `harness/security.py`, which is fully
+coverage-counted. `harness/llm/claude_sdk.py` is the one approved coverage omit (DEC-F8) —
+if the predicate logic lived inline in the hook body there, a broken check could ship with
+zero measured coverage. `claude_sdk.py`'s hook is thin glue only: extract the tool call's
+URL/path from the SDK's `input_data`, call the `security.py` predicate, translate the
+boolean into the hook's `hookSpecificOutput` dict.
+
+**Sub-items, shipped separately by severity:**
+- **DEC-F11a (this entry, WebFetch):** `is_fetch_allowed(url, allowlist)` checks the
+  request's host against the exact `fetch_domain_allowlist` computed for that review call —
+  not a fresh `is_internal_host` check, which would incorrectly permit any public host, not
+  only the oracle+artifact-derived set the model was told about.
+- **DEC-F11b (Read/Grep/Glob, follow-up):** `is_path_within_roots(path, roots)` resolves
+  the target path (`Path.resolve()`) and compares with `Path.is_relative_to()`, not string
+  prefix matching, so a symlink inside an allowed root pointing outside it is caught rather
+  than defeating a naive check.
+
+**Accepted residual risk, not solved here:** a `WebFetch` redirect chain from an allowed
+host to an internal one is invisible to a hook that only sees the initial URL. Fixing this
+means replacing `WebFetch` with a custom redirect-validating fetcher — over-engineering for
+a single-user offline document reviewer, not a multi-tenant service. Documented, not built.
+
+**Verification:** unit tests for the new predicates in `security.py` (pure functions, no
+SDK needed); mocked-transport integration tests in `test_claude_sdk_adapter.py` proving a
+denial is actually returned for an off-allowlist/out-of-root call. Final confirmation
+against the live SDK needs `ANTHROPIC_API_KEY` (roadmap item 1, owner-blocked) but neither
+implementation nor these tests do.

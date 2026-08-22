@@ -3,7 +3,7 @@
 C4-model documentation for the `creative-agent` harness: an agent framework for
 doctrine-driven review agents, shipping with `sutton-review`.
 
-Related: [decision-log.md](decision-log.md) (framework decisions DEC-F1..F10),
+Related: [decision-log.md](decision-log.md) (framework decisions DEC-F1..F11),
 [../README.md](../README.md), [../CLAUDE.md](../CLAUDE.md).
 
 ---
@@ -317,6 +317,7 @@ Full text and rationale: [decision-log.md](decision-log.md). All ten are `CONFIR
 | [DEC-F8](decision-log.md#dec-f8--determinism--coverage-policy--confirmed) | Injected `Clock`; branch coverage at 90% with per-package floors | Wall-clock reads are lint-banned so reviews are reproducible; the one coverage omit (`llm/claude_sdk.py`) is visible and requires this decision. |
 | [DEC-F9](decision-log.md#dec-f9--threat-model--confirmed) | The reviewed artifact is untrusted: scoped tools, allowlisted fetch, laundered output | Prompt injection and SSRF are the realistic attacks on a reviewer, so tool scope is narrow and tool honesty is checked against results, not intentions. |
 | [DEC-F10](decision-log.md#dec-f10--observability--confirmed) | Structured logging on the `creative_agent` namespace with stable event names | A wrong verdict must be traceable to the stage that decided it; prompts and artifact text are never logged, only sizes, ids, counts, durations. |
+| [DEC-F11](decision-log.md#dec-f11--real-tool-scope-enforcement-via-pretooluse--confirmed) | A `PreToolUse` hook enforces DEC-F9's scoping at the SDK call boundary, not just in the prompt | The prior scoping was advisory for `WebFetch` and fully disconnected for `Read`/`Grep`/`Glob`; `can_use_tool` is dead code under this project's `permission_mode="dontAsk"`, so `PreToolUse` is the only mechanism that actually fires. |
 
 ---
 

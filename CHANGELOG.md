@@ -23,6 +23,20 @@ Post-merge next-steps work, not yet in `main`.
   with no runnable check was found to be a real gap in this repo's own documentation-honesty
   philosophy.
 
+- **DEC-F11a: real WebFetch scoping.** `ThreatGuard`'s fetch-domain allowlist (DEC-F9)
+  reached the model only as prose in the system prompt — nothing stopped a `WebFetch` call
+  to an off-allowlist host from actually executing; only the downstream tool-honesty check
+  would later refuse to credit the resulting "evidence," after the call had already run.
+  A `PreToolUse` hook in `ClaudeSDKAdapter` now denies the call itself. Uses `PreToolUse`
+  rather than the SDK's `can_use_tool` callback because this project's
+  `permission_mode="dontAsk"` means `can_use_tool` is very likely never invoked here (it
+  only fires when permission evaluation would otherwise prompt); `PreToolUse` fires
+  unconditionally. The decision predicate (`is_fetch_allowed`) lives in `harness/security.py`
+  (coverage-counted) rather than inline in `claude_sdk.py` (the one approved coverage
+  omit, DEC-F8), so a broken check can't ship invisibly to the gate. Read/Grep/Glob
+  path-scoping enforcement (DEC-F11b) is tracked as a separate follow-up — see
+  `docs/decision-log.md` DEC-F11.
+
 ### Fixed
 
 - The Unreleased section itself said the framework was "not yet on `main`" after PR #1 had
