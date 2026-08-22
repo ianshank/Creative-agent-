@@ -1,0 +1,12 @@
+Classify the artifact below and determine review mode.
+
+Artifact classes: {% for c in oracle.artifact_classes %}{{ c.name }}{% if not loop.last %}, {% endif %}{% endfor %}.
+Usage gates for context: {{ oracle.protocol.usage_gates | join(" ") }}
+
+Mode: recommend "conformance" ONLY if the artifact explicitly claims to follow this
+oracle's research program (markers: {{ oracle.conformance.markers | join(", ") }}) — and
+if so, quote the claiming sentence VERBATIM in conformance_evidence. If it merely cites
+or discusses the program without claiming to conform, recommend "advisory".
+Also report whether the artifact contains a safety section (safety_section_present).
+
+{{ artifact }}

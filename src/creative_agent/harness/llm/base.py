@@ -32,6 +32,7 @@ class AssembledPrompt(SchemaModel):
     """One ready-to-send call: prompt text + the schema the response must satisfy."""
 
     kind: CallKind
+    ref: str = Field(default="", description="Sub-reference, e.g. the doctrine row id")
     system: str = Field(min_length=1)
     user: str = Field(min_length=1)
     output_schema: dict[str, object]

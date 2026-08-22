@@ -1,0 +1,22 @@
+Doctrine sweep — row {{ row.id }} only. Verdict: hit (artifact satisfies the check),
+miss (it violates it — emit findings), or not_applicable (with a mandatory na_reason).
+
+{{ row_rendered }}
+
+Rules for this row:
+- Apply exactly the check licensed above; do not import checks from other rows.
+{% if row.precedence %}- Precedence: {{ row.precedence.note }}{% endif %}
+{% if row.disclosed_gap %}- This row is a DISCLOSED GAP: do not demand a citation that
+  does not exist; require an explicit "unevidenced in this regime" label instead.{% endif %}
+- Findings need: severity, a short stable `anchor` phrase naming the defect site,
+  doctrine_refs ["{{ row.id }}"], and supports listing every basis.
+- Every doctrinal assertion needs a verification_entries item mapping it to this row and
+  a source URL (fetched=true only if you fetched it in this session).
+- Reuse anchors from prior cycles when the same defect persists:
+{% for key in prior_keys %}  - {{ key }}
+{% else %}  (no prior findings)
+{% endfor %}
+
+Artifact mode: {{ mode }} | class: {{ artifact_class }}
+
+{{ artifact }}

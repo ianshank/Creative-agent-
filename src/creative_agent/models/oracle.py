@@ -177,11 +177,20 @@ class ConformanceConfig(SchemaModel):
     advisory_severity_cap: SeverityField
 
 
+class LabelElement(SchemaModel):
+    """One required element of a claimed label, with its detection patterns."""
+
+    label: str = Field(min_length=1)
+    patterns: list[str] = Field(min_length=1, description="casefold substrings, any-of")
+
+
 class OakConformanceSpec(SchemaModel):
     """The OaK label's required elements, enumerated so a checker can name misses."""
 
-    features: list[str] = Field(min_length=1)
-    stages: list[str] = Field(min_length=1)
+    label_pattern: str = Field(min_length=1, description="regex that detects the label claim")
+    doctrine_ref: str = Field(min_length=1, description="row that licenses this check")
+    features: list[LabelElement] = Field(min_length=1)
+    stages: list[LabelElement] = Field(min_length=1)
     missing_severity: SeverityField
 
 
@@ -237,6 +246,11 @@ class OracleTable(SchemaModel):
         for trap in self.decision_traps:
             if trap.decision_id not in self.required_decisions:
                 raise ValueError(f"decision trap {trap.decision_id} not in required_decisions")
+        if self.oak_conformance is not None and self.oak_conformance.doctrine_ref not in row_ids:
+            raise ValueError(
+                f"oak_conformance.doctrine_ref {self.oak_conformance.doctrine_ref!r} "
+                "is not a known row"
+            )
         return self
 
     def row(self, row_id: str) -> OracleRow:

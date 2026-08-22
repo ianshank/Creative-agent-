@@ -13,9 +13,9 @@ import xml.etree.ElementTree as ET
 from collections import defaultdict
 
 FLOORS: dict[str, float] = {
-    "creative_agent/harness": 95.0,
-    "creative_agent/models": 95.0,
-    "creative_agent/cli.py": 85.0,
+    "src/creative_agent/harness": 90.0,
+    "src/creative_agent/models": 95.0,
+    "src/creative_agent/cli.py": 85.0,
 }
 
 

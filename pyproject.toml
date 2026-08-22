@@ -24,6 +24,7 @@ llm = ["claude-agent-sdk>=0.1"]
 dev = [
     "pytest>=8.2",
     "pytest-cov>=5.0",
+    "pytest-asyncio>=0.23",
     "pytest-randomly>=3.15",
     "hypothesis>=6.100",
     "respx>=0.21",
@@ -63,6 +64,13 @@ ignore = [
 "scripts/**" = ["S", "PLC0415"]
 # Greek-letter character classes in the symbol-definition regexes are intentional.
 "src/creative_agent/harness/consistency.py" = ["RUF001"]
+# The pipeline orchestrates many injected components; the arg/statement counts are the
+# design, not an accident. Renderer builds one long document.
+"src/creative_agent/harness/pipeline.py" = ["PLR0913", "PLR0915"]
+"src/creative_agent/harness/rendering.py" = ["PLR0915"]
+# prompting: function-level import breaks a models<->harness cycle; autoescape=False is
+# correct for plain-text prompts (no HTML sink).
+"src/creative_agent/harness/prompting.py" = ["PLC0415", "S701"]
 
 [tool.mypy]
 python_version = "3.11"
@@ -77,6 +85,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+asyncio_mode = "auto"
 addopts = "--cov=creative_agent --cov-branch --cov-report=term-missing --cov-report=xml --cov-fail-under=90 -m 'not live'"
 markers = [
     "live: tests that call the real Claude Agent SDK (require ANTHROPIC_API_KEY; run by live.yml)",

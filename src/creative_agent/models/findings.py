@@ -82,10 +82,14 @@ class FindingKey(SchemaModel):
         return f"{self.row_id}+{self.slug}"
 
 
+FindingOrigin = Literal["llm", "deterministic"]
+
+
 class Finding(SchemaModel):
     """One review finding, after deterministic assembly and capping."""
 
     finding_id: str = Field(min_length=1)
+    origin: FindingOrigin = "llm"
     severity: SeverityField
     original_severity: SeverityField
     summary: str = Field(min_length=1)

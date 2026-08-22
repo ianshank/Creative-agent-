@@ -81,7 +81,8 @@ def oracles_validate(
 def main() -> int:
     """Console entry point wrapper mapping unexpected errors to exit code 5."""
     try:
-        app(standalone_mode=False)
+        # click returns the Exit code (rather than raising) when standalone mode is off.
+        return_value = app(standalone_mode=False)
     except typer.Exit as exc:
         return exc.exit_code
     except typer.Abort:
@@ -92,6 +93,8 @@ def main() -> int:
     except Exception as exc:  # the exit-code contract demands a defined code for anything
         print(f"unexpected error: {exc}", file=sys.stderr)
         return int(ExitCode.UNEXPECTED_ERROR)
+    if isinstance(return_value, int):
+        return return_value
     return int(ExitCode.CLEAN)
 
 

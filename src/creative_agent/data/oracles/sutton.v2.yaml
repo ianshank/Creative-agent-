@@ -110,14 +110,29 @@ decision_traps:
       the vehicle; it does not satisfy the physical-deployment safety envelope decision.
 
 oak_conformance:
-  features:
-    - All components learn continually
-    - >
-      Each learned weight has a dedicated step size meta-learned by online
-      cross-validation
-    - Abstractions created via FC-STOMP
-  stages: [Feature Construction, SubTask, Option, Model, Planning]
+  label_pattern: '\bOaK\b'
+  doctrine_ref: D12
   missing_severity: major
+  features:
+    - label: "Feature 1: all components learn continually"
+      patterns: ["learn continually", "continual learning", "learns continually"]
+    - label: >
+        Feature 2: each learned weight has a dedicated step size meta-learned by online
+        cross-validation
+      patterns: ["per-weight step size", "dedicated step size", "idbd", "meta-learned step"]
+    - label: "Feature 3: abstractions created via FC-STOMP"
+      patterns: ["fc-stomp", "fcstomp"]
+  stages:
+    - label: "FC-STOMP stage 1: Feature Construction"
+      patterns: ["feature construction"]
+    - label: "FC-STOMP stage 2: SubTask"
+      patterns: ["subtask"]
+    - label: "FC-STOMP stage 3: Option"
+      patterns: ["option"]
+    - label: "FC-STOMP stage 4: Model"
+      patterns: ["model"]
+    - label: "FC-STOMP stage 5: Planning"
+      patterns: ["planning"]
 
 protocol:
   escalation_cycle: 3

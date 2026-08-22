@@ -1,0 +1,18 @@
+Source-quality judgement sweep (the mechanical checks run separately; do NOT repeat them).
+
+1. Load-bearing citation rule: any claim carrying more than one downstream conclusion
+   needs a source at tier {{ oracle.source_quality.load_bearing_requires_tiers | join(" or ") }}
+   (peer-reviewed/archival). Preprints and profile-hosted PDFs are admissible only when
+   the artifact says so in text. Emit load_bearing_violations for breaches.
+2. Regime match: these transfers must be argued, never assumed:
+   {{ oracle.source_quality.regime_breaks | join("; ") }}.
+   Where the oracle itself has no in-regime source (disclosed gaps), require an explicit
+   "unevidenced in this regime" label rather than an impossible citation.
+   Emit regime_break_findings naming BOTH regimes.
+3. {{ oracle.source_quality.vendor_page_note }}
+
+Every finding needs verification_entries backing its doctrinal assertions.
+
+Mode: {{ mode }} | class: {{ artifact_class }}
+
+{{ artifact }}

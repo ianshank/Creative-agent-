@@ -57,10 +57,15 @@ class VerificationLogChecker:
     def check_completeness(
         self, findings: list[Finding], entries: list[VerificationEntry]
     ) -> list[str]:
-        """Every doctrinal finding needs a verification entry for each row it cites."""
+        """Every LLM doctrinal finding needs a verification entry for each row it cites.
+
+        Deterministic findings are the harness's own mechanical checks — they carry no
+        model assertion to verify."""
         defects: list[str] = []
         entry_rows = {e.row_id for e in entries if e.row_id}
         for finding in findings:
+            if finding.origin == "deterministic":
+                continue
             for row_id in finding.doctrine_refs:
                 if row_id not in entry_rows:
                     defects.append(
