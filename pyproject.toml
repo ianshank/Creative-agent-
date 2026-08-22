@@ -61,6 +61,8 @@ ignore = [
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S", "PLR0913", "DTZ001", "DTZ011"]
 "scripts/**" = ["S", "PLC0415"]
+# Greek-letter character classes in the symbol-definition regexes are intentional.
+"src/creative_agent/harness/consistency.py" = ["RUF001"]
 
 [tool.mypy]
 python_version = "3.11"

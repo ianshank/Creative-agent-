@@ -14,7 +14,7 @@ from typing import Literal
 from pydantic import Field, HttpUrl, field_validator, model_validator
 
 from creative_agent.models.base import SchemaModel
-from creative_agent.models.findings import SeverityField
+from creative_agent.models.findings import Severity, SeverityField
 
 EvidenceTier = Literal["PR", "AP", "T", "E", "NONE"]
 """Peer-reviewed, archival preprint, talk, essay/blog; NONE marks a disclosed gap row."""
@@ -130,6 +130,7 @@ class ArtifactClassRule(SchemaModel):
     name: str = Field(min_length=1)
     requires_gates: list[str] = Field(default_factory=list)
     requires_sections: list[str] = Field(default_factory=list)
+    missing_section_severity: SeverityField = Severity.BLOCKER
     source_quality_only: bool = False
 
 
