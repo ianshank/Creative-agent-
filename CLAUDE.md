@@ -52,7 +52,7 @@ Review state and audit bundles stay in **this** repo under `docs/review-log/`. T
   + mechanical author-list diff).
 - `.claude/hooks/session-start.sh` — SessionStart: `uv sync` so a fresh container can run
   the suite immediately.
-- `.claude/hooks/validate-oracles.sh` — PostToolUse: re-validates oracle data after any
+- `.claude/hooks/validate-data.sh` — PostToolUse: re-validates oracle data after any
   edit under `data/oracles`, blocking on a schema break (exit 2) so it surfaces at edit
   time rather than in CI.
 

@@ -25,6 +25,8 @@ decisions_app = typer.Typer(no_args_is_help=True)
 app.add_typer(decisions_app, name="decisions", help="Inspect CONFIRM-FIRST decision logs.")
 state_app = typer.Typer(no_args_is_help=True)
 app.add_typer(state_app, name="state", help="Inspect per-artifact review state.")
+assets_app = typer.Typer(no_args_is_help=True)
+app.add_typer(assets_app, name="assets", help="Validate Claude Code agents, skills and hooks.")
 
 
 def _settings() -> HarnessSettings:
@@ -168,6 +170,35 @@ def oracles_rebaseline(
     typer.echo(f"wrote {target} (rebaseline_count={updated.freshness.rebaseline_count})")
     if any("MISMATCH" in line for line in report):
         raise typer.Exit(code=int(ExitCode.FINDINGS_MAJOR))
+
+
+@assets_app.command("validate")
+def assets_validate(
+    claude_dir: Annotated[
+        Path | None,
+        typer.Option("--claude-dir", help="Directory to validate (default: this repo's .claude)"),
+    ] = None,
+) -> None:
+    """Validate the Claude Code assets: agent/skill frontmatter, hooks, settings.
+
+    These are executable configuration — a malformed agent or a non-executable hook fails
+    silently mid-session — so they get the same treatment as oracle data.
+    """
+    from creative_agent.harness.assets import collect, default_claude_dir
+
+    target = claude_dir or default_claude_dir()
+    if not target.is_dir():
+        _fail(ConfigError(f"no .claude directory at {target}"))
+    inventory, defects = collect(target)
+    typer.echo(
+        f"{target}: {len(inventory.agents)} agent(s), {len(inventory.skills)} skill(s), "
+        f"{len(inventory.hooks)} hook(s)"
+    )
+    for defect in defects:
+        typer.echo(f"defect: {defect}", err=True)
+    if defects:
+        raise typer.Exit(code=int(ExitCode.FINDINGS_MAJOR))
+    typer.echo("ok: all assets valid")
 
 
 @app.command()

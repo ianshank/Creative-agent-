@@ -176,3 +176,29 @@ class TestSecondOracleNeedsNoCode:
         result = runner.invoke(app, ["review", str(artifact), "--oracle", "other", "--offline"])
         assert result.exit_code == 0, result.output
         assert "Oracle: other" in result.output
+
+
+class TestAssetsCommand:
+    """The assets validator must be usable outside the test suite (CI, hooks, humans)."""
+
+    def test_shipped_assets_validate(self) -> None:
+        result = runner.invoke(app, ["assets", "validate"])
+        assert result.exit_code == 0, result.output
+        assert "ok: all assets valid" in result.output
+
+    def test_defective_assets_exit_nonzero(self, tmp_path: Path) -> None:
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / "mismatched.md").write_text(
+            "---\nname: other-name\ndescription: " + "d" * 60 + "\n---\nbody\n",
+            encoding="utf-8",
+        )
+        result = runner.invoke(app, ["assets", "validate", "--claude-dir", str(tmp_path)])
+        assert result.exit_code == int(ExitCode.FINDINGS_MAJOR)
+        assert "filename must match" in result.output
+
+    def test_missing_directory_is_config_error(self, tmp_path: Path) -> None:
+        result = runner.invoke(
+            app, ["assets", "validate", "--claude-dir", str(tmp_path / "absent")]
+        )
+        assert result.exit_code == int(ExitCode.CONFIG_ERROR)

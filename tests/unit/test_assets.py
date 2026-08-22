@@ -1,0 +1,302 @@
+"""Deterministic validation of the shipped Claude Code assets.
+
+`.claude/` is executable configuration. A subagent whose filename no longer matches its
+name is unaddressable; a skill with a thin description never triggers; a hook that lost
+its executable bit silently stops running. None of that shows up in a normal unit test,
+so the assets get their own regression suite — schema checks on every shipped asset,
+behavioural checks on the hooks, and named invariants on the contracts other things
+depend on (exit codes referenced by the subagent, tools the harness actually uses).
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from creative_agent.config import HarnessSettings
+from creative_agent.errors import ExitCode
+from creative_agent.harness.assets import (
+    AssetDefect,
+    collect,
+    default_claude_dir,
+    parse_front_matter,
+    validate_agent,
+    validate_hook,
+    validate_settings,
+    validate_skill,
+)
+
+CLAUDE_DIR = default_claude_dir()
+# Tools Claude Code can grant a subagent. Kept explicit so an invented tool name in an
+# agent definition fails here rather than at runtime in someone's session.
+KNOWN_TOOLS = frozenset(
+    {
+        "Bash",
+        "Read",
+        "Write",
+        "Edit",
+        "Glob",
+        "Grep",
+        "WebFetch",
+        "WebSearch",
+        "Task",
+        "TodoWrite",
+        "NotebookEdit",
+        "Agent",
+        "SlashCommand",
+    }
+)
+
+
+@pytest.fixture(scope="module")
+def shipped() -> tuple[object, list[AssetDefect]]:
+    return collect(CLAUDE_DIR, known_tools=KNOWN_TOOLS)
+
+
+class TestShippedAssetsAreValid:
+    def test_claude_dir_exists(self) -> None:
+        assert CLAUDE_DIR.is_dir(), f"no .claude directory at {CLAUDE_DIR}"
+
+    def test_no_defects_in_any_shipped_asset(self, shipped: tuple) -> None:
+        _, defects = shipped
+        assert not defects, "asset defects:\n" + "\n".join(str(d) for d in defects)
+
+    def test_expected_agents_are_present(self, shipped: tuple) -> None:
+        inventory, _ = shipped
+        assert "sutton-review" in inventory.agents
+
+    def test_expected_skills_are_present(self, shipped: tuple) -> None:
+        inventory, _ = shipped
+        assert {"add-oracle", "review-gate", "oracle-rebaseline"} <= set(inventory.skills)
+
+    def test_every_hook_referenced_by_settings_exists(self, shipped: tuple) -> None:
+        inventory, _ = shipped
+        assert inventory.settings, "settings.json is missing or empty"
+        assert set(inventory.settings["hooks"]) == {"SessionStart", "PostToolUse"}
+
+
+class TestSubagentContract:
+    """The subagent delegates to the CLI, so its documented contract must match ours."""
+
+    @pytest.fixture(scope="class")
+    @classmethod
+    def agent_body(cls) -> str:
+        _, body = parse_front_matter(CLAUDE_DIR / "agents" / "sutton-review.md")
+        return body
+
+    def test_documents_every_exit_code(self, agent_body: str) -> None:
+        for code in ExitCode:
+            assert f"{int(code)}" in agent_body, f"exit code {code.name} is undocumented"
+
+    def test_invokes_the_real_cli_command(self, agent_body: str) -> None:
+        assert "creative-agent review" in agent_body
+
+    def test_forbids_softening_the_report(self, agent_body: str) -> None:
+        """The spec's hard rule; losing this line would quietly change the product."""
+        lowered = agent_body.lower()
+        assert "unmodified" in lowered
+        assert "do not soften" in lowered
+
+    def test_declares_only_tools_it_uses(self) -> None:
+        meta, _ = parse_front_matter(CLAUDE_DIR / "agents" / "sutton-review.md")
+        declared = {t.strip() for t in str(meta["tools"]).split(",")}
+        assert "Bash" in declared, "the agent must be able to run the CLI"
+        assert declared <= KNOWN_TOOLS
+
+
+class TestSkillContracts:
+    def test_review_gate_names_the_real_targets(self) -> None:
+        _, body = parse_front_matter(CLAUDE_DIR / "skills" / "review-gate" / "SKILL.md")
+        for command in ("ruff check", "mypy", "lint-imports", "pytest", "oracles validate"):
+            assert command in body, f"review-gate omits {command}"
+
+    def test_add_oracle_points_at_the_shipped_oracle(self) -> None:
+        _, body = parse_front_matter(CLAUDE_DIR / "skills" / "add-oracle" / "SKILL.md")
+        assert "src/creative_agent/data/oracles/sutton.v2.yaml" in body
+        oracle_path = "src/creative_agent/data/oracles/sutton.v2.yaml"
+        assert (Path(__file__).resolve().parents[2] / oracle_path).is_file()
+
+    def test_rebaseline_skill_uses_the_real_subcommand(self) -> None:
+        _, body = parse_front_matter(CLAUDE_DIR / "skills" / "oracle-rebaseline" / "SKILL.md")
+        assert "oracles rebaseline" in body
+
+
+class TestSettingsMatchTheHarness:
+    @pytest.fixture(scope="class")
+    @classmethod
+    def settings_json(cls) -> dict:
+        return json.loads((CLAUDE_DIR / "settings.json").read_text(encoding="utf-8"))
+
+    def test_allowlist_covers_the_gate_commands(self, settings_json: dict) -> None:
+        allowed = " ".join(settings_json["permissions"]["allow"])
+        for command in ("creative-agent", "pytest", "ruff", "mypy"):
+            assert command in allowed, f"{command} is not pre-approved; every run prompts"
+
+    def test_no_blanket_bash_permission(self, settings_json: dict) -> None:
+        """A bare Bash(*) grant would defeat the point of an allowlist."""
+        assert "Bash(*)" not in settings_json["permissions"]["allow"]
+
+
+class TestHookBehaviour:
+    """Hooks are shell scripts with real side effects; assert what they actually do."""
+
+    @staticmethod
+    def _run(script: str, payload: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(CLAUDE_DIR / "hooks" / script)],
+            input=payload,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+
+    def test_oracle_hook_passes_for_valid_data(self) -> None:
+        payload = json.dumps(
+            {"tool_input": {"file_path": "src/creative_agent/data/oracles/sutton.v2.yaml"}}
+        )
+        assert self._run("validate-data.sh", payload).returncode == 0
+
+    def test_oracle_hook_ignores_unrelated_edits(self) -> None:
+        payload = json.dumps({"tool_input": {"file_path": "README.md"}})
+        result = self._run("validate-data.sh", payload)
+        assert result.returncode == 0
+        assert result.stdout == ""
+
+    def test_oracle_hook_blocks_on_invalid_data(self, tmp_path: Path) -> None:
+        """Exit 2 is what feeds the error back to Claude to fix immediately."""
+        repo_root = Path(__file__).resolve().parents[2]
+        broken = repo_root / "src/creative_agent/data/oracles/_hooktest_broken.yaml"
+        broken.write_text("schema_version: 1\noracle_id: broken\n", encoding="utf-8")
+        try:
+            payload = json.dumps({"tool_input": {"file_path": str(broken)}})
+            result = self._run("validate-data.sh", payload)
+            assert result.returncode == 2
+            assert "Oracle validation failed" in result.stderr
+        finally:
+            broken.unlink(missing_ok=True)
+
+    def test_session_start_hook_reports_readiness(self) -> None:
+        result = self._run("session-start.sh", "")
+        assert result.returncode == 0
+        assert "creative-agent ready" in result.stdout
+
+
+class TestAssetValidatorItself:
+    """The validator is the thing catching the defects, so test it against known-bad
+    inputs — otherwise a broken validator silently passes everything."""
+
+    def test_missing_front_matter_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "x.md"
+        path.write_text("no front matter here", encoding="utf-8")
+        assert validate_agent(path)[0].message.startswith("missing YAML front matter")
+
+    def test_unparseable_front_matter_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "x.md"
+        path.write_text("---\na: [unclosed\n---\nbody\n", encoding="utf-8")
+        assert "unparseable" in validate_agent(path)[0].message
+
+    def test_name_filename_mismatch_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "wrong.md"
+        path.write_text(
+            "---\nname: right\ndescription: " + "d" * 60 + "\n---\nbody\n", encoding="utf-8"
+        )
+        assert any("filename must match" in d.message for d in validate_agent(path))
+
+    def test_unknown_frontmatter_key_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "a.md"
+        path.write_text(
+            "---\nname: a\ndescription: " + "d" * 60 + "\ntoolz: Bash\n---\nbody\n",
+            encoding="utf-8",
+        )
+        assert any("unknown frontmatter keys" in d.message for d in validate_agent(path))
+
+    def test_unknown_tool_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "a.md"
+        path.write_text(
+            "---\nname: a\ndescription: " + "d" * 60 + "\ntools: Telepathy\n---\nbody\n",
+            encoding="utf-8",
+        )
+        defects = validate_agent(path, known_tools=KNOWN_TOOLS)
+        assert any("unknown tools" in d.message for d in defects)
+
+    def test_thin_description_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "a.md"
+        path.write_text("---\nname: a\ndescription: short\n---\nbody\n", encoding="utf-8")
+        assert any("unlikely to trigger" in d.message for d in validate_agent(path))
+
+    def test_empty_body_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "a.md"
+        path.write_text("---\nname: a\ndescription: " + "d" * 60 + "\n---\n", encoding="utf-8")
+        assert any("empty body" in d.message for d in validate_agent(path))
+
+    def test_skill_directory_mismatch_is_reported(self, tmp_path: Path) -> None:
+        skill_dir = tmp_path / "wrong-dir"
+        skill_dir.mkdir()
+        path = skill_dir / "SKILL.md"
+        path.write_text(
+            "---\nname: right-name\ndescription: " + "d" * 60 + "\n---\nbody\n", encoding="utf-8"
+        )
+        assert any("directory must match" in d.message for d in validate_skill(path))
+
+    def test_non_executable_hook_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "h.sh"
+        path.write_text("#!/usr/bin/env bash\nset -e\n", encoding="utf-8")
+        path.chmod(0o644)
+        assert any("not executable" in d.message for d in validate_hook(path))
+
+    def test_hook_without_shebang_or_set_is_reported(self, tmp_path: Path) -> None:
+        path = tmp_path / "h.sh"
+        path.write_text("echo hi\n", encoding="utf-8")
+        path.chmod(0o755)
+        messages = [d.message for d in validate_hook(path)]
+        assert any("missing shebang" in m for m in messages)
+        assert any("set -e" in m for m in messages)
+
+    def test_settings_referencing_a_missing_hook_is_reported(self, tmp_path: Path) -> None:
+        settings = tmp_path / "settings.json"
+        settings.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/absent.sh",
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        defects = validate_settings(settings, tmp_path)
+        assert any("missing script absent.sh" in d.message for d in defects)
+
+    def test_invalid_settings_json_is_reported(self, tmp_path: Path) -> None:
+        settings = tmp_path / "settings.json"
+        settings.write_text("{not json", encoding="utf-8")
+        assert "invalid JSON" in validate_settings(settings, tmp_path)[0].message
+
+    def test_collect_on_an_empty_directory_is_clean(self, tmp_path: Path) -> None:
+        inventory, defects = collect(tmp_path)
+        assert not defects and not inventory.agents and not inventory.skills
+
+
+class TestAgentToolsMatchHarnessCapabilities:
+    def test_default_agent_tools_are_known(self) -> None:
+        """settings-driven SDK tool scoping must name tools that actually exist."""
+        assert set(HarnessSettings().agent_tools) <= KNOWN_TOOLS
+
+    def test_fetch_tools_are_a_subset_of_agent_tools(self) -> None:
+        settings = HarnessSettings()
+        assert set(settings.fetch_tool_names) <= set(settings.agent_tools), (
+            "a fetch tool the session cannot use would reject every verification entry"
+        )

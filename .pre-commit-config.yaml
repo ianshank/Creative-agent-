@@ -5,6 +5,11 @@ repos:
       - id: ruff
         args: [--fix]
       - id: ruff-format
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks
+        args: [--config, .gitleaks.toml, --redact]
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
@@ -14,3 +19,12 @@ repos:
       - id: check-yaml
         args: [--unsafe]
       - id: check-added-large-files
+  - repo: local
+    hooks:
+      # The doctrine table is the product; a schema break must never reach a commit.
+      - id: oracle-validate
+        name: validate oracle data
+        entry: uv run creative-agent oracles validate --all
+        language: system
+        files: ^src/creative_agent/data/oracles/.*\.yaml$
+        pass_filenames: false

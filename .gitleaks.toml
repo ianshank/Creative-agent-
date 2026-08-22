@@ -1,0 +1,35 @@
+# gitleaks configuration for creative-agent.
+#
+# The harness handles an ANTHROPIC_API_KEY and writes review artifacts that quote the
+# documents under review, so a leaked credential or a pasted key in a fixture is a real
+# risk. Extends the upstream default ruleset rather than replacing it, and adds one
+# project-specific rule plus narrowly-scoped allowlists for known-safe test data.
+
+title = "creative-agent"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API key"
+# Upstream covers this, but pin it explicitly: it is the one credential this project uses.
+regex = '''sk-ant-[A-Za-z0-9_\-]{20,}'''
+keywords = ["sk-ant"]
+
+[allowlist]
+description = "Known-safe fixtures and documentation"
+paths = [
+  # Lockfiles carry hashes that trip entropy heuristics.
+  '''uv\.lock''',
+  # Golden files and recorded fixtures are deterministic test data, reviewed by hand.
+  '''tests/golden/.*''',
+  '''tests/fixtures/.*''',
+]
+regexes = [
+  # The example config documents env var NAMES, never values.
+  '''ANTHROPIC_API_KEY=\.\.\.''',
+  # Oracle data cites DOIs and arXiv ids, which look like high-entropy strings.
+  '''10\.\d{4,9}/\S+''',
+  '''arxiv:\d{4}\.\d{4,5}''',
+]

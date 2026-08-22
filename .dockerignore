@@ -1,0 +1,35 @@
+# Keep the build context small and free of local state. Anything not needed to install
+# the package or run the suite stays out — a smaller context also means fewer chances of
+# shipping a developer's local config or review state into an image.
+
+.git
+.github
+.venv
+**/__pycache__
+**/*.py[cod]
+*.egg-info
+dist
+build
+
+# Tooling caches
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.hypothesis
+.mutmut-cache
+mutants
+htmlcov
+coverage.xml
+.coverage
+.coverage.*
+
+# Local state and secrets
+config/settings.yaml
+.env
+docs/review-log/*
+!docs/review-log/.gitkeep
+
+# Editor and OS noise
+.idea
+.vscode
+.DS_Store
