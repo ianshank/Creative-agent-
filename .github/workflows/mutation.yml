@@ -3,7 +3,16 @@ name: Mutation testing
 # The enforcement core (severity capping, gates, verification, consistency) is where a
 # softened comparison is the worst silent failure the harness can have. Line and branch
 # coverage cannot see that; a surviving mutant can. Weekly rather than per-PR because a
-# full run is slow, and advisory rather than blocking until a kill-rate baseline exists.
+# full run is slow (a few minutes, not seconds).
+#
+# A real gate, not advisory: mutmut only copies the four files named in
+# [tool.mutmut].source_paths into ./mutants — `also_copy` mirrors the rest of the package
+# so the sandbox's own test collection can resolve creative_agent's other submodules (this
+# was the actual sandbox problem, not package metadata as first suspected — found by
+# reproducing the failure locally and reading mutmut's own copy logic). Kill-rate
+# regressions fail the job via scripts/check_mutation_baseline.py against
+# docs/mutation-baseline.json (currently 452/452 killed, 0 survived/no_tests/suspicious/
+# timeout) rather than continue-on-error swallowing them.
 
 on:
   schedule:
@@ -24,15 +33,14 @@ jobs:
           enable-cache: true
       - run: uv python install 3.11
       - run: uv sync --all-extras --locked
-      # mutmut 3.x copies the tree into ./mutants and re-runs pytest there, which needs
-      # the package metadata to resolve in that copy. Advisory (continue-on-error) until
-      # that sandbox setup is settled; the mutants themselves generate correctly, and
-      # tests/unit/test_project_config.py guards the config from silently rotting again.
       - name: Run mutation testing on the enforcement core
-        continue-on-error: true
-        run: |
-          cp README.md mutants/README.md 2>/dev/null || true
-          uv run mutmut run --max-children 4
-      - name: Report surviving mutants
+        run: uv run mutmut run --max-children 4
+      - name: Report results
         if: always()
         run: uv run mutmut results || true
+      - name: Export CI/CD stats
+        if: always()
+        run: uv run mutmut export-cicd-stats
+      - name: Enforce the kill-rate baseline
+        if: always()
+        run: uv run python scripts/check_mutation_baseline.py

@@ -39,6 +39,41 @@ def _host_of(url: str) -> str | None:
         return None
 
 
+def is_fetch_allowed(url: str, allowlist: list[str]) -> bool:
+    """True when `url`'s host is one this review's computed allowlist actually names.
+
+    Deliberately not a fresh `is_internal_host` check: that would permit any public host,
+    not only the oracle- and artifact-derived set the model was told about in the system
+    prompt (DEC-F11a) — a call to an unrelated public host would defeat the allowlist's
+    purpose just as much as a call to an internal one.
+    """
+    host = _host_of(url)
+    return host is not None and host in allowlist
+
+
+def is_path_within_roots(path: str, roots: list[Path], cwd: str = "") -> bool:
+    """True when `path` resolves inside one of `roots` (DEC-F11b).
+
+    Resolves both the candidate and the roots before comparing, so a symlink inside an
+    allowed root that points outside it is caught — a string prefix check would not catch
+    it, and the artifact directory being reviewed is untrusted content.
+
+    A relative `path` is joined against `cwd` (the SDK tool call's own reported working
+    directory) before resolving, never left to `Path.resolve()`'s implicit `os.getcwd()`
+    fallback — that resolves against *this process's* cwd, which need not match the cwd
+    the tool call actually ran under, and a mismatch here is a scoping bypass, not just a
+    wrong answer.
+    """
+    try:
+        candidate = Path(path)
+        if not candidate.is_absolute() and cwd:
+            candidate = Path(cwd) / candidate
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return any(resolved.is_relative_to(root.resolve()) for root in roots)
+
+
 def is_internal_host(host: str, blocked_suffixes: tuple[str, ...]) -> bool:
     """True when a host is loopback, private, link-local, reserved, or internal-only.
 

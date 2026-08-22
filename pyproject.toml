@@ -137,4 +137,31 @@ source_paths = [
 ]
 # `tests_dir` is deprecated in 3.x AND breaks the run (it is concatenated with the list
 # below), so test selection lives entirely in pytest_add_cli_args_test_selection.
-pytest_add_cli_args_test_selection = ["tests/unit", "-x", "-q", "--no-cov", "-p", "no:randomly"]
+#
+# Scoped to the four direct unit-test files for the mutated modules, not all of
+# tests/unit/. Two reasons, found by running this and reading the failures: (1) mutmut
+# copies mutants/ as a nested, non-git directory, so tests whose behavior depends on
+# `git rev-parse --show-toplevel` or `$CLAUDE_PROJECT_DIR` resolving to the *sandbox* root
+# (TestHookBehaviour subprocess-running .claude/hooks/validate-data.sh) silently validate
+# the real repo instead and pass for the wrong reason, or fail outright when they expect a
+# blocking exit code; (2) collecting the whole directory pulls in every top-level import
+# across tests/unit — cli.py, scripts/, .claude/ — none of which the enforcement core
+# needs, so each would otherwise need mirroring into the sandbox via also_copy just to
+# satisfy imports that have nothing to do with what mutation testing is scoped to verify.
+pytest_add_cli_args_test_selection = [
+    "tests/unit/test_severity.py",
+    "tests/unit/test_gates.py",
+    "tests/unit/test_verification.py",
+    "tests/unit/test_consistency.py",
+    "-x",
+    "-q",
+    "--no-cov",
+    "-p",
+    "no:randomly",
+]
+# mutmut only copies the four files named in source_paths into mutants/ — walk_all_files()
+# walks exactly that list, nothing else. The four test files above (plus tests/factories.py)
+# import several other creative_agent submodules (models/oracle.py, models/findings.py,
+# harness/llm/base.py, ...), so the whole package is mirrored; create_mutants() then
+# overwrites the four target files with actual mutations, so this cannot mask a mutation.
+also_copy = ["src/creative_agent"]

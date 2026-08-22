@@ -11,11 +11,14 @@ depend on (exit codes referenced by the subagent, tools the harness actually use
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
+from creative_agent.cli import app
 from creative_agent.config import HarnessSettings
 from creative_agent.errors import ExitCode
 from creative_agent.harness.assets import (
@@ -122,6 +125,31 @@ class TestSkillContracts:
     def test_rebaseline_skill_uses_the_real_subcommand(self) -> None:
         _, body = parse_front_matter(CLAUDE_DIR / "skills" / "oracle-rebaseline" / "SKILL.md")
         assert "oracles rebaseline" in body
+
+    def test_inspect_state_commands_actually_resolve(self) -> None:
+        """A skill's prose is a claim, not a test — verify every command it names still
+        exists by actually invoking it through the real Typer app (in-process, via
+        CliRunner), the same spirit as TestHookBehaviour running the real hooks instead of
+        only checking they're present. A renamed or removed subcommand would otherwise rot
+        silently."""
+        _, body = parse_front_matter(CLAUDE_DIR / "skills" / "inspect-state" / "SKILL.md")
+        pattern = r"creative-agent ([a-z]+(?:-[a-z]+)*(?: [a-z]+(?:-[a-z]+)*)?)"
+        commands = sorted(set(re.findall(pattern, body)))
+        assert commands, "no `creative-agent <subcommand>` strings found — the scan is inert"
+        expected = {
+            "oracles list",
+            "agents list",
+            "decisions check",
+            "state show",
+            "assets validate",
+        }
+        assert expected <= set(commands)
+
+        runner = CliRunner()
+        for command in commands:
+            result = runner.invoke(app, [*command.split(), "--help"])
+            label = f"creative-agent {command} --help"
+            assert result.exit_code == 0, f"`{label}` failed: {result.output}"
 
 
 class TestSettingsMatchTheHarness:

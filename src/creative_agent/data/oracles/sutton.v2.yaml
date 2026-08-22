@@ -201,15 +201,21 @@ rows:
     tier: PR
     sources:
       - citation: >
-          Bowling, Martin, Dabney, Abel — Settling the Reward Hypothesis, ICML 2023,
+          Bowling, Martin, Abel, Dabney — Settling the Reward Hypothesis, ICML 2023,
           PMLR 202:3003-3020
-        authors: [Michael Bowling, John D. Martin, Will Dabney, David Abel]
+        authors: [Michael Bowling, John D. Martin, David Abel, Will Dabney]
         arxiv_id: "2212.10420"
         tier: PR
-        verified: false
+        verified: true
+        last_verified: 2026-08-22
         notes: >
-          Author list is the spec's corrected v2 list (v1 wrongly inserted Sutton in
-          place of Dabney). arXiv id transcribed from memory — confirm at rebaseline.
+          Resolved against arXiv 2026-08-22: author order corrected from Bowling/Martin/
+          Dabney/Abel to Bowling/Martin/Abel/Dabney (the paper's front matter has Bowling
+          and Martin as equal-contribution first authors, then Abel, then Dabney) — this
+          was the exact defect class this oracle exists to catch, a transcription error
+          surviving as `verified: false` until rebaseline. Venue (ICML 2023, PMLR 202)
+          confirmed from the same front matter; the PMLR page range was not independently
+          re-verified against the front matter and is carried over from the spec.
     check: >
       Name the preference relation over outcome distributions. Test completeness,
       transitivity, independence, continuity, temporal gamma-indifference. Only then judge

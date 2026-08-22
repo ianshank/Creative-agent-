@@ -1,0 +1,10 @@
+{
+  "_comment": "Kill-rate baseline for the enforcement core (severity.py, gates.py, verification.py, consistency.py). Checked in .github/workflows/mutation.yml via scripts/check_mutation_baseline.py — a fresh run's survived/no_tests/suspicious/timeout counts must not exceed these. Update this file only deliberately, with a reason here: a genuine equivalent mutant (document which one and why it cannot be killed), not to quiet a real regression.",
+  "updated": "2026-08-22",
+  "total": 452,
+  "killed": 452,
+  "survived": 0,
+  "no_tests": 0,
+  "suspicious": 0,
+  "timeout": 0
+}

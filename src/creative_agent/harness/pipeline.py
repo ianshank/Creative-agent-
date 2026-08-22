@@ -141,6 +141,7 @@ class ReviewPipeline:
                 ref=ref,
                 allowed_tools=self._settings.agent_tools,
                 fetch_domain_allowlist=context.get("fetch_domains", []),  # type: ignore[arg-type]
+                allowed_read_roots=context.get("read_roots", []),  # type: ignore[arg-type]
                 context={**context, "repair_defects": defects},
             )
             with timed_stage(
@@ -316,6 +317,9 @@ class ReviewPipeline:
         artifact_text = read_artifact(request.artifact_path, self._settings.max_artifact_bytes)
         fetch_domains = self._guard.fetch_domain_allowlist(artifact_text)
         rejected_hosts = self._guard.rejected_fetch_hosts(artifact_text)
+        read_roots = self._guard.allowed_read_roots(
+            request.artifact_path, self._settings.oracle_search_paths, request.artifact_repo
+        )
         if rejected_hosts:
             # Not fatal, but a planted internal URL is exactly what the threat model is
             # for — make it visible rather than silently dropping it.
@@ -343,6 +347,7 @@ class ReviewPipeline:
             "oracle": self._oracle,
             "artifact": delimited,
             "fetch_domains": fetch_domains,
+            "read_roots": read_roots,
             "prior_keys": prior_keys,
             **self._agent.build_context(request, self._oracle, state),
         }

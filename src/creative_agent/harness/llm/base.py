@@ -8,6 +8,7 @@ version is part of the wire contract.
 from __future__ import annotations
 
 from enum import StrEnum
+from pathlib import Path
 from typing import TypeVar
 
 from pydantic import BaseModel, Field
@@ -38,6 +39,7 @@ class AssembledPrompt(SchemaModel):
     output_schema: dict[str, object]
     allowed_tools: list[str] = Field(default_factory=list)
     fetch_domain_allowlist: list[str] = Field(default_factory=list)
+    allowed_read_roots: list[Path] = Field(default_factory=list)
     contract_version: int = LLM_CALL_CONTRACT_VERSION
 
 
