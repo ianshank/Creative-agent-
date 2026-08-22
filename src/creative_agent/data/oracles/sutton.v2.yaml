@@ -1,0 +1,422 @@
+# sutton-review doctrine table, v2 — transcribed from the sutton-review v2 specification.
+# This file is DATA consumed by the generic oracle engine; the spec's prose rules are
+# captured as schema fields so nothing normative lives only in a prompt.
+#
+# Verification state: sources marked `verified: true` were resolved against arXiv during
+# the initial transcription (2026-08-22) with author lists diffed. Sources marked
+# `verified: false` carry citation text from the spec and MUST be resolved by
+# `creative-agent oracles rebaseline sutton` — transcription without resolution is the
+# exact defect class (v1's three wrong author lists) this oracle exists to catch.
+
+schema_version: 1
+oracle_id: sutton
+name: sutton-review doctrine table
+version: "2.0"
+description: >
+  Reviews agent architectures, RL algorithm claims, and embodied-deployment blueprints
+  against the published Sutton/Alberta-Plan corpus.
+
+conformance:
+  markers:
+    - Alberta Plan
+    - OaK
+    - Oak architecture
+    - FC-STOMP
+  advisory_severity_cap: info
+
+freshness:
+  last_rebaselined: 2026-08-22
+  rebaseline_count: 0
+  max_rebaselines_without_verification: 2
+
+severity_policy:
+  tier_caps:
+    - tiers: [T, E]
+      max_solo_severity: major
+      reason: >
+        Rows at tier T or E may not carry a Blocker alone — a disclosed self-exemption:
+        much of this oracle is below the evidence bar it imposes on reviewees, and
+        reviewees may say so.
+  unverified_row_cap: minor
+  blocker_requires_any_of:
+    - tier_pr_or_ap_row
+    - gate_failure
+    - safety_failure
+    - internal_contradiction
+
+gate_policy:
+  gates:
+    - name: observable
+      description: What is sensed or computed, in what units, at what rate.
+    - name: update_rule
+      description: The equation, its step size, its stability argument.
+    - name: compute_budget
+      description: >
+        FLOPs per control step, watts, latency at the target rate on the named hardware.
+        A hardware section transcribing vendor specs without a budget is a Blocker on any
+        document calling itself a blueprint or deployment plan.
+      anchors:
+        - >
+          arXiv:2604.19033 reports per-update FLOPs relative to a batch baseline
+          (~140x SAC vs Intentional AC) — ask for the same ratio.
+      blueprint_missing_severity: blocker
+    - name: falsifier
+      description: >
+        The measurement that would show the claim is wrong, with its threshold, stated
+        before the experiment.
+  missing_any_severity: major
+  quant_claim_requires: [dataset, baseline, seeds, interval]
+  hand_asserted_severity: major
+
+source_quality:
+  cluster_citation_min_refs: 4
+  cluster_citation_severity: major
+  bibliography_hygiene_severity: minor
+  vendor_domains:
+    - nvidia.com
+    - qualcomm.com
+    - intel.com
+    - amd.com
+    - ambarella.com
+    - ti.com
+  vendor_page_note: >
+    Vendor pages are not evidence for performance or suitability — only for what the
+    vendor advertises, and must be labelled as such.
+  load_bearing_requires_tiers: [PR, AP]
+  regime_breaks:
+    - supervised -> reinforcement learning
+    - simulation -> physical
+    - offline -> streaming
+
+artifact_classes:
+  - name: architecture_design
+  - name: algorithm_claim
+  - name: deployment_blueprint
+    requires_gates: [compute_budget]
+    requires_sections: [safety]
+  - name: research_synthesis
+    source_quality_only: true
+
+required_decisions: [DEC-S1, DEC-S2, DEC-S3, DEC-S4, DEC-S5, DEC-S6]
+decision_traps:
+  - decision_id: DEC-S2
+    trap: >
+      While per-weight IDBD-style meta step sizes are deferred, the build is not
+      OaK-conformant under D12 feature 2; the artifact must say so rather than claiming
+      the label.
+  - decision_id: DEC-S6
+    trap: >
+      Bounded per-step KL is a stability property of the update, not a safety property of
+      the vehicle; it does not satisfy the physical-deployment safety envelope decision.
+
+oak_conformance:
+  features:
+    - All components learn continually
+    - >
+      Each learned weight has a dedicated step size meta-learned by online
+      cross-validation
+    - Abstractions created via FC-STOMP
+  stages: [Feature Construction, SubTask, Option, Model, Planning]
+  missing_severity: major
+
+protocol:
+  escalation_cycle: 3
+  unverified_marker: "[Unverified — flagged for human check]"
+  usage_gates:
+    - "Gate A: review architecture/design documents BEFORE mechanism build-out."
+    - "Gate B: review again BEFORE empirical commitment."
+
+rows:
+  - id: D1
+    principle: >
+      General methods that scale with computation beat methods encoding human knowledge
+      of the domain.
+    tier: E
+    sources:
+      - citation: "Sutton, The Bitter Lesson (2019), incompleteideas.net"
+        authors: [Richard S. Sutton]
+        url: "http://www.incompleteideas.net/IncIdeas/BitterLesson.html"
+        tier: E
+        verified: false
+        notes: Canonical author-hosted essay URL; confirm at rebaseline.
+    check: >
+      Which parts are hand-specified domain content a scaled general method would subsume?
+      What is the compute-scaling story?
+    failure_mode: Hand-authored domain taxonomies presented as architecture.
+    precedence:
+      applies_to: domain content handed to the agent
+      defer_to: D12
+      note: >
+        D12's naming requirement applies to mechanism the agent runs; D1 applies to domain
+        content handed to the agent. Naming five learning stages is not a D1 violation;
+        naming fourteen hand-authored constraint types is.
+
+  - id: D2
+    principle: >
+      The reward hypothesis (Sutton's, per the paper) holds iff the preference relation
+      satisfies stated axioms.
+    tier: PR
+    sources:
+      - citation: >
+          Bowling, Martin, Dabney, Abel — Settling the Reward Hypothesis, ICML 2023,
+          PMLR 202:3003-3020
+        authors: [Michael Bowling, John D. Martin, Will Dabney, David Abel]
+        arxiv_id: "2212.10420"
+        tier: PR
+        verified: false
+        notes: >
+          Author list is the spec's corrected v2 list (v1 wrongly inserted Sutton in
+          place of Dabney). arXiv id transcribed from memory — confirm at rebaseline.
+    check: >
+      Name the preference relation over outcome distributions. Test completeness,
+      transitivity, independence, continuity, temporal gamma-indifference. Only then judge
+      whether one scalar exists, and where gamma comes from.
+    failure_mode: >
+      Objectives asserted as scalarizable with no preference relation stated; weights that
+      relocate the design problem into tuning.
+
+  - id: D3
+    principle: Experience, not curated data, is the substrate.
+    tier: E
+    sources:
+      - citation: >
+          Silver & Sutton, Welcome to the Era of Experience (2025) — archival venue to be
+          confirmed at next re-baseline
+        authors: [David Silver, Richard S. Sutton]
+        tier: E
+        verified: false
+        notes: Preprint chapter; archival venue unconfirmed per the spec itself.
+    check: >
+      Does the agent learn from its own action-consequence stream, or a corpus it did not
+      generate?
+    failure_mode: Retrieval over a static vector DB presented as a learning agent.
+
+  - id: D4
+    principle: >
+      Big World Hypothesis: the world is orders of magnitude larger than the agent;
+      approximation is permanent.
+    tier: AP
+    sources:
+      - citation: >
+          Javed & Sutton, The Big World Hypothesis and its Ramifications for AI, Finding
+          the Frame workshop, RLC 2024
+        authors: [Khurram Javed, Richard S. Sutton]
+        url: "https://openreview.net/forum?id=Sv7DazuCn8"
+        tier: AP
+        verified: false
+        notes: >
+          Workshop paper (spec's corrected v2 attribution — v1 wrongly added
+          Sharifnassab). OpenReview id unconfirmed — resolve at rebaseline.
+    check: >
+      Does any component assume the agent can represent, enumerate, or simulate the
+      environment?
+    failure_mode: World-model components specified as if complete.
+
+  - id: D5
+    principle: Continual learning is the default; no train phase, no deploy phase.
+    tier: AP
+    sources:
+      - citation: >
+          Sutton, Bowling, Pilarski, The Alberta Plan for AI Research, arXiv:2208.11173
+        authors: [Richard S. Sutton, Michael Bowling, Patrick M. Pilarski]
+        arxiv_id: "2208.11173"
+        tier: AP
+        verified: false
+        notes: Well-known preprint; diff author list at rebaseline.
+    check: Is there a phase boundary anywhere? Justified, or inherited from batch practice?
+    failure_mode: Pre-train-then-deploy pipelines relabelled "lifelong".
+
+  - id: D6
+    principle: >
+      Loss of plasticity is real, measurable, and must be actively counteracted.
+    tier: PR
+    sources:
+      - citation: >
+          Dohare, Hernandez-Garcia, Lan, Rahman, Mahmood, Sutton, Loss of plasticity in
+          deep continual learning, Nature 632:768-774 (2024) — supervised and simulated RL
+        authors:
+          - Shibhansh Dohare
+          - J. Fernando Hernandez-Garcia
+          - Qingfeng Lan
+          - Parash Rahman
+          - A. Rupam Mahmood
+          - Richard S. Sutton
+        doi: "10.1038/s41586-024-07711-7"
+        tier: PR
+        verified: false
+        notes: DOI transcribed from memory — confirm at rebaseline.
+      - citation: >
+          Hernandez-Garcia, Dohare, Luo, Sutton, Reinitializing weights vs units,
+          arXiv:2508.00212 (2025) — continual supervised only
+        authors:
+          - J. Fernando Hernandez-Garcia
+          - Shibhansh Dohare
+          - Jun Luo
+          - Richard S. Sutton
+        arxiv_id: "2508.00212"
+        tier: AP
+        verified: true
+        last_verified: 2026-08-22
+        notes: >
+          Resolved against arXiv 2026-08-22; author list matches (CoLLAs 2025; the spec's
+          v2 correction — v1 wrongly attributed this to Elsayed).
+    check: >
+      Is a plasticity mechanism NAMED, with a measured metric and reporting cadence?
+    failure_mode: Unmeasured plasticity claims.
+
+  - id: D6a
+    principle: >
+      Oracle gap, disclosed: no physical-control streaming plasticity result is in this
+      oracle.
+    tier: NONE
+    disclosed_gap: true
+    sources: []
+    check: >
+      Do not demand an in-regime citation that does not exist. Require the artifact to
+      carry an explicit "unevidenced in this regime" label instead.
+    failure_mode: Silent transfer of supervised results to in-flight adaptation.
+
+  - id: D7
+    principle: >
+      Step sizes belong in units of intended function-output change, not parameter
+      movement.
+    tier: PR
+    sources:
+      - citation: >
+          Sharifnassab, Elsayed, De Asis, Mahmood, Sutton, Intentional Updates for
+          Streaming Reinforcement Learning, arXiv:2604.19033, ICML 2026
+        authors:
+          - Arsalan Sharifnassab
+          - Mohamed Elsayed
+          - Kris De Asis
+          - A. Rupam Mahmood
+          - Richard S. Sutton
+        arxiv_id: "2604.19033"
+        tier: PR
+        verified: true
+        last_verified: 2026-08-22
+        notes: Resolved against arXiv 2026-08-22; author list matches the spec.
+      - citation: "Sutton, IDBD (1992)"
+        authors: [Richard S. Sutton]
+        url: "http://www.incompleteideas.net/papers/sutton-92a.pdf"
+        tier: PR
+        verified: false
+        notes: AAAI-92; author-hosted URL unconfirmed — resolve at rebaseline.
+    check: >
+      At batch size 1, what bounds the per-step change in output? Is the intended outcome
+      stated (fractional TD-error reduction; bounded per-step policy KL)? Is diagonal
+      scaling present?
+    check_notes: >
+      Per-weight meta-learned step sizes are OaK feature 2 and are checked under D12, NOT
+      required here.
+    failure_mode: >
+      Designs that name streaming RL but keep a global scalar learning rate.
+
+  - id: D8
+    principle: >
+      Subtasks are reward-respecting: original reward plus a bonus on a feature of the
+      state at option termination.
+    tier: PR
+    sources:
+      - citation: >
+          Sutton, Machado, Holland, David Szepesvari, Timbers, Tanner, White,
+          Reward-respecting subtasks for model-based RL, Artificial Intelligence (2023);
+          arXiv:2202.03466
+        authors:
+          - Richard S. Sutton
+          - Marlos C. Machado
+          - G. Zacharias Holland
+          - David Szepesvari
+          - Finbarr Timbers
+          - Brian Tanner
+          - Adam White
+        arxiv_id: "2202.03466"
+        tier: PR
+        verified: false
+        notes: Diff full author list at rebaseline (spec emphasizes David Szepesvari).
+    check: >
+      For each intrinsic goal: what is the terminating feature, and what is the stopping
+      bonus?
+    failure_mode: Free-floating curiosity/novelty drives.
+
+  - id: D9
+    principle: >
+      An option is unusable for planning until its model is learned: initiation set,
+      policy, termination, plus learned transition/reward model.
+    tier: PR
+    sources:
+      - citation: >
+          Sutton, Precup, Singh, Between MDPs and semi-MDPs, Artificial Intelligence 112
+          (1999)
+        authors: [Richard S. Sutton, Doina Precup, Satinder Singh]
+        doi: "10.1016/S0004-3702(99)00052-1"
+        tier: PR
+        verified: false
+        notes: DOI transcribed from memory — confirm at rebaseline.
+    check: >
+      For every macro-action or reusable module, where is its learned model and what does
+      it predict?
+    failure_mode: Reusable building-block libraries with no models.
+
+  - id: D10
+    principle: >
+      Knowledge is predictions verifiable from the agent's own stream (GVFs).
+    tier: PR
+    sources:
+      - citation: >
+          Sutton, Modayil, Delp, Degris, Pilarski, White, Precup, Horde, AAMAS 2011:
+          761-768
+        authors:
+          - Richard S. Sutton
+          - Joseph Modayil
+          - Michael Delp
+          - Thomas Degris
+          - Patrick M. Pilarski
+          - Adam White
+          - Doina Precup
+        url: "http://www.incompleteideas.net/papers/horde-aamas-11.pdf"
+        tier: PR
+        verified: false
+        notes: Author-hosted URL unconfirmed — resolve at rebaseline.
+    check: >
+      Is every knowledge claim falsifiable by the agent from its own data, no human
+      labeller?
+    failure_mode: Knowledge bases the agent cannot verify or refute.
+
+  - id: D11
+    principle: Elements are continually assessed for utility and replaced.
+    tier: AP
+    sources:
+      - citation: >
+          Alberta Plan Step 11 (written "Oak" there), arXiv:2208.11173
+        authors: [Richard S. Sutton, Michael Bowling, Patrick M. Pilarski]
+        arxiv_id: "2208.11173"
+        tier: AP
+        verified: false
+        notes: Same preprint as D5.
+    check: What gets deleted, on what utility signal, at what rate?
+    failure_mode: Monotonically growing memory with no eviction.
+
+  - id: D12
+    principle: >
+      OaK = model-based RL with three special features: (1) all components learn
+      continually; (2) each learned weight has a dedicated step size meta-learned by
+      online cross-validation; (3) abstractions created via FC-STOMP — Feature
+      Construction -> SubTask -> Option -> Model -> Planning.
+    tier: T
+    sources:
+      - citation: >
+          Sutton, The OaK Architecture (RLC/NeurIPS 2025 invited talks; author's own
+          summary of the three features)
+        authors: [Richard S. Sutton]
+        tier: T
+        verified: false
+        notes: Talk — no archival identifier exists; tier-capped accordingly.
+    check: >
+      Name all three features and all five FC-STOMP stages with their update rules.
+    failure_mode: Architecture-by-nomenclature.
+    precedence:
+      applies_to: mechanism the agent runs
+      note: >
+        D12's naming requirement applies to mechanism the agent runs, not to domain
+        content (that is D1's province).
