@@ -9,6 +9,7 @@ with an explicit --reset-state escape hatch, never a silent cycle reset.
 from __future__ import annotations
 
 import fcntl
+import logging
 import os
 import re
 from collections.abc import Iterator
@@ -19,6 +20,7 @@ import yaml
 from pydantic import ValidationError
 
 from creative_agent.errors import StateCorruptError
+from creative_agent.harness.logging import get_logger, log_event
 from creative_agent.models.findings import Severity
 from creative_agent.models.oracle import OracleTable
 from creative_agent.models.review import ReviewResult
@@ -26,6 +28,7 @@ from creative_agent.models.state import EscalationEvent, ReviewState
 
 SUPPORTED_STATE_SCHEMA_VERSIONS = {1}
 _FRONT_MATTER = re.compile(r"\A---\n(?P<yaml>.*?)\n---\n", re.DOTALL)
+_LOG = get_logger(__name__)
 
 
 class FileStateStore:
@@ -83,8 +86,22 @@ class FileStateStore:
         content = f"---\n{front}---\n\n{summary_markdown}".rstrip() + "\n"
         with self._locked(state.artifact_id):
             tmp_path = path.with_suffix(".md.tmp")
-            tmp_path.write_text(content, encoding="utf-8", newline="\n")
-            os.replace(tmp_path, path)
+            try:
+                tmp_path.write_text(content, encoding="utf-8", newline="\n")
+                os.replace(tmp_path, path)
+            except OSError:
+                # Never leave a partial temp file behind to be mistaken for state.
+                tmp_path.unlink(missing_ok=True)
+                raise
+        log_event(
+            _LOG,
+            logging.DEBUG,
+            "state.saved",
+            artifact_id=state.artifact_id,
+            cycle=state.cycle,
+            path=str(path),
+            bytes=len(content),
+        )
         return path
 
     def reset(self, artifact_id: str) -> None:

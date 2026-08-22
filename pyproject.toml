@@ -67,7 +67,7 @@ ignore = [
 "src/creative_agent/harness/consistency.py" = ["RUF001"]
 # The pipeline orchestrates many injected components; the arg/statement counts are the
 # design, not an accident. Renderer builds one long document.
-"src/creative_agent/harness/pipeline.py" = ["PLR0913", "PLR0915"]
+"src/creative_agent/harness/pipeline.py" = ["PLR0913", "PLR0915", "PLR0912"]
 "src/creative_agent/harness/rendering.py" = ["PLR0915"]
 # prompting: function-level import breaks a models<->harness cycle; autoescape=False is
 # correct for plain-text prompts (no HTML sink).

@@ -39,8 +39,31 @@ def _fail(exc: CreativeAgentError) -> NoReturn:
 
 
 @app.callback()
-def _main() -> None:
+def _main(
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Log progress at INFO level")
+    ] = False,
+    debug: Annotated[
+        bool, typer.Option("--debug", help="Log every stage and LLM call at DEBUG level")
+    ] = False,
+    log_format: Annotated[
+        str | None, typer.Option("--log-format", help="text | json (default from settings)")
+    ] = None,
+) -> None:
     """creative-agent: doctrine-driven review harness."""
+    from creative_agent.harness.logging import configure_logging
+
+    settings = _settings()
+    level = settings.log_level
+    if verbose:
+        level = "INFO"
+    if debug:  # --debug wins over --verbose
+        level = "DEBUG"
+    try:
+        configure_logging(level, log_format or settings.log_format)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=int(ExitCode.CONFIG_ERROR)) from exc
 
 
 @app.command()

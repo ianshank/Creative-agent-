@@ -9,6 +9,7 @@ The findings table is assembled by this module, never emitted whole by the model
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import TypeVar
@@ -27,6 +28,7 @@ from creative_agent.harness.llm.base import (
     ToolEvidence,
     parse_payload,
 )
+from creative_agent.harness.logging import get_logger, log_event, timed_stage
 from creative_agent.harness.oak import LabelConformanceChecker
 from creative_agent.harness.prompting import PromptAssembler, render_oracle_rows
 from creative_agent.harness.protocols import Clock, LLMClient, ReviewAgent, StateStore
@@ -54,6 +56,7 @@ from creative_agent.models.verification import VerificationEntry
 
 _HEADING = re.compile(r"^#{1,6}\s+(?P<title>.+)$", re.MULTILINE)
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
+_LOG = get_logger(__name__)
 
 
 @dataclass
@@ -128,7 +131,7 @@ class ReviewPipeline:
         attempts = self._settings.max_regeneration_attempts + 1
         defects = list(repair_defects or [])
         last_error: str | None = None
-        for _ in range(attempts):
+        for attempt in range(attempts):
             prompt = self._assembler.assemble(
                 kind,
                 ref=ref,
@@ -136,7 +139,13 @@ class ReviewPipeline:
                 fetch_domain_allowlist=context.get("fetch_domains", []),  # type: ignore[arg-type]
                 context={**context, "repair_defects": defects},
             )
-            raw: RawLLMResult = await self._llm.generate(prompt)
+            with timed_stage(
+                _LOG, "llm.call", kind=kind.value, ref=ref, attempt=attempt + 1
+            ) as call_log:
+                raw: RawLLMResult = await self._llm.generate(prompt)
+                call_log["model"] = raw.model
+                call_log["cost_usd"] = raw.cost_usd
+                call_log["tool_results"] = len(raw.tool_evidence)
             sweep.evidence.extend(raw.tool_evidence)
             sweep.calls.append(
                 {"kind": kind.value, "ref": ref, "model": raw.model, "cost_usd": raw.cost_usd}
@@ -145,7 +154,18 @@ class ReviewPipeline:
                 return parse_payload(raw, model_type)
             except ValidationError as exc:
                 last_error = str(exc)
-                defects = [*defects, f"schema violation: {exc.errors()[0]['msg']}"]
+                first = exc.errors()[0]
+                log_event(
+                    _LOG,
+                    logging.WARNING,
+                    "llm.schema_violation",
+                    kind=kind.value,
+                    ref=ref,
+                    attempt=attempt + 1,
+                    location=".".join(str(part) for part in first["loc"]),
+                    reason=first["msg"],
+                )
+                defects = [*defects, f"schema violation: {first['msg']}"]
         raise LLMOutputError(
             f"{kind.value} call failed schema validation after {attempts} attempts: {last_error}"
         )
@@ -260,11 +280,43 @@ class ReviewPipeline:
     # ---- main entry ------------------------------------------------------
 
     async def run(self, request: ReviewRequest) -> PipelineOutcome:
+        with timed_stage(
+            _LOG,
+            "review",
+            artifact_id=request.artifact_id,
+            oracle=self._oracle.oracle_id,
+            agent=request.agent_name,
+        ) as review_log:
+            outcome = await self._run(request, review_log)
+        return outcome
+
+    async def _run(self, request: ReviewRequest, review_log: dict[str, object]) -> PipelineOutcome:
         state = self._state_store.load(request.artifact_id)
         artifact_text = read_artifact(request.artifact_path, self._settings.max_artifact_bytes)
         fetch_domains = self._guard.fetch_domain_allowlist(artifact_text)
+        rejected_hosts = self._guard.rejected_fetch_hosts(artifact_text)
+        if rejected_hosts:
+            # Not fatal, but a planted internal URL is exactly what the threat model is
+            # for — make it visible rather than silently dropping it.
+            log_event(
+                _LOG,
+                logging.WARNING,
+                "security.fetch_hosts_rejected",
+                artifact_id=request.artifact_id,
+                hosts=rejected_hosts,
+            )
         delimited = ThreatGuard.delimit_artifact(artifact_text)
         prior_keys = sorted(state.open_major_keys())
+        log_event(
+            _LOG,
+            logging.INFO,
+            "review.started",
+            artifact_id=request.artifact_id,
+            prior_cycles=state.cycle,
+            artifact_bytes=len(artifact_text),
+            fetch_domains=len(fetch_domains),
+            prior_open_major_keys=len(prior_keys),
+        )
 
         base_context: dict[str, object] = {
             "oracle": self._oracle,
@@ -397,15 +449,35 @@ class ReviewPipeline:
                     "incomplete verification log after "
                     f"{attempt + 1} attempts: " + "; ".join(defects[:5])
                 )
+                log_event(
+                    _LOG,
+                    logging.ERROR,
+                    "verification.failed",
+                    artifact_id=request.artifact_id,
+                    attempts=attempt + 1,
+                    defect_count=len(defects),
+                    defects=defects[:5],
+                )
                 break
-            # Repair only the calls implicated by the defects.
-            defective_rows = {
-                row_id
+            # Repair only the calls implicated by the defects. Row ids are matched on a
+            # word boundary so D1's repair never inherits D10's defects.
+            defects_by_row = {
+                row_id: [d for d in defects if _mentions_row(d, row_id)]
                 for row_id in sweep.rows
-                for defect in defects
-                if f" {row_id} " in f" {defect} "
             }
-            for row_id in sorted(defective_rows):
+            defective_rows = sorted(
+                row_id for row_id, matched in defects_by_row.items() if matched
+            )
+            log_event(
+                _LOG,
+                logging.INFO,
+                "verification.repairing",
+                artifact_id=request.artifact_id,
+                attempt=attempt + 1,
+                defect_count=len(defects),
+                rows=defective_rows,
+            )
+            for row_id in defective_rows:
                 row = self._oracle.row(row_id)
                 repaired = await self._call(
                     sweep,
@@ -417,7 +489,7 @@ class ReviewPipeline:
                         "row_rendered": render_oracle_rows([row]),
                     },
                     ref=row_id,
-                    repair_defects=[d for d in defects if row_id in d],
+                    repair_defects=defects_by_row[row_id],
                 )
                 sweep.rows[row_id] = repaired
 
@@ -430,6 +502,15 @@ class ReviewPipeline:
         )
         escalation = self._escalator.check(state, result)
         result = result.model_copy(update={"escalation": escalation})
+        if escalation is not None:
+            log_event(
+                _LOG,
+                logging.WARNING,
+                "escalation.charter_review",
+                artifact_id=request.artifact_id,
+                key=escalation.key.render(),
+                cycles=escalation.cycles,
+            )
 
         final_synthesis = sweep.synthesis
         assert final_synthesis is not None
@@ -481,6 +562,33 @@ class ReviewPipeline:
         state_path = self._state_store.save(new_state, rendered)
         self._write_audit_bundle(request, current_cycle, sweep)
 
+        severity_counts: dict[str, int] = {}
+        for finding in findings:
+            name = Severity.parse(finding.severity).name
+            severity_counts[name] = severity_counts.get(name, 0) + 1
+        review_log.update(
+            {
+                "cycle": current_cycle,
+                "mode": mode,
+                "artifact_class": classify.artifact_class,
+                "findings": len(findings),
+                "severities": severity_counts,
+                "llm_calls": len(sweep.calls),
+                "escalated": escalation is not None,
+            }
+        )
+        log_event(
+            _LOG,
+            logging.INFO,
+            "review.completed",
+            artifact_id=request.artifact_id,
+            cycle=current_cycle,
+            mode=mode,
+            findings=len(findings),
+            severities=severity_counts,
+            state_path=str(state_path),
+        )
+
         return PipelineOutcome(
             report=report,
             result=result,
@@ -502,6 +610,11 @@ class ReviewPipeline:
 
 def _squash(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+def _mentions_row(defect: str, row_id: str) -> bool:
+    """Whole-token match so 'D1' does not match a defect that names 'D10'."""
+    return re.search(rf"(?<![A-Za-z0-9]){re.escape(row_id)}(?![A-Za-z0-9])", defect) is not None
 
 
 __all__ = [

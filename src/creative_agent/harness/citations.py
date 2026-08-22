@@ -9,16 +9,19 @@ failure is data, not an error: unverified rows are severity-capped by the freshn
 
 from __future__ import annotations
 
+import logging
 import unicodedata
 from xml.etree.ElementTree import Element
 
 import httpx
 from defusedxml import ElementTree as SafeET
 
+from creative_agent.harness.logging import get_logger, log_event
 from creative_agent.harness.protocols import Clock, ResolutionResult
 from creative_agent.models.oracle import FreshnessMeta, OracleTable, SourceRef
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
+_LOG = get_logger(__name__)
 
 
 def _fold_surname(name: str) -> str:
@@ -109,6 +112,14 @@ class OracleRebaseliner:
                         f"{row.id}: AUTHOR MISMATCH on {source.arxiv_id} — {result.detail} "
                         "(the v1 defect class; fix the citation, do not soften)"
                     )
+                    log_event(
+                        _LOG,
+                        logging.WARNING,
+                        "rebaseline.author_mismatch",
+                        row=row.id,
+                        arxiv_id=source.arxiv_id,
+                        detail=result.detail,
+                    )
                 else:
                     new_sources.append(source)
                     report.append(
@@ -116,6 +127,14 @@ class OracleRebaseliner:
                         f" ({result.detail})"
                     )
             new_rows.append(row.model_copy(update={"sources": new_sources}))
+            log_event(
+                _LOG,
+                logging.DEBUG,
+                "rebaseline.row_done",
+                row=row.id,
+                sources=len(new_sources),
+                verified=sum(1 for s in new_sources if s.verified),
+            )
         freshness = FreshnessMeta(
             last_rebaselined=today,
             rebaseline_count=table.freshness.rebaseline_count + 1,

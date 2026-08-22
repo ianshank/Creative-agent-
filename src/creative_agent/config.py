@@ -90,6 +90,11 @@ class HarnessSettings(BaseSettings):
     arxiv_api_url: str = "https://export.arxiv.org/api/query"
     citation_timeout_seconds: float = 30.0
 
+    # Observability (DEC-F10). Level and format are configuration, never literals at a
+    # call site; --verbose/--debug on the CLI raise the level for one invocation.
+    log_level: str = "WARNING"
+    log_format: str = "text"
+
     # Rendering limits (output laundering, DEC-F9).
     max_prose_chars: int = 4_000
 
