@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -155,7 +156,7 @@ class TestPreToolUseWebFetchEnforcement:
         pytest.importorskip("claude_agent_sdk")
         options = adapter()._options(assembled_prompt)
         (matcher,) = options.hooks["PreToolUse"]
-        assert matcher.matcher == "WebFetch"
+        assert matcher.matcher == "WebFetch|Read|Grep|Glob"
         (hook,) = matcher.hooks
         return hook
 
@@ -181,18 +182,95 @@ class TestPreToolUseWebFetchEnforcement:
         )
         assert result == {}
 
-    async def test_ignores_non_webfetch_tools(self) -> None:
-        """The hook is scoped to WebFetch calls; a Read call is untouched by DEC-F11a."""
+    async def test_ignores_tools_outside_its_scope(self) -> None:
+        """The hook only judges WebFetch/Read/Grep/Glob; other tools pass through."""
         hook = self._wired_hook(prompt().model_copy(update={"fetch_domain_allowlist": []}))
-        result = await hook(
-            {"tool_name": "Read", "tool_input": {"file_path": "/anywhere"}}, "t1", None
-        )
+        result = await hook({"tool_name": "TodoWrite", "tool_input": {}}, "t1", None)
         assert result == {}
 
     async def test_empty_allowlist_denies_every_host(self) -> None:
         hook = self._wired_hook(prompt().model_copy(update={"fetch_domain_allowlist": []}))
         result = await hook(
             {"tool_name": "WebFetch", "tool_input": {"url": "https://arxiv.org/abs/1"}},
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+class TestPreToolUseReadEnforcement:
+    """DEC-F11b: Read/Grep/Glob path scoping enforced at the call boundary — previously
+    computed by ThreatGuard.allowed_read_roots but never reaching the SDK or the prompt at
+    all. Same wired-hook approach as the WebFetch tests: the mocked transport doesn't run
+    the SDK's hook machinery, so these invoke the hook function directly."""
+
+    @staticmethod
+    def _wired_hook(assembled_prompt: AssembledPrompt) -> Any:
+        pytest.importorskip("claude_agent_sdk")
+        options = adapter()._options(assembled_prompt)
+        (matcher,) = options.hooks["PreToolUse"]
+        (hook,) = matcher.hooks
+        return hook
+
+    async def test_denies_a_read_outside_the_roots(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        hook = self._wired_hook(prompt().model_copy(update={"allowed_read_roots": [root]}))
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "secret.env")}},
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_allows_a_read_inside_the_roots(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        hook = self._wired_hook(prompt().model_copy(update={"allowed_read_roots": [root]}))
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": str(root / "doc.md")}},
+            "t1",
+            None,
+        )
+        assert result == {}
+
+    async def test_glob_without_an_explicit_path_falls_back_to_cwd(self, tmp_path: Path) -> None:
+        """Grep/Glob's `path` argument is optional; the SDK reports cwd when omitted."""
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        hook = self._wired_hook(prompt().model_copy(update={"allowed_read_roots": [root]}))
+        allowed = await hook(
+            {"tool_name": "Glob", "tool_input": {"pattern": "*.md"}, "cwd": str(root)},
+            "t1",
+            None,
+        )
+        assert allowed == {}
+        denied = await hook(
+            {"tool_name": "Glob", "tool_input": {"pattern": "*.md"}, "cwd": str(tmp_path)},
+            "t1",
+            None,
+        )
+        assert denied["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_grep_with_an_explicit_path_uses_it_over_cwd(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        hook = self._wired_hook(prompt().model_copy(update={"allowed_read_roots": [root]}))
+        result = await hook(
+            {
+                "tool_name": "Grep",
+                "tool_input": {"pattern": "TODO", "path": str(tmp_path / "elsewhere")},
+                "cwd": str(root),
+            },
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_empty_roots_denies_every_read(self, tmp_path: Path) -> None:
+        hook = self._wired_hook(prompt().model_copy(update={"allowed_read_roots": []}))
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "doc.md")}},
             "t1",
             None,
         )

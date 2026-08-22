@@ -75,13 +75,16 @@ class PromptAssembler:
             keep_trailing_newline=True,
         )
 
-    def assemble(
+    def assemble(  # noqa: PLR0913 — three independent scope lists (tools/fetch/read
+        # roots, DEC-F9/F11) plus kind/ref/context; a wrapper object would touch every
+        # call site (pipeline.py, two test modules) for no behavioral gain
         self,
         kind: CallKind,
         *,
         ref: str = "",
         allowed_tools: list[str],
         fetch_domain_allowlist: list[str],
+        allowed_read_roots: list[Path] | None = None,
         context: dict[str, Any],
     ) -> AssembledPrompt:
         model_type = output_model_for(kind)
@@ -105,4 +108,5 @@ class PromptAssembler:
             output_schema=schema,
             allowed_tools=allowed_tools,
             fetch_domain_allowlist=fetch_domain_allowlist,
+            allowed_read_roots=allowed_read_roots or [],
         )

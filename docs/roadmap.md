@@ -31,28 +31,34 @@ unpublished preprint, that is the correct end state, not a failure.
 
 ## Near term
 
-### 4. Enforce the tool scope in the SDK session, or narrow the claim — **WebFetch half done**
+### 4. Enforce the tool scope in the SDK session — **done (DEC-F11), pending live confirmation**
 
-**Done (DEC-F11a):** a `PreToolUse` hook in `ClaudeSDKAdapter` now denies any `WebFetch`
-call whose host isn't in the review's computed allowlist — the allowlist was previously
-advisory only (stated in the system prompt, never enforced; only the downstream
-tool-honesty check would later refuse to credit resulting "evidence," after the call had
-already run). Uses `PreToolUse`, not `can_use_tool`: this project's
+A `PreToolUse` hook in `ClaudeSDKAdapter` now denies both halves of what DEC-F9 only stated
+in the prompt: a `WebFetch` call whose host isn't in the review's computed allowlist
+(DEC-F11a), and a `Read`/`Grep`/`Glob` call whose resolved path escapes the review's
+computed read roots (DEC-F11b — this half was previously fully disconnected, not merely
+advisory: `ThreatGuard.allowed_read_roots` was computed and unit-tested but never reached
+the SDK or any prompt at all). The path check resolves both the candidate and the roots
+before comparing (`Path.resolve()` + `is_relative_to()`, not string prefix matching), so a
+symlink inside an allowed root that points outside it is caught — the artifact directory
+under review is untrusted content.
+
+Uses `PreToolUse`, not the SDK's `can_use_tool` callback: this project's
 `permission_mode="dontAsk"` means `can_use_tool` is very likely dead code here, since it
 only fires when permission evaluation would otherwise prompt, and `dontAsk`'s entire
-purpose is to skip that. Implemented and unit-tested against the mocked-transport
-`ClaudeSDKAdapter` with no API key needed; only final live confirmation is still
-owner-blocked (item 1). See `docs/decision-log.md` DEC-F11.
+purpose is to skip that. `PreToolUse` fires on every tool call unconditionally. The
+decision predicates (`is_fetch_allowed`, `is_path_within_roots`) live in
+`harness/security.py`, which is coverage-counted, rather than inline in `claude_sdk.py`
+(the one approved coverage omit, DEC-F8) — a broken check there could otherwise ship
+invisibly to the gate.
 
-**Still open (DEC-F11b):** `ThreatGuard.allowed_read_roots` is computed and unit-tested but
-still not passed to the SDK or rendered into any prompt — read-path scoping (`Read`/`Grep`/
-`Glob`) is fully disconnected, not merely advisory. Lower severity than the WebFetch half
-(worst case is unintended local file content in laundered, length-capped LLM prose, not
-network exfiltration), which is why it shipped second. Same mechanism
-(`PreToolUse`), same coverage-boundary discipline (decision logic in `security.py`, not
-inline in the `claude_sdk.py` coverage omit) — needs a symlink-safe path check
-(`Path.resolve()` + `is_relative_to()`, not string prefix matching) since the artifact
-directory being reviewed is untrusted content.
+Implemented and unit-tested entirely against the mocked-transport `ClaudeSDKAdapter`, no
+API key needed. What's left is **only** the final live confirmation that the real SDK
+invokes the hook the way the mocked transport says it does — that's owner-blocked on item
+1, same as everything else needing `ANTHROPIC_API_KEY`. See `docs/decision-log.md` DEC-F11
+for the full rationale, including the accepted residual risk (a WebFetch redirect chain to
+an internal host is invisible to a hook that only sees the initial URL — documented, not
+solved, as over-engineering for a single-user offline reviewer).
 
 ### 5. Schema migration paths
 

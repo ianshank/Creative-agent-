@@ -9,6 +9,7 @@ from creative_agent.harness.security import (
     ThreatGuard,
     is_fetch_allowed,
     is_internal_host,
+    is_path_within_roots,
 )
 from tests.factories import make_oracle, make_row, make_source
 
@@ -136,6 +137,74 @@ class TestFetchEnforcementPredicate:
 
     def test_port_and_case_do_not_defeat_the_check(self) -> None:
         assert is_fetch_allowed("https://ARXIV.org:443/x", ["arxiv.org"])
+
+
+class TestPathWithinRootsPredicate:
+    """DEC-F11b: the predicate the PreToolUse hook calls for Read/Grep/Glob. Must resolve
+    both sides before comparing — the artifact directory under review is untrusted, so a
+    planted symlink is exactly the kind of escape a naive prefix check would miss."""
+
+    def test_path_inside_root_is_allowed(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        target = root / "doc.md"
+        target.write_text("x", encoding="utf-8")
+        assert is_path_within_roots(str(target), [root])
+
+    def test_path_outside_every_root_is_denied(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        outside = tmp_path / "secret.env"
+        outside.write_text("x", encoding="utf-8")
+        assert not is_path_within_roots(str(outside), [root])
+
+    def test_traversal_out_of_root_is_denied(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        (tmp_path / "secret.env").write_text("x", encoding="utf-8")
+        assert not is_path_within_roots(str(root / ".." / "secret.env"), [root])
+
+    def test_prefix_collision_is_not_treated_as_inside(self, tmp_path: Path) -> None:
+        """`/allowed` must not match a sibling like `/allowed-evil` by string prefix."""
+        root = tmp_path / "allowed"
+        root.mkdir()
+        sibling = tmp_path / "allowed-evil"
+        sibling.mkdir()
+        target = sibling / "x.md"
+        target.write_text("x", encoding="utf-8")
+        assert not is_path_within_roots(str(target), [root])
+
+    def test_symlink_escaping_the_root_is_denied(self, tmp_path: Path) -> None:
+        """The exploit this predicate exists to catch: a symlink inside the allowed root
+        that resolves to a target outside it."""
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        secret = tmp_path / "secret.env"
+        secret.write_text("s3cret", encoding="utf-8")
+        link = root / "innocuous.md"
+        link.symlink_to(secret)
+        assert not is_path_within_roots(str(link), [root])
+
+    def test_symlink_staying_inside_the_root_is_allowed(self, tmp_path: Path) -> None:
+        root = tmp_path / "artifact-dir"
+        root.mkdir()
+        real = root / "real.md"
+        real.write_text("x", encoding="utf-8")
+        link = root / "alias.md"
+        link.symlink_to(real)
+        assert is_path_within_roots(str(link), [root])
+
+    def test_multiple_roots_any_match_allows(self, tmp_path: Path) -> None:
+        artifact_dir = tmp_path / "artifact"
+        oracle_dir = tmp_path / "oracle"
+        artifact_dir.mkdir()
+        oracle_dir.mkdir()
+        target = oracle_dir / "sutton.v2.yaml"
+        target.write_text("x", encoding="utf-8")
+        assert is_path_within_roots(str(target), [artifact_dir, oracle_dir])
+
+    def test_unresolvable_path_is_denied_not_raised(self) -> None:
+        assert not is_path_within_roots("\x00bad", [Path("/tmp")])
 
 
 class TestReadScoping:

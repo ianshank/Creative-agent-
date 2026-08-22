@@ -51,6 +51,20 @@ def is_fetch_allowed(url: str, allowlist: list[str]) -> bool:
     return host is not None and host in allowlist
 
 
+def is_path_within_roots(path: str, roots: list[Path]) -> bool:
+    """True when `path` resolves inside one of `roots` (DEC-F11b).
+
+    Resolves both the candidate and the roots before comparing, so a symlink inside an
+    allowed root that points outside it is caught — a string prefix check would not catch
+    it, and the artifact directory being reviewed is untrusted content.
+    """
+    try:
+        resolved = Path(path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return any(resolved.is_relative_to(root.resolve()) for root in roots)
+
+
 def is_internal_host(host: str, blocked_suffixes: tuple[str, ...]) -> bool:
     """True when a host is loopback, private, link-local, reserved, or internal-only.
 

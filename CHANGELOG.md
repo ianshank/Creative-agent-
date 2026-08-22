@@ -33,9 +33,19 @@ Post-merge next-steps work, not yet in `main`.
   only fires when permission evaluation would otherwise prompt); `PreToolUse` fires
   unconditionally. The decision predicate (`is_fetch_allowed`) lives in `harness/security.py`
   (coverage-counted) rather than inline in `claude_sdk.py` (the one approved coverage
-  omit, DEC-F8), so a broken check can't ship invisibly to the gate. Read/Grep/Glob
-  path-scoping enforcement (DEC-F11b) is tracked as a separate follow-up — see
-  `docs/decision-log.md` DEC-F11.
+  omit, DEC-F8), so a broken check can't ship invisibly to the gate.
+
+- **DEC-F11b: real Read/Grep/Glob scoping.** `ThreatGuard.allowed_read_roots` was computed
+  and unit-tested but never reached the SDK or any prompt — read-path scoping was fully
+  disconnected, not merely advisory. The same `PreToolUse` hook now also denies a
+  `Read`/`Grep`/`Glob` call whose resolved path escapes the review's computed roots
+  (artifact directory, oracle directories, and `--artifact-repo` when given). The
+  predicate (`is_path_within_roots`) resolves both the candidate path and the roots before
+  comparing (`Path.resolve()` + `is_relative_to()`), so a symlink inside an allowed root
+  that points outside it is caught — the artifact directory under review is untrusted
+  content, and a string-prefix check would miss that. Grep/Glob's `path` argument is
+  optional and falls back to the session's working directory when omitted. `docs/decision-
+  log.md` DEC-F11 now covers both halves.
 
 ### Fixed
 

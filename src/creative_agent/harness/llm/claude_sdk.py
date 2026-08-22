@@ -6,11 +6,12 @@ bypassPermissions). Message handling dispatches on type names so the adapter can
 exercised against recorded/mocked transports without importing SDK classes; the weekly
 live workflow guards against surface drift.
 
-A `PreToolUse` hook enforces DEC-F9's WebFetch scoping at the call boundary (DEC-F11a):
-the allowlist was previously advisory-only (stated in the prompt, never enforced). The
-decision logic itself (`is_fetch_allowed`) lives in `harness/security.py`, which is
-coverage-counted — this module stays thin glue only, since it is the one file DEC-F8
-excludes from the coverage gate and a check written inline here could ship untested.
+A `PreToolUse` hook enforces DEC-F9's scoping at the call boundary: WebFetch host allowlist
+(DEC-F11a) and Read/Grep/Glob path scoping (DEC-F11b), both previously advisory-only or
+fully disconnected. The decision logic itself (`is_fetch_allowed`, `is_path_within_roots`)
+lives in `harness/security.py`, which is coverage-counted — this module stays thin glue
+only, since it is the one file DEC-F8 excludes from the coverage gate and a check written
+inline here could ship untested.
 
 Excluded from the coverage gate (visible omit, DEC-F8): exercised by mocked-transport
 tests here and by `pytest -m live` / scripts/sdk_spike.py against the real SDK.
@@ -26,10 +27,12 @@ from creative_agent.config import HarnessSettings
 from creative_agent.errors import LLMOutputError, LLMTransportError
 from creative_agent.harness.llm.base import AssembledPrompt, RawLLMResult, ToolEvidence
 from creative_agent.harness.logging import get_logger, log_event
-from creative_agent.harness.security import is_fetch_allowed
+from creative_agent.harness.security import is_fetch_allowed, is_path_within_roots
 
 _LOG = get_logger(__name__)
 _TARGET_KEYS = ("url", "file_path", "path", "pattern", "query")
+# Read requires file_path; Grep/Glob take an optional path (default: cwd, from input_data).
+_READ_PATH_KEYS = ("file_path", "path")
 
 
 def _deny(reason: str) -> dict[str, Any]:
@@ -43,29 +46,48 @@ def _deny(reason: str) -> dict[str, Any]:
 
 
 def _pre_tool_use_hook(prompt: AssembledPrompt) -> Any:
-    """Builds a PreToolUse hook closed over this call's computed fetch allowlist.
+    """Builds a PreToolUse hook closed over this call's computed scopes.
 
-    Checked against the allowlist actually computed for this review (DEC-F11a) — not a
-    fresh internal-host check, which would permit any public host rather than only the
-    oracle- and artifact-derived set the model was told about in the system prompt.
+    WebFetch (DEC-F11a) is checked against the exact allowlist computed for this review —
+    not a fresh internal-host check, which would permit any public host rather than only
+    the oracle- and artifact-derived set the model was told about in the system prompt.
+    Read/Grep/Glob (DEC-F11b) are checked against the computed read roots; Grep/Glob's
+    `path` argument is optional and defaults to the session's cwd when absent.
     """
 
     async def hook(
         input_data: dict[str, Any], tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
-        if input_data.get("tool_name") != "WebFetch":
-            return {}
-        url = str(input_data.get("tool_input", {}).get("url", ""))
-        if is_fetch_allowed(url, prompt.fetch_domain_allowlist):
-            return {}
-        log_event(
-            _LOG,
-            logging.WARNING,
-            "security.pretooluse_denied",
-            call_kind=prompt.kind.value,
-            tool_name="WebFetch",
-        )
-        return _deny("WebFetch host is not in this review's computed allowlist")
+        tool_name = input_data.get("tool_name")
+        tool_input = input_data.get("tool_input", {})
+        if tool_name == "WebFetch":
+            url = str(tool_input.get("url", ""))
+            if is_fetch_allowed(url, prompt.fetch_domain_allowlist):
+                return {}
+            log_event(
+                _LOG,
+                logging.WARNING,
+                "security.pretooluse_denied",
+                call_kind=prompt.kind.value,
+                tool_name=tool_name,
+            )
+            return _deny("WebFetch host is not in this review's computed allowlist")
+        if tool_name in ("Read", "Grep", "Glob"):
+            target = next(
+                (tool_input[k] for k in _READ_PATH_KEYS if tool_input.get(k)),
+                input_data.get("cwd", ""),
+            )
+            if is_path_within_roots(str(target), prompt.allowed_read_roots):
+                return {}
+            log_event(
+                _LOG,
+                logging.WARNING,
+                "security.pretooluse_denied",
+                call_kind=prompt.kind.value,
+                tool_name=tool_name,
+            )
+            return _deny(f"{tool_name} path is outside this review's allowed read roots")
+        return {}
 
     return hook
 
@@ -99,7 +121,11 @@ class ClaudeSDKAdapter:
             "max_turns": self._settings.max_turns,
             "output_format": {"type": "json_schema", "schema": prompt.output_schema},
             "hooks": {
-                "PreToolUse": [HookMatcher(matcher="WebFetch", hooks=[_pre_tool_use_hook(prompt)])]
+                "PreToolUse": [
+                    HookMatcher(
+                        matcher="WebFetch|Read|Grep|Glob", hooks=[_pre_tool_use_hook(prompt)]
+                    )
+                ]
             },
         }
         if self._settings.model != "inherit":
