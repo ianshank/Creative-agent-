@@ -34,13 +34,26 @@ RUN uv sync --locked --no-dev
 # --- test --------------------------------------------------------------------
 FROM base AS test
 
+# make is not in python:slim; the gate is defined once, in the Makefile, and the
+# container must call that definition rather than restate it.
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y make \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN uv sync --locked --all-extras
 COPY tests ./tests
 COPY scripts ./scripts
-COPY Makefile ./
-# Default command runs the same gate CI runs, so a green container means a green CI.
-CMD ["sh", "-c", "uv run ruff check . && uv run mypy && uv run pytest && \
-     uv run python scripts/check_coverage_floors.py coverage.xml pyproject.toml"]
+COPY docs ./docs
+COPY .claude ./.claude
+COPY .github ./.github
+# The suite audits the project's own configuration — that `make gate` still covers
+# every CI check, that the ignore files protect what they claim, that the shipped
+# Claude Code assets are valid. Those files are inputs to the tests, so a test stage
+# without them passes vacuously and the "green container means green CI" claim breaks.
+COPY Makefile CHANGELOG.md Dockerfile .gitignore .dockerignore .gitleaks.toml ./
+# One definition of the gate, called here rather than restated: a green container is a
+# green CI because both run the same target.
+CMD ["make", "gate"]
 
 # --- runtime -----------------------------------------------------------------
 FROM python:${PYTHON_VERSION}-slim AS runtime

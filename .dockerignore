@@ -2,8 +2,9 @@
 # the package or run the suite stays out — a smaller context also means fewer chances of
 # shipping a developer's local config or review state into an image.
 
+# .github stays in the context on purpose: the test stage asserts that `make gate`
+# still covers every check ci.yml runs, which means reading the workflow.
 .git
-.github
 .venv
 **/__pycache__
 **/*.py[cod]

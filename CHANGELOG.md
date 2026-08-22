@@ -107,6 +107,12 @@ regression test.
   required and a key the tool ignores — and is now guarded by a test that loads it.
 - **CI restructured** to call `Makefile` targets, with added secret-scanning and
   container-build jobs.
+- **Container test stage repaired.** It ran a hand-copied subset of the gate (no
+  format check, layering, oracle or asset validation) over a build context missing
+  every configuration file the suite audits — so `make docker-test` passed vacuously
+  on the checks that read them. The stage now copies those inputs and invokes
+  `make gate`, and static tests assert both, since Docker is not available everywhere
+  the suite runs.
 
 ### Security
 

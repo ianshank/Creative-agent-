@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import pytest
 from mutmut.configuration import Config
@@ -151,3 +151,81 @@ class TestDocumentationIsHonest:
         config = (self.ROOT / ".gitleaks.toml").read_text(encoding="utf-8")
         assert "useDefault = true" in config, "a bespoke ruleset would miss known secrets"
         assert "sk-ant-" in config, "the one credential this project uses is unpinned"
+
+
+class TestContainerTestStageCanActuallyRunTheSuite:
+    """The Dockerfile's test stage claims a green container means a green CI.
+
+    That claim breaks silently: the suite audits the project's own configuration, so a
+    file it reads that never reaches the build context makes the container *pass*
+    vacuously rather than fail. Docker is not available in every environment this suite
+    runs in, so these assert the invariant statically — from the Dockerfile and
+    .dockerignore themselves — rather than by building.
+    """
+
+    ROOT = PYPROJECT.parent
+    # Read through `default_claude_dir()`, not a literal, so the scan below cannot see it.
+    IMPLICIT_DEPENDENCIES = frozenset({".claude"})
+
+    @classmethod
+    def _repo_root_dependencies(cls) -> set[str]:
+        """Top-level context paths the suite reads, discovered from the tests themselves."""
+        found = set(cls.IMPLICIT_DEPENDENCIES)
+        for path in sorted((cls.ROOT / "tests").rglob("*.py")):
+            source = path.read_text(encoding="utf-8")
+            for literal in re.findall(r"(?:ROOT|repo_root)\s*/\s*\"([^\"]+)\"", source):
+                found.add(PurePosixPath(literal).parts[0])
+        return found
+
+    @classmethod
+    def _context_copy_targets(cls) -> set[str]:
+        """Every path copied from the build context, across all stages of the Dockerfile.
+
+        `COPY --from=` reads another stage or image, not the context, so it is skipped;
+        the test stage builds `FROM base`, so base's context copies count too.
+        """
+        dockerfile = (cls.ROOT / "Dockerfile").read_text(encoding="utf-8")
+        copied: set[str] = set()
+        for line in dockerfile.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("COPY ") or "--from=" in stripped:
+                continue
+            # The final argument is the destination; everything before it is a source.
+            for source in stripped.split()[1:-1]:
+                copied.add(PurePosixPath(source).parts[0])
+        return copied
+
+    def test_every_file_the_suite_reads_is_copied_into_the_image(self) -> None:
+        missing = self._repo_root_dependencies() - self._context_copy_targets()
+        assert not missing, (
+            "the suite reads these but the Dockerfile never copies them, so "
+            f"`make docker-test` would fail or pass vacuously: {sorted(missing)}"
+        )
+
+    def test_dockerignore_does_not_strip_what_the_dockerfile_copies(self) -> None:
+        """An exclusion silently wins over a COPY: the build succeeds, the file is absent."""
+        entries = [
+            line.strip()
+            for line in (self.ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith(("#", "!"))
+        ]
+        for dependency in sorted(self._repo_root_dependencies()):
+            assert dependency not in entries, (
+                f".dockerignore excludes {dependency}, which the suite reads"
+            )
+
+    def test_test_stage_calls_the_gate_rather_than_restating_it(self) -> None:
+        """A hand-copied command list is how the container silently stops matching CI."""
+        dockerfile = (self.ROOT / "Dockerfile").read_text(encoding="utf-8")
+        test_stage = dockerfile.split("AS test", 1)[1].split("AS runtime", 1)[0]
+        assert 'CMD ["make", "gate"]' in test_stage, (
+            "the test stage must invoke `make gate`, the single definition of the gate"
+        )
+
+    def test_the_scan_finds_the_dependencies_it_is_meant_to(self) -> None:
+        """Guards the regex above: if it silently matched nothing, both tests would pass."""
+        discovered = self._repo_root_dependencies()
+        for expected in (".github", "Makefile", "README.md", ".claude"):
+            assert expected in discovered, (
+                f"the dependency scan no longer sees {expected}; the tests above are inert"
+            )
