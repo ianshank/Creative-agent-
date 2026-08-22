@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import unicodedata
 from enum import IntEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, get_args
 
 from pydantic import BeforeValidator, Field, field_validator
 
@@ -39,12 +39,19 @@ class Severity(IntEnum):
 SeverityField = Annotated[Severity, BeforeValidator(Severity.parse)]
 
 # Support kinds a finding may rest on; blocker legitimacy is judged over these (DEC-F3).
+# The oracle's `blocker_requires_any_of` vocabulary is DERIVED from this one definition
+# (see models/oracle.BlockerBasis) so the two can never drift apart: severity.py relies
+# on non-doctrine support kinds sharing their names with the basis vocabulary.
 SupportKind = Literal[
     "doctrine_row",
     "gate_failure",
     "safety_failure",
     "internal_contradiction",
 ]
+NON_DOCTRINE_SUPPORT_KINDS: tuple[str, ...] = tuple(
+    kind for kind in get_args(SupportKind) if kind != "doctrine_row"
+)
+SupportKindField = SupportKind
 
 
 class SupportRef(SchemaModel):

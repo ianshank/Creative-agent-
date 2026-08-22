@@ -33,9 +33,7 @@ class TestGetLogger:
         assert get_logger("harness.pipeline").name == "creative_agent.harness.pipeline"
 
     def test_already_namespaced_names_pass_through(self) -> None:
-        assert get_logger("creative_agent.harness.state").name == (
-            "creative_agent.harness.state"
-        )
+        assert get_logger("creative_agent.harness.state").name == ("creative_agent.harness.state")
         assert get_logger(LOGGER_NAMESPACE).name == LOGGER_NAMESPACE
 
 
@@ -80,9 +78,7 @@ class TestConfigureLogging:
         assert logging.getLogger().handlers == before
         assert not logging.getLogger(LOGGER_NAMESPACE).propagate
 
-    @pytest.mark.parametrize(
-        ("level", "log_format"), [("SHOUTING", "text"), ("INFO", "yaml")]
-    )
+    @pytest.mark.parametrize(("level", "log_format"), [("SHOUTING", "text"), ("INFO", "yaml")])
     def test_invalid_configuration_rejected(self, level: str, log_format: str) -> None:
         with pytest.raises(ValueError):
             configure_logging(level, log_format, stream=io.StringIO())

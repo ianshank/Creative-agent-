@@ -102,8 +102,12 @@ class ReviewPipeline:
         self._severity_policy = SeverityPolicy(oracle)
         self._gate_checker = MeasurementGateChecker(oracle)
         self._sq_checker = SourceQualityChecker(oracle.source_quality)
-        self._consistency = ConsistencyChecker()
-        self._verifier = VerificationLogChecker(oracle.source_author_names())
+        self._consistency = ConsistencyChecker(oracle.consistency)
+        self._verifier = VerificationLogChecker(
+            oracle.source_author_names(),
+            fetch_tools=frozenset(settings.fetch_tool_names),
+            impersonation_patterns=tuple(oracle.attribution.impersonation_patterns),
+        )
         self._decision_gate = DecisionGate(oracle, settings.decision_log_filename)
         self._escalator = CycleEscalator(oracle)
         self._guard = ThreatGuard(
@@ -179,8 +183,12 @@ class ReviewPipeline:
             for section in rule.requires_sections:
                 if any(section.casefold() in heading for heading in headings):
                     present.add(section)
-        if classify.safety_section_present:
-            present.add("safety")
+        # The model reports which required sections it saw; the harness only trusts
+        # names the oracle actually declares.
+        declared = {
+            section for rule in self._oracle.artifact_classes for section in rule.requires_sections
+        }
+        present.update(name for name in classify.sections_present if name in declared)
         return present
 
     def _resolve_mode(
@@ -213,7 +221,7 @@ class ReviewPipeline:
         supports = [
             s for s in candidate.supports if s.kind != "doctrine_row" or s.ref in known_rows
         ]
-        key_row = doctrine_refs[0] if doctrine_refs else "G0"
+        key_row = doctrine_refs[0] if doctrine_refs else self._oracle.protocol.placeholder_row_id
         return Finding(
             finding_id=f"F{index}",
             origin=origin,
@@ -462,12 +470,9 @@ class ReviewPipeline:
             # Repair only the calls implicated by the defects. Row ids are matched on a
             # word boundary so D1's repair never inherits D10's defects.
             defects_by_row = {
-                row_id: [d for d in defects if _mentions_row(d, row_id)]
-                for row_id in sweep.rows
+                row_id: [d for d in defects if _mentions_row(d, row_id)] for row_id in sweep.rows
             }
-            defective_rows = sorted(
-                row_id for row_id, matched in defects_by_row.items() if matched
-            )
+            defective_rows = sorted(row_id for row_id, matched in defects_by_row.items() if matched)
             log_event(
                 _LOG,
                 logging.INFO,

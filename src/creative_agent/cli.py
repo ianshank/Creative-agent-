@@ -8,10 +8,12 @@ from pathlib import Path
 from typing import Annotated, NoReturn
 
 import typer
+from pydantic import ValidationError
+from pydantic_settings.exceptions import SettingsError
 
 from creative_agent import __version__
 from creative_agent.config import HarnessSettings
-from creative_agent.errors import CreativeAgentError, ExitCode
+from creative_agent.errors import ConfigError, CreativeAgentError, ExitCode
 from creative_agent.harness.oracle import OracleLoader
 
 app = typer.Typer(name="creative-agent", no_args_is_help=True, add_completion=False)
@@ -30,7 +32,9 @@ def _settings() -> HarnessSettings:
 
 
 def _loader(settings: HarnessSettings) -> OracleLoader:
-    return OracleLoader(settings.oracle_search_paths, settings.max_oracle_bytes)
+    return OracleLoader(
+        settings.oracle_search_paths, settings.max_oracle_bytes, settings.max_oracle_depth
+    )
 
 
 def _fail(exc: CreativeAgentError) -> NoReturn:
@@ -53,7 +57,11 @@ def _main(
     """creative-agent: doctrine-driven review harness."""
     from creative_agent.harness.logging import configure_logging
 
-    settings = _settings()
+    try:
+        settings = _settings()
+    except (CreativeAgentError, ValidationError, SettingsError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(code=int(ExitCode.CONFIG_ERROR)) from exc
     level = settings.log_level
     if verbose:
         level = "INFO"
@@ -79,6 +87,8 @@ def oracles_list() -> None:
         tables = _loader(_settings()).load_all()
     except CreativeAgentError as exc:
         _fail(exc)
+    except (ValidationError, SettingsError) as exc:
+        _fail(ConfigError(f"invalid settings: {exc}"))
     for oracle_id in sorted(tables):
         table = tables[oracle_id]
         typer.echo(f"{oracle_id}\tv{table.version}\trows={len(table.rows)}\t{table.name}")
@@ -90,9 +100,8 @@ def oracles_validate(
     all_oracles: Annotated[bool, typer.Option("--all", help="Validate every oracle")] = False,
 ) -> None:
     """Validate oracle data files against the schema (used by CI)."""
-    settings = _settings()
-    loader = _loader(settings)
     try:
+        loader = _loader(_settings())
         if all_oracles:
             tables = loader.load_all()
             if not tables:
@@ -107,6 +116,8 @@ def oracles_validate(
             raise typer.Exit(code=int(ExitCode.CONFIG_ERROR))
     except CreativeAgentError as exc:
         _fail(exc)
+    except (ValidationError, SettingsError) as exc:
+        _fail(ConfigError(f"invalid settings: {exc}"))
 
 
 @oracles_app.command("rebaseline")
@@ -130,11 +141,13 @@ def oracles_rebaseline(
     from creative_agent.harness.citations import ArxivCitationResolver, OracleRebaseliner
     from creative_agent.harness.clock import SystemClock
 
-    settings = _settings()
     try:
+        settings = _settings()
         source_path, table = _loader(settings).find(name)
     except CreativeAgentError as exc:
         _fail(exc)
+    except (ValidationError, SettingsError) as exc:
+        _fail(ConfigError(f"invalid settings: {exc}"))
     resolver = ArxivCitationResolver(settings.arxiv_api_url, settings.citation_timeout_seconds)
     rebaseliner = OracleRebaseliner(resolver, SystemClock())
     updated, report = asyncio.run(rebaseliner.rebaseline(table))
@@ -163,7 +176,9 @@ def review(
     oracle: Annotated[
         str | None, typer.Option(help="Oracle id (default: the agent's default oracle)")
     ] = None,
-    agent: Annotated[str, typer.Option(help="Registered agent name")] = "sutton-review",
+    agent: Annotated[
+        str | None, typer.Option(help="Registered agent name (default from settings)")
+    ] = None,
     mode: Annotated[
         str, typer.Option(help="auto | conformance | advisory (auto is fail-closed)")
     ] = "auto",
@@ -197,13 +212,14 @@ def review(
     from creative_agent.models.findings import Severity
     from creative_agent.models.review import ReviewRequest
 
-    settings = _settings()
     try:
+        settings = _settings()
         if mode not in ("auto", "conformance", "advisory"):
             from creative_agent.errors import ConfigError
 
             raise ConfigError(f"invalid --mode {mode!r}") from None
-        review_agent = build_registry().get(agent)
+        agent_name = agent or settings.default_agent
+        review_agent = build_registry().get(agent_name)
         oracle_id = oracle or review_agent.default_oracle()
         table = _loader(settings).load(oracle_id)
         text = read_artifact(artifact, settings.max_artifact_bytes)
@@ -215,7 +231,7 @@ def review(
         if offline:
             from creative_agent.harness.llm.offline import OfflineLLMClient
 
-            llm = OfflineLLMClient()
+            llm = OfflineLLMClient(table)
         else:
             from creative_agent.harness.llm.claude_sdk import ClaudeSDKAdapter
 
@@ -232,7 +248,7 @@ def review(
             artifact_path=artifact,
             artifact_id=resolved_id,
             oracle_id=oracle_id,
-            agent_name=agent,
+            agent_name=agent_name,
             mode=mode,
             artifact_repo=artifact_repo,
             offline=offline,
@@ -240,6 +256,8 @@ def review(
         outcome = asyncio.run(pipeline.run(request))
     except CreativeAgentError as exc:
         _fail(exc)
+    except (ValidationError, SettingsError) as exc:
+        _fail(ConfigError(f"invalid settings: {exc}"))
 
     typer.echo(outcome.rendered)
     if output_json is not None:
@@ -265,16 +283,22 @@ def agents_list() -> None:
 @decisions_app.command("check")
 def decisions_check(
     repo: Annotated[Path, typer.Option("--repo", exists=True, file_okay=False)] = Path("."),
-    oracle: Annotated[str, typer.Option(help="Oracle whose required decisions apply")] = "sutton",
+    oracle: Annotated[
+        str | None, typer.Option(help="Oracle whose required decisions apply")
+    ] = None,
 ) -> None:
     """Check a repo's decision log against an oracle's required decisions."""
+    from creative_agent.agents import build_registry
     from creative_agent.harness.decisions import DecisionGate
 
-    settings = _settings()
     try:
-        table = _loader(settings).load(oracle)
+        settings = _settings()
+        oracle_id = oracle or build_registry().get(settings.default_agent).default_oracle()
+        table = _loader(settings).load(oracle_id)
     except CreativeAgentError as exc:
         _fail(exc)
+    except (ValidationError, SettingsError) as exc:
+        _fail(ConfigError(f"invalid settings: {exc}"))
     findings = DecisionGate(table, settings.decision_log_filename).check(repo)
     if not findings:
         typer.echo("ok: all required decisions are CONFIRMED (or none required)")
@@ -289,11 +313,13 @@ def state_show(artifact_id: Annotated[str, typer.Argument()]) -> None:
     """Print the recorded cycle history for an artifact."""
     from creative_agent.harness.state import FileStateStore
 
-    settings = _settings()
     try:
+        settings = _settings()
         state = FileStateStore(settings.review_log_dir).load(artifact_id)
     except CreativeAgentError as exc:
         _fail(exc)
+    except (ValidationError, SettingsError) as exc:
+        _fail(ConfigError(f"invalid settings: {exc}"))
     typer.echo(f"artifact: {state.artifact_id}  cycles: {state.cycle}")
     for cycle_record in state.history:
         typer.echo(

@@ -9,17 +9,32 @@ from __future__ import annotations
 
 import re
 from datetime import date
-from typing import Literal
+from typing import Literal, cast
 
 from pydantic import Field, HttpUrl, field_validator, model_validator
 
 from creative_agent.models.base import SchemaModel
-from creative_agent.models.findings import Severity, SeverityField
+from creative_agent.models.findings import (
+    Severity,
+    SeverityField,
+    SupportKindField,
+)
 
 EvidenceTier = Literal["PR", "AP", "T", "E", "NONE"]
 """Peer-reviewed, archival preprint, talk, essay/blog; NONE marks a disclosed gap row."""
 
 _ROW_ID = re.compile(r"^[A-Z]\d+[a-z]?$")
+
+# Defaults for behavior that is data but has a sensible corpus-independent starting
+# point. Oracles override them; they are defaults, not hidden literals at a call site.
+DEFAULT_IMPERSONATION_PATTERNS: tuple[str, ...] = (
+    r"\b{name}\s+would\s+(?:say|argue|call|reject|think|insist)",
+    r"\b{name}\s+believes?\b",
+    r"\baccording\s+to\s+{name}\b(?![^.]{{0,80}}\((?:1[0-9]|20|21)\d\d\))",
+)
+DEFAULT_DECISION_ENTRY_PATTERN = (
+    r"^#{1,6}\s+(?P<id>DEC-[A-Za-z0-9]+)\b.*?\b(?P<status>CONFIRMED|DEFERRED|PENDING)\b"
+)
 
 
 class SourceRef(SchemaModel):
@@ -115,6 +130,15 @@ class GatePolicy(SchemaModel):
     missing_any_severity: SeverityField
     quant_claim_requires: list[str] = Field(default_factory=list)
     hand_asserted_severity: SeverityField
+    # Non-measurement checks that also emit gate_failure support (source-quality,
+    # provenance, decision gating). Declared so support refs can be cross-validated
+    # instead of being free-form strings.
+    pseudo_gates: list[str] = Field(
+        default_factory=lambda: ["source_quality", "provenance", "decision"]
+    )
+
+    def all_gate_refs(self) -> set[str]:
+        return {gate.name for gate in self.gates} | set(self.pseudo_gates)
 
     @model_validator(mode="after")
     def _unique_gate_names(self) -> GatePolicy:
@@ -131,6 +155,10 @@ class ArtifactClassRule(SchemaModel):
     requires_gates: list[str] = Field(default_factory=list)
     requires_sections: list[str] = Field(default_factory=list)
     missing_section_severity: SeverityField = Severity.BLOCKER
+    # Which blocker basis a missing section establishes. Defaults to safety because that
+    # is the sutton corpus's case, but an oracle requiring a "threat_model" or "ethics"
+    # section can say what a missing one actually means.
+    missing_section_support: SupportKindField = "safety_failure"
     source_quality_only: bool = False
 
 
@@ -142,6 +170,9 @@ class TierCap(SchemaModel):
     reason: str = Field(min_length=1)
 
 
+# The doctrine-row basis is named separately because it is tier-qualified; every other
+# basis is a support kind, derived from findings.SupportKind so the two cannot drift.
+DOCTRINE_TIER_BASIS = "tier_pr_or_ap_row"
 BlockerBasis = Literal[
     "tier_pr_or_ap_row",
     "gate_failure",
@@ -156,6 +187,11 @@ class SeverityPolicyConfig(SchemaModel):
     tier_caps: list[TierCap] = Field(default_factory=list)
     unverified_row_cap: SeverityField
     blocker_requires_any_of: list[BlockerBasis] = Field(min_length=1)
+    # Which evidence tiers satisfy the doctrine-row basis. An oracle with a different
+    # tier scheme can require, say, peer review only.
+    blocker_tiers: list[EvidenceTier] = Field(
+        default_factory=lambda: cast("list[EvidenceTier]", ["PR", "AP"])
+    )
 
 
 class SourceQualityConfig(SchemaModel):
@@ -201,6 +237,58 @@ class DecisionTrap(SchemaModel):
     trap: str = Field(min_length=1)
 
 
+def _validate_patterns(patterns: list[str]) -> list[str]:
+    """Reject uncompilable regexes at load time rather than mid-review."""
+    for pattern in patterns:
+        try:
+            re.compile(pattern.replace("{name}", "x"))
+        except re.error as exc:
+            raise ValueError(f"invalid regex {pattern!r}: {exc}") from exc
+    return patterns
+
+
+class AttributionConfig(SchemaModel):
+    """The no-invented-positions sweep. A hit fails the review, so it is data."""
+
+    # Each pattern gets `{name}` substituted with an escaped, case-folded author surname.
+    impersonation_patterns: list[str] = Field(min_length=1)
+
+    _check = field_validator("impersonation_patterns")(
+        classmethod(lambda cls, v: _validate_patterns(v))
+    )
+
+
+class DecisionLogGrammar(SchemaModel):
+    """How the reviewed repository writes its decision log (ADR-style varies by shop)."""
+
+    entry_pattern: str = Field(
+        min_length=1,
+        description=r"Regex with named groups `id` and `status`, matched per line",
+    )
+    confirmed_status: str = Field(min_length=1)
+
+    @field_validator("entry_pattern")
+    @classmethod
+    def _compiles_with_groups(cls, value: str) -> str:
+        try:
+            compiled = re.compile(value, re.MULTILINE)
+        except re.error as exc:
+            raise ValueError(f"invalid decision entry pattern: {exc}") from exc
+        missing = {"id", "status"} - set(compiled.groupindex)
+        if missing:
+            raise ValueError(f"decision entry pattern needs named groups {sorted(missing)}")
+        return value
+
+
+class ConsistencyConfig(SchemaModel):
+    """Internal-consistency sweep tuning (protocol step 6)."""
+
+    # Words that look like assignments in prose ("Note = important") but define nothing.
+    prose_symbols: list[str] = Field(default_factory=list)
+    max_symbol_length: int = Field(default=20, ge=1)
+    max_definition_length: int = Field(default=120, ge=8)
+
+
 class ProtocolConfig(SchemaModel):
     """Review-protocol thresholds and fixed marker text."""
 
@@ -208,6 +296,11 @@ class ProtocolConfig(SchemaModel):
     unverified_marker: str = Field(min_length=1)
     usage_gates: list[str] = Field(default_factory=list)
     missing_decision_severity: SeverityField = Severity.MAJOR
+    # Key under which findings with no doctrine row are grouped. Must not collide with a
+    # real row id, so it deliberately falls outside the row-id grammar.
+    placeholder_row_id: str = Field(default="-", min_length=1)
+    # Artifact class assumed when no judgement is available (offline runs).
+    offline_artifact_class: str | None = None
 
 
 class OracleTable(SchemaModel):
@@ -228,6 +321,17 @@ class OracleTable(SchemaModel):
     decision_traps: list[DecisionTrap] = Field(default_factory=list)
     oak_conformance: OakConformanceSpec | None = None
     protocol: ProtocolConfig
+    attribution: AttributionConfig = Field(
+        default_factory=lambda: AttributionConfig(
+            impersonation_patterns=list(DEFAULT_IMPERSONATION_PATTERNS)
+        )
+    )
+    decision_log_grammar: DecisionLogGrammar = Field(
+        default_factory=lambda: DecisionLogGrammar(
+            entry_pattern=DEFAULT_DECISION_ENTRY_PATTERN, confirmed_status="CONFIRMED"
+        )
+    )
+    consistency: ConsistencyConfig = Field(default_factory=ConsistencyConfig)
     rows: list[OracleRow] = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -251,7 +355,22 @@ class OracleTable(SchemaModel):
                 f"oak_conformance.doctrine_ref {self.oak_conformance.doctrine_ref!r} "
                 "is not a known row"
             )
+        if _ROW_ID.match(self.protocol.placeholder_row_id):
+            raise ValueError(
+                f"protocol.placeholder_row_id {self.protocol.placeholder_row_id!r} matches "
+                "the row-id grammar and would collide with a real doctrine row"
+            )
+        offline_class = self.protocol.offline_artifact_class
+        if offline_class is not None and offline_class not in class_names:
+            raise ValueError(
+                f"protocol.offline_artifact_class {offline_class!r} is not a declared "
+                "artifact class"
+            )
         return self
+
+    def default_artifact_class(self) -> str:
+        """Class assumed when no judgement is available (offline runs)."""
+        return self.protocol.offline_artifact_class or self.artifact_classes[0].name
 
     def row(self, row_id: str) -> OracleRow:
         for row in self.rows:

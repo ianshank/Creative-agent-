@@ -19,6 +19,12 @@ class MeasurementGateChecker:
         self._oracle = oracle
         self._policy = oracle.gate_policy
 
+    def _gate_description(self, name: str) -> str:
+        for gate in self._policy.gates:
+            if gate.name == name:
+                return gate.description
+        return name
+
     def _class_rule(self, artifact_class: str) -> ArtifactClassRule:
         for rule in self._oracle.artifact_classes:
             if rule.name == artifact_class:
@@ -97,9 +103,13 @@ class MeasurementGateChecker:
                             SupportRef(kind="gate_failure", ref=name)
                             for name in assessment.missing_gates
                         ],
-                        disposition_required="Name every gate: observable, update rule, "
-                        "compute budget, falsifier — as defined by the oracle's gate "
-                        "policy.",
+                        disposition_required=(
+                            "State every missing gate: "
+                            + ", ".join(
+                                f"{name} ({self._gate_description(name)})"
+                                for name in assessment.missing_gates
+                            )
+                        ),
                     )
                 )
             if assessment.missing_provenance:
@@ -128,7 +138,7 @@ class MeasurementGateChecker:
                         severity=rule.missing_section_severity,
                         summary=(f"A {rule.name} must carry a {section} section; none found."),
                         anchor=f"missing-{section}-section",
-                        supports=[SupportRef(kind="safety_failure", ref=section)],
+                        supports=[SupportRef(kind=rule.missing_section_support, ref=section)],
                         disposition_required=f"Add the required {section} section.",
                     )
                 )

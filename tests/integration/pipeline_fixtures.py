@@ -64,7 +64,7 @@ def classify_payload(
         "artifact_class": artifact_class,
         "mode_recommendation": recommendation,
         "conformance_evidence": evidence,
-        "safety_section_present": safety,
+        "sections_present": ["safety"] if safety else [],
         "rationale": "test",
     }
 

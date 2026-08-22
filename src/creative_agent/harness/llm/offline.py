@@ -10,18 +10,22 @@ from __future__ import annotations
 from typing import Any
 
 from creative_agent.harness.llm.base import AssembledPrompt, CallKind, RawLLMResult
+from creative_agent.models.oracle import OracleTable
+
+# Only used when no oracle is supplied (direct construction in a contract test).
+_FALLBACK_CLASS = "unclassified"
 
 _OFFLINE_NOTE = "offline mode: no LLM judgement performed"
 
 
-def _payload_for(prompt: AssembledPrompt) -> dict[str, Any]:
+def _payload_for(prompt: AssembledPrompt, artifact_class: str) -> dict[str, Any]:
     kind = prompt.kind
     if kind is CallKind.CLASSIFY:
         return {
-            "artifact_class": "architecture_design",
+            "artifact_class": artifact_class,
             "mode_recommendation": "advisory",
             "conformance_evidence": None,
-            "safety_section_present": False,
+            "sections_present": [],
             "rationale": _OFFLINE_NOTE,
         }
     if kind is CallKind.ROW:
@@ -45,7 +49,8 @@ def _payload_for(prompt: AssembledPrompt) -> dict[str, Any]:
         return {"baselines": [], "falsifiability": [], "scope": [], "verification_entries": []}
     return {
         "headline": "Offline review: deterministic checks only; no design judgement.",
-        "confidence": "Certain",
+        # No judgement was performed, so the verdict cannot claim certainty.
+        "confidence": "Guessing",
         "what_survives": [],
         "residual_risks": [
             "LLM judgement sweeps were skipped (offline); doctrinal misses may exist."
@@ -54,5 +59,17 @@ def _payload_for(prompt: AssembledPrompt) -> dict[str, Any]:
 
 
 class OfflineLLMClient:
+    """Null-judgement client. The artifact class comes from the oracle, never a literal,
+    so any corpus can run offline."""
+
+    def __init__(self, oracle: OracleTable | None = None) -> None:
+        self._artifact_class = (
+            oracle.default_artifact_class() if oracle is not None else _FALLBACK_CLASS
+        )
+
     async def generate(self, prompt: AssembledPrompt) -> RawLLMResult:
-        return RawLLMResult(kind=prompt.kind, payload=_payload_for(prompt), model="offline")
+        return RawLLMResult(
+            kind=prompt.kind,
+            payload=_payload_for(prompt, self._artifact_class),
+            model="offline",
+        )

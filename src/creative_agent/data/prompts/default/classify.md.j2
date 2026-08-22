@@ -7,6 +7,7 @@ Mode: recommend "conformance" ONLY if the artifact explicitly claims to follow t
 oracle's research program (markers: {{ oracle.conformance.markers | join(", ") }}) — and
 if so, quote the claiming sentence VERBATIM in conformance_evidence. If it merely cites
 or discusses the program without claiming to conform, recommend "advisory".
-Also report whether the artifact contains a safety section (safety_section_present).
+Also report, in sections_present, which of these required sections the artifact actually
+contains: {% for c in oracle.artifact_classes %}{% for s in c.requires_sections %}{{ s }} {% endfor %}{% endfor %}(empty if none apply).
 
 {{ artifact }}

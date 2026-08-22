@@ -293,4 +293,10 @@ class TestSpecDeltaScenarios:
         fake = FakeLLMClient(base_scripts())
         pipeline, _ = build_pipeline(tmp_path, fake, oracle=oracle)
         outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT, artifact_repo=repo))
-        assert any(f.key.render() == "G0+dec-s1-missing-decision" for f in outcome.result.findings)
+        # Findings with no doctrine row group under the oracle's placeholder key, which
+        # deliberately falls outside the row-id grammar so it cannot collide with a row.
+        placeholder = oracle.protocol.placeholder_row_id
+        assert any(
+            f.key.render() == f"{placeholder}+dec-s1-missing-decision"
+            for f in outcome.result.findings
+        )

@@ -12,26 +12,32 @@ from creative_agent.errors import ConfigError, OracleValidationError
 from creative_agent.models.oracle import OracleTable
 
 SUPPORTED_ORACLE_SCHEMA_VERSIONS = {1}
-_MAX_YAML_DEPTH = 32
+DEFAULT_MAX_YAML_DEPTH = 32
 
 
-def _check_depth(node: object, depth: int = 0) -> None:
-    if depth > _MAX_YAML_DEPTH:
-        raise OracleValidationError(f"oracle YAML exceeds max nesting depth {_MAX_YAML_DEPTH}")
+def _check_depth(node: object, depth: int = 0, max_depth: int = DEFAULT_MAX_YAML_DEPTH) -> None:
+    if depth > max_depth:
+        raise OracleValidationError(f"oracle YAML exceeds max nesting depth {max_depth}")
     if isinstance(node, dict):
         for value in node.values():
-            _check_depth(value, depth + 1)
+            _check_depth(value, depth + 1, max_depth)
     elif isinstance(node, list):
         for value in node:
-            _check_depth(value, depth + 1)
+            _check_depth(value, depth + 1, max_depth)
 
 
 class OracleLoader:
     """Finds and validates oracle tables across a search path, packaged data last."""
 
-    def __init__(self, search_paths: list[Path], max_bytes: int) -> None:
+    def __init__(
+        self,
+        search_paths: list[Path],
+        max_bytes: int,
+        max_depth: int = DEFAULT_MAX_YAML_DEPTH,
+    ) -> None:
         self._search_paths = search_paths
         self._max_bytes = max_bytes
+        self._max_depth = max_depth
 
     def _packaged_dir(self) -> Path:
         return Path(str(resources.files("creative_agent").joinpath("data", "oracles")))
@@ -59,7 +65,7 @@ class OracleLoader:
             raise OracleValidationError(f"{path}: empty oracle file")
         if not isinstance(raw, dict):
             raise OracleValidationError(f"{path}: oracle root must be a mapping")
-        _check_depth(raw)
+        _check_depth(raw, max_depth=self._max_depth)
         version = raw.get("schema_version")
         if version not in SUPPORTED_ORACLE_SCHEMA_VERSIONS:
             raise OracleValidationError(

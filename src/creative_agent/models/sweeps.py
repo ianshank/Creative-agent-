@@ -51,7 +51,10 @@ class ClassifyResult(SchemaModel):
     conformance_evidence: str | None = Field(
         default=None, description="Verbatim quote of the artifact's conformance claim"
     )
-    safety_section_present: bool = False
+    sections_present: list[str] = Field(
+        default_factory=list,
+        description="Names of required sections the artifact actually contains",
+    )
     rationale: str = ""
 
 

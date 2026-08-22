@@ -16,7 +16,7 @@ from creative_agent.models.findings import SupportRef
 from creative_agent.models.oracle import SourceQualityConfig
 from creative_agent.models.sweeps import CandidateFinding
 
-_NUMBERED_REF_RUN = re.compile(r"(?:\[\d{1,3}\]\s*){2,}")
+_REF_TOKEN = r"\[\d{1,4}\]"  # noqa: S105 — a citation-marker regex, not a secret
 _URL = re.compile(r"https?://[^\s\"'<>\])]+", re.IGNORECASE)
 
 
@@ -25,12 +25,17 @@ class SourceQualityChecker:
 
     def __init__(self, config: SourceQualityConfig) -> None:
         self._config = config
+        # Built from the configured threshold so the pre-filter can never disagree with
+        # the rule it screens for.
+        self._cluster_run = re.compile(
+            rf"(?:{_REF_TOKEN}\s*){{{config.cluster_citation_min_refs},}}"
+        )
 
     def cluster_citations(self, text: str) -> list[CandidateFinding]:
         """Runs of numbered refs at/beyond the threshold are unreviewable (spec: Major)."""
         candidates: list[CandidateFinding] = []
-        for match in _NUMBERED_REF_RUN.finditer(text):
-            refs = re.findall(r"\[\d{1,3}\]", match.group(0))
+        for match in self._cluster_run.finditer(text):
+            refs = re.findall(_REF_TOKEN, match.group(0))
             if len(refs) >= self._config.cluster_citation_min_refs:
                 cluster = "".join(refs)
                 candidates.append(

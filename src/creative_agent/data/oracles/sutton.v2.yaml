@@ -38,6 +38,7 @@ severity_policy:
         much of this oracle is below the evidence bar it imposes on reviewees, and
         reviewees may say so.
   unverified_row_cap: minor
+  blocker_tiers: [PR, AP]
   blocker_requires_any_of:
     - tier_pr_or_ap_row
     - gate_failure
@@ -67,6 +68,8 @@ gate_policy:
   missing_any_severity: major
   quant_claim_requires: [dataset, baseline, seeds, interval]
   hand_asserted_severity: major
+  # Non-measurement checks that also emit gate_failure support.
+  pseudo_gates: [source_quality, provenance, decision]
 
 source_quality:
   cluster_citation_min_refs: 4
@@ -94,6 +97,7 @@ artifact_classes:
   - name: deployment_blueprint
     requires_gates: [compute_budget]
     requires_sections: [safety]
+    missing_section_support: safety_failure
   - name: research_synthesis
     source_quality_only: true
 
@@ -134,8 +138,32 @@ oak_conformance:
     - label: "FC-STOMP stage 5: Planning"
       patterns: ["planning"]
 
+# The no-invented-positions sweep. A hit fails the review, so the patterns are data:
+# `{name}` is replaced with an escaped, case-folded author surname from the rows above.
+attribution:
+  impersonation_patterns:
+    - '\b{name}\s+would\s+(?:say|argue|call|reject|think|insist)'
+    - '\b{name}\s+believes?\b'
+    - '\baccording\s+to\s+{name}\b(?![^.]{{0,80}}\((?:1[0-9]|20|21)\d\d\))'
+
+# How the reviewed repository writes its decision log (DEC-S1..S6 live in the artifact's
+# own repo, and shops differ: DEC-/ADR-, CONFIRMED/Accepted).
+decision_log_grammar:
+  entry_pattern: '^#{1,6}\s+(?P<id>DEC-[A-Za-z0-9]+)\b.*?\b(?P<status>CONFIRMED|DEFERRED|PENDING)\b'
+  confirmed_status: CONFIRMED
+
+# Internal-consistency sweep (protocol step 6) tuning.
+consistency:
+  prose_symbols: [note, example, result, verdict, status, summary, title, name]
+  max_symbol_length: 20
+  max_definition_length: 120
+
 protocol:
   escalation_cycle: 3
+  # Findings with no doctrine row group under this key; it must fall outside the row-id
+  # grammar so it can never collide with a real row.
+  placeholder_row_id: "-"
+  offline_artifact_class: architecture_design
   unverified_marker: "[Unverified — flagged for human check]"
   usage_gates:
     - "Gate A: review architecture/design documents BEFORE mechanism build-out."

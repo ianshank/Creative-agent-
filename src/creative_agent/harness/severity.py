@@ -8,10 +8,8 @@ harness can have.
 from __future__ import annotations
 
 from creative_agent.models.findings import Finding, Severity, SupportRef
-from creative_agent.models.oracle import OracleTable
+from creative_agent.models.oracle import DOCTRINE_TIER_BASIS, OracleTable
 from creative_agent.models.review import ReviewMode
-
-_PR_AP = ("PR", "AP")
 
 
 class SeverityPolicy:
@@ -20,6 +18,7 @@ class SeverityPolicy:
     def __init__(self, oracle: OracleTable) -> None:
         self._oracle = oracle
         self._policy = oracle.severity_policy
+        self._blocker_tiers = tuple(oracle.severity_policy.blocker_tiers)
 
     def _row_tier(self, row_id: str) -> str | None:
         try:
@@ -34,7 +33,10 @@ class SeverityPolicy:
         allowed = set(self._policy.blocker_requires_any_of)
         for support in finding.supports:
             if support.kind == "doctrine_row":
-                if "tier_pr_or_ap_row" in allowed and self._row_tier(support.ref) in _PR_AP:
+                if (
+                    DOCTRINE_TIER_BASIS in allowed
+                    and self._row_tier(support.ref) in self._blocker_tiers
+                ):
                     return True
             # Non-doctrine support kinds share their names with the basis vocabulary.
             elif support.kind in allowed:
@@ -102,9 +104,11 @@ class SeverityPolicy:
 
         if severity is Severity.BLOCKER and not self._has_blocker_basis(finding):
             severity = Severity.MAJOR
+            bases = ", ".join(self._policy.blocker_requires_any_of)
+            tiers = "/".join(self._blocker_tiers)
             reasons.append(
-                "blocker requires a PR/AP-tier row, a gate or safety failure, or an "
-                "internal contradiction among its supports"
+                f"blocker requires one of [{bases}] among its supports "
+                f"(doctrine rows qualify at tier {tiers})"
             )
 
         return finding.model_copy(

@@ -14,17 +14,13 @@ import unicodedata
 from creative_agent.harness.canonical import canonicalize
 from creative_agent.harness.llm.base import ToolEvidence
 from creative_agent.models.findings import Finding
+from creative_agent.models.oracle import DEFAULT_IMPERSONATION_PATTERNS
 from creative_agent.models.verification import VerificationEntry
 
 # Tools whose successful results count as "fetched" evidence. WebSearch is deliberately
 # absent: search snippets support existence, never content (spec tool-honesty rule).
+# Overridable via settings so an MCP fetch tool can be recognized.
 DEFAULT_FETCH_TOOLS = frozenset({"WebFetch", "Read"})
-
-_IMPERSONATION_TEMPLATES = (
-    r"\b{name}\s+would\s+(?:say|argue|call|reject)",
-    r"\b{name}\s+believes?\b",
-    r"\baccording\s+to\s+{name}\b(?![^.]{{0,80}}\((?:19|20)\d\d\))",
-)
 
 
 def _fold(text: str) -> str:
@@ -40,9 +36,11 @@ class VerificationLogChecker:
         self,
         author_names: set[str],
         fetch_tools: frozenset[str] = DEFAULT_FETCH_TOOLS,
+        impersonation_patterns: tuple[str, ...] = DEFAULT_IMPERSONATION_PATTERNS,
     ) -> None:
-        self._surnames = sorted({name.split()[-1] for name in author_names if name.strip()})
+        self._surnames = sorted({parts[-1] for name in author_names if (parts := name.split())})
         self._fetch_tools = fetch_tools
+        self._impersonation_patterns = tuple(impersonation_patterns)
 
     def _evidence_identifiers(self, evidence: list[ToolEvidence]) -> set[str]:
         identifiers: set[str] = set()
@@ -107,7 +105,7 @@ class VerificationLogChecker:
             folded = _fold(block)
             for surname in self._surnames:
                 folded_surname = re.escape(_fold(surname))
-                for template in _IMPERSONATION_TEMPLATES:
+                for template in self._impersonation_patterns:
                     if re.search(template.format(name=folded_surname), folded):
                         defects.append(
                             f"impersonation/attribution phrasing about {surname!r} "

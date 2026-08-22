@@ -106,9 +106,7 @@ def configure_logging(
     return logger
 
 
-def log_event(
-    logger: logging.Logger, level: int, event: str, /, **context: Any
-) -> None:
+def log_event(logger: logging.Logger, level: int, event: str, /, **context: Any) -> None:
     """Emit one structured event. `event` is a stable, greppable identifier."""
     logger.log(level, event, extra={_CONTEXT_KEY: {"event": event, **context}})
 

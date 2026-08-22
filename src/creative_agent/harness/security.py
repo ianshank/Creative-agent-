@@ -63,8 +63,7 @@ def is_internal_host(host: str, blocked_suffixes: tuple[str, ...]) -> bool:
             or address.is_unspecified
         )
     if any(
-        candidate == suffix.lstrip(".") or candidate.endswith(suffix)
-        for suffix in blocked_suffixes
+        candidate == suffix.lstrip(".") or candidate.endswith(suffix) for suffix in blocked_suffixes
     ):
         return True
     return "." not in candidate
