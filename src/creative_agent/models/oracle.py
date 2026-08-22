@@ -198,6 +198,7 @@ class ProtocolConfig(SchemaModel):
     escalation_cycle: int = Field(ge=2)
     unverified_marker: str = Field(min_length=1)
     usage_gates: list[str] = Field(default_factory=list)
+    missing_decision_severity: SeverityField = Severity.MAJOR
 
 
 class OracleTable(SchemaModel):
