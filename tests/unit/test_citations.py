@@ -106,8 +106,13 @@ class TestRebaseliner:
             return_value=httpx.Response(200, text=atom("A Paper", ["Somebody Else"]))
         )
         oracle = make_oracle(rows=[make_row("D1", sources=[make_source(verified=True)])])
+        assert oracle.rows[0].sources[0].last_verified is not None
         updated, report = await OracleRebaseliner(resolver(), FixedClock(NOW)).rebaseline(oracle)
-        assert not updated.rows[0].sources[0].verified
+        source = updated.rows[0].sources[0]
+        assert not source.verified
+        # A stale verification date on an unverified source would misreport the row as
+        # recently checked, so the date is cleared with the flag.
+        assert source.last_verified is None
         assert any("MISMATCH" in line for line in report)
 
     async def test_unreachable_leaves_source_untouched(self) -> None:

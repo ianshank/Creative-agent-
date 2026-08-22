@@ -22,6 +22,7 @@ from pydantic_settings import (
 )
 
 from creative_agent.errors import ConfigError
+from creative_agent.harness.security import DEFAULT_BLOCKED_HOST_SUFFIXES
 
 _CONFIG_ENV_VAR = "CREATIVE_AGENT_CONFIG"
 
@@ -91,6 +92,15 @@ class HarnessSettings(BaseSettings):
 
     # Rendering limits (output laundering, DEC-F9).
     max_prose_chars: int = 4_000
+
+    # Fetch-allowlist policy (DEC-F9). Hosts harvested from the untrusted artifact are
+    # filtered so a planted URL cannot point the session at an internal target; a
+    # deployment that genuinely reviews against an internal mirror can extend the
+    # suffix list or (deliberately) opt out.
+    blocked_host_suffixes: list[str] = Field(
+        default_factory=lambda: list(DEFAULT_BLOCKED_HOST_SUFFIXES)
+    )
+    allow_internal_fetch_hosts: bool = False
 
     @classmethod
     def settings_customise_sources(

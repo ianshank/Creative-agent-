@@ -99,7 +99,12 @@ class OracleRebaseliner:
                     )
                     report.append(f"{row.id}: resolved {source.arxiv_id} ({result.resolved_title})")
                 elif result.status == "mismatch":
-                    new_sources.append(source.model_copy(update={"verified": False}))
+                    # Clear last_verified too: a source whose author list no longer matches
+                    # has no valid verification date, and leaving one would misreport the
+                    # row as recently checked.
+                    new_sources.append(
+                        source.model_copy(update={"verified": False, "last_verified": None})
+                    )
                     report.append(
                         f"{row.id}: AUTHOR MISMATCH on {source.arxiv_id} — {result.detail} "
                         "(the v1 defect class; fix the citation, do not soften)"

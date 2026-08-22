@@ -12,6 +12,24 @@ from creative_agent.models.findings import normalize_slug
 _REVIEW_ID = re.compile(r"^review-id:\s*(?P<id>[A-Za-z0-9][A-Za-z0-9._-]*)\s*$", re.MULTILINE)
 _FRONT_MATTER = re.compile(r"\A---\n.*?\n---\n", re.DOTALL)
 
+# An artifact id becomes a path segment (docs/review-log/<id>.md and the audit bundle
+# directory), so it must be a single safe filename component: no separators, no traversal,
+# no control characters, no leading dot. This is a security invariant, not a preference,
+# so it lives in code rather than settings.
+_SAFE_ARTIFACT_ID = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
+MAX_ARTIFACT_ID_LENGTH = 128
+
+
+def validate_artifact_id(candidate: str, *, source: str) -> str:
+    """Return the id if it is a safe single path segment, else raise ConfigError."""
+    if not _SAFE_ARTIFACT_ID.match(candidate) or ".." in candidate:
+        raise ConfigError(
+            f"invalid artifact id {candidate!r} from {source}: ids become a filename, so "
+            "they must start alphanumeric, contain only [A-Za-z0-9._-], avoid '..', and be "
+            f"at most {MAX_ARTIFACT_ID_LENGTH} characters"
+        )
+    return candidate
+
 
 def read_artifact(path: Path, max_bytes: int) -> str:
     try:
@@ -30,15 +48,19 @@ def content_sha256(text: str) -> str:
 
 
 def resolve_artifact_id(path: Path, text: str, override: str | None) -> str:
-    """--artifact-id flag > front-matter review-id > normalized filename slug."""
+    """--artifact-id flag > front-matter review-id > normalized filename slug.
+
+    Every branch is validated: the override is operator input and the front-matter id
+    comes from the untrusted artifact, so neither may escape the review-log directory.
+    """
     if override:
-        return override
+        return validate_artifact_id(override, source="--artifact-id")
     front = _FRONT_MATTER.match(text)
     if front:
         match = _REVIEW_ID.search(front.group(0))
         if match:
-            return match.group("id")
-    slug = normalize_slug(path.stem)
+            return validate_artifact_id(match.group("id"), source="artifact front matter")
+    slug = normalize_slug(path.stem)[:MAX_ARTIFACT_ID_LENGTH]
     if not slug:
         raise ConfigError(f"cannot derive an artifact id from {path}; pass --artifact-id")
-    return slug
+    return validate_artifact_id(slug, source=f"filename {path.name!r}")

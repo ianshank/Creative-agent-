@@ -103,7 +103,12 @@ class ReviewPipeline:
         self._verifier = VerificationLogChecker(oracle.source_author_names())
         self._decision_gate = DecisionGate(oracle, settings.decision_log_filename)
         self._escalator = CycleEscalator(oracle)
-        self._guard = ThreatGuard(oracle, settings.max_prose_chars)
+        self._guard = ThreatGuard(
+            oracle,
+            settings.max_prose_chars,
+            blocked_host_suffixes=tuple(settings.blocked_host_suffixes),
+            allow_internal_fetch_hosts=settings.allow_internal_fetch_hosts,
+        )
         self._assembler = PromptAssembler(settings.prompt_search_paths, agent.prompt_template_dir())
         self._renderer = OutputRenderer(oracle.protocol.unverified_marker)
 

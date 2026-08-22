@@ -6,7 +6,12 @@ from pathlib import Path
 import pytest
 
 from creative_agent.errors import ConfigError, LLMTransportError
-from creative_agent.harness.artifact import content_sha256, resolve_artifact_id
+from creative_agent.harness.artifact import (
+    MAX_ARTIFACT_ID_LENGTH,
+    content_sha256,
+    resolve_artifact_id,
+    validate_artifact_id,
+)
 from creative_agent.harness.llm.base import AssembledPrompt, CallKind, RawLLMResult
 from creative_agent.harness.llm.fake import FakeLLMClient, script_key
 from creative_agent.harness.prompting import PromptAssembler, output_model_for
@@ -33,6 +38,54 @@ class TestArtifactIdentity:
 
     def test_sha_ignores_line_endings(self) -> None:
         assert content_sha256("a\r\nb\r") == content_sha256("a\nb\n")
+
+
+class TestArtifactIdSafety:
+    """The id becomes a path segment, so every source of it must be validated."""
+
+    @pytest.mark.parametrize(
+        "malicious",
+        [
+            "../../etc/passwd",
+            "..",
+            "a/b",
+            "a\\b",
+            "/absolute",
+            ".hidden",
+            "-leading-dash",
+            "with space",
+            "nul\x00byte",
+            "   ",
+            "x" * 129,
+        ],
+    )
+    def test_malicious_override_rejected(self, malicious: str, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError, match="invalid artifact id"):
+            resolve_artifact_id(tmp_path / "doc.md", "text", malicious)
+
+    def test_empty_override_falls_back_to_filename(self, tmp_path: Path) -> None:
+        """An empty flag value means 'not provided', not an invalid id."""
+        assert resolve_artifact_id(tmp_path / "doc.md", "text", "") == "doc"
+
+    def test_traversal_in_front_matter_rejected(self, tmp_path: Path) -> None:
+        """The front matter comes from the untrusted artifact."""
+        text = "---\nreview-id: a..b\n---\n"
+        with pytest.raises(ConfigError, match="invalid artifact id"):
+            resolve_artifact_id(tmp_path / "doc.md", text, None)
+
+    def test_safe_override_accepted(self, tmp_path: Path) -> None:
+        assert resolve_artifact_id(tmp_path / "doc.md", "t", "rl_blueprint-7.v2") == (
+            "rl_blueprint-7.v2"
+        )
+
+    def test_long_filename_is_truncated_not_rejected(self, tmp_path: Path) -> None:
+        path = tmp_path / (("very-long-name-" * 20) + ".md")
+        resolved = resolve_artifact_id(path, "t", None)
+        assert 0 < len(resolved) <= MAX_ARTIFACT_ID_LENGTH
+
+    def test_validate_helper_names_its_source(self) -> None:
+        with pytest.raises(ConfigError, match="from --artifact-id"):
+            validate_artifact_id("../x", source="--artifact-id")
 
 
 class TestFakeClient:
