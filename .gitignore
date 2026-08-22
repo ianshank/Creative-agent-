@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.python-version
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.mutmut-cache
+coverage.xml
+.coverage
+.coverage.*
+htmlcov/
+
+# Local settings / secrets
+config/settings.yaml
+.env
+
+# Review runtime artifacts (audit bundles are per-machine unless deliberately committed)
+docs/review-log/*/cycle-*/transcript.jsonl

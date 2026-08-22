@@ -1,0 +1,5 @@
+* text=auto
+tests/golden/** text eol=lf
+tests/fixtures/** text eol=lf
+*.yaml text eol=lf
+*.j2 text eol=lf

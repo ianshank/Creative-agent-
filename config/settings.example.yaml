@@ -1,0 +1,17 @@
+# Example configuration for creative-agent. Copy to config/settings.yaml (gitignored) and
+# point CREATIVE_AGENT_CONFIG at it, or set individual CREATIVE_AGENT_* env vars instead.
+# Precedence: CLI/init kwargs > env > this file > packaged defaults.
+
+model: inherit            # "inherit" uses the Claude Agent SDK default; or an alias/full ID
+fallback_model: null
+max_turns: 12
+max_budget_usd: null      # e.g. 2.50 to cap a review's spend
+max_regeneration_attempts: 2
+
+agent_tools: [Read, Grep, Glob, WebFetch, WebSearch]
+permission_mode: dontAsk
+
+oracle_search_paths: [data/oracles]
+prompt_search_paths: [data/prompts]
+review_log_dir: docs/review-log
+decision_log_filename: docs/decision-log.md

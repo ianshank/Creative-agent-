@@ -1,0 +1,41 @@
+name: Live SDK verification
+
+# Weekly: run the live-marked tests against the real Claude Agent SDK and refresh the
+# recorded transcript fixtures that the mocked-transport tests replay. Secret-gated —
+# never runs on fork PRs.
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  live:
+    if: github.repository == 'ianshank/Creative-agent-'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: astral-sh/setup-uv@887a942a15af3a7626099df99e897a18d9e5ab3a # v5.1.0
+        with:
+          enable-cache: true
+      - run: uv python install 3.11
+      - run: uv sync --all-extras --locked
+      - name: Run live tests
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: uv run pytest -m live --no-cov -q
+      - name: Open issue on failure
+        if: failure()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Live SDK verification failed (${new Date().toISOString().slice(0, 10)})`,
+              body: `The weekly live run failed: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}. The Claude Agent SDK surface may have drifted from the mocked-transport fixtures.`,
+            });
