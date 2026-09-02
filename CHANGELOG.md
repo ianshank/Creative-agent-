@@ -25,8 +25,16 @@ Work on top of the PR #7 merge.
   charter-review escalation — and nine gates that report success while verifying nothing,
   including a mutation gate that passes on zero mutants. Every finding carries a
   `file:line` and was reproduced. Controls that were attacked and held are recorded too,
-  so the fixes are not read as a verdict on the whole boundary. No behaviour changed in
-  this entry; the plan says what to change and in what order.
+  so the fixes are not read as a verdict on the whole boundary. This entry is documentation
+  only — no harness, CLI or oracle behaviour changed, and none of the findings are fixed
+  here; the plan says what to change and in what order.
+
+- **Pinned GitHub Actions versions bumped** by Dependabot, across `ci.yml`, `live.yml` and
+  `mutation.yml`: `actions/checkout` 4.2.2 to 7.0.1, `actions/upload-artifact` 4.4.3 to
+  7.0.1, `actions/github-script` 7.0.1 to 9.0.0, and `docker/build-push-action` 6.9.0 to
+  7.3.0. These merged as PRs #3 through #6 against the old default branch and reach `main`
+  with this change; they alter CI, not the package. Every action stays pinned to a commit
+  SHA, which `tests/unit/test_project_config.py` asserts.
 
 ### Added
 
