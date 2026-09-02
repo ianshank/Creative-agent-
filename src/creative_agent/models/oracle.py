@@ -56,7 +56,13 @@ class FreshnessMeta(SchemaModel):
 
     last_rebaselined: date
     rebaseline_count: int = Field(ge=0)
-    max_rebaselines_without_verification: int = 2
+    # Grace budget: how many re-baseline rounds a row may go without a verified source
+    # before its findings are capped. Defaults to none (DEC-F13) — fail closed. The old
+    # default of 2 meant a freshly transcribed oracle, which has `rebaseline_count: 0`
+    # and is exactly the corpus most likely to carry a mis-transcribed citation, was
+    # never capped at all. An operator who deliberately wants a grace window raises this
+    # and owns that choice.
+    max_rebaselines_without_verification: int = 0
 
 
 class OracleRowPrecedence(SchemaModel):
@@ -106,12 +112,21 @@ class OracleRow(SchemaModel):
         return self
 
     def is_stale(self, freshness: FreshnessMeta) -> bool:
-        """A row is stale when no source was verified within the re-baseline budget."""
+        """A row is stale when no source was verified within the re-baseline budget.
+
+        With the default budget of zero (DEC-F13) an unverified row is stale immediately,
+        so `severity_policy.unverified_row_cap` applies from the first review rather than
+        only after two re-baseline rounds have already failed to resolve it.
+        """
         if self.disclosed_gap:
             return False
         if any(s.verified for s in self.sources):
             return False
         return freshness.rebaseline_count >= freshness.max_rebaselines_without_verification
+
+    def has_verified_source(self) -> bool:
+        """True when at least one source has been resolved against its publisher."""
+        return any(source.verified for source in self.sources)
 
 
 class GateDefinition(SchemaModel):
@@ -377,6 +392,21 @@ class OracleTable(SchemaModel):
             if row.id == row_id:
                 return row
         raise KeyError(row_id)
+
+    def unverified_blocker_rows(self) -> list[str]:
+        """Ids of rows that may carry a Blocker but have no verified source.
+
+        These are the rows whose severity depends entirely on the staleness cap firing
+        (DEC-F13). A nonzero `freshness.max_rebaselines_without_verification` suppresses
+        that cap, so the loader warns when both are true rather than letting unresolved
+        doctrine publish a Blocker silently.
+        """
+        blocker_tiers = set(self.severity_policy.blocker_tiers)
+        return [
+            row.id
+            for row in self.rows
+            if not row.disclosed_gap and row.tier in blocker_tiers and not row.has_verified_source()
+        ]
 
     def source_author_names(self) -> set[str]:
         """All author names across sources — feeds the attribution sweep."""

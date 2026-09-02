@@ -598,7 +598,12 @@ class ReviewPipeline:
         new_state = state.model_copy(
             update={"cycle": current_cycle, "history": [*state.history, new_record]}
         )
-        state_path = self._state_store.save(new_state, rendered)
+        # Pass the cycle we loaded so the store can refuse a lost update (DEC-F14). The
+        # findings, the escalation verdict and `rendered` above were all computed from
+        # that snapshot; if a concurrent review has advanced it, publishing this run would
+        # discard their history and, worse, would act on a recurrence count that is no
+        # longer true. `StateConflictError` aborts the run without writing anything.
+        state_path = self._state_store.save(new_state, rendered, expected_cycle=state.cycle)
         self._write_audit_bundle(request, current_cycle, sweep)
 
         severity_counts: dict[str, int] = {}

@@ -323,3 +323,73 @@ class TestUnknownAndEmptySupports:
             supports=[doctrine("D1")],
         )
         assert SeverityPolicy(oracle).cap(finding, "conformance").severity is Severity.MAJOR
+
+
+class TestStalenessCapFiresByDefault:
+    """The cap was inert in the shipped configuration (DEC-F13).
+
+    `is_stale` returned `rebaseline_count >= max_rebaselines_without_verification`, and the
+    shipped oracle carried `rebaseline_count: 0` against a threshold of 2. `0 >= 2` is
+    False for every row, so no row was ever stale and `unverified_row_cap` never applied:
+    six rows with no verified source and a Blocker-permitting tier could publish a full
+    Blocker on a citation nobody had resolved. The trigger was coupled to a counter that
+    only rises when `oracles rebaseline` runs — and running it is what sets
+    `verified: true` — so a freshly transcribed oracle had no protection at all.
+    """
+
+    FRESHLY_TRANSCRIBED = FreshnessMeta(
+        last_rebaselined=date(2026, 1, 1),
+        rebaseline_count=0,
+        max_rebaselines_without_verification=0,
+    )
+
+    def test_the_default_grace_budget_is_zero(self) -> None:
+        """The model default is the whole fix; guard it against a silent revert."""
+        meta = FreshnessMeta(last_rebaselined=date(2026, 1, 1), rebaseline_count=0)
+        assert meta.max_rebaselines_without_verification == 0
+
+    def test_an_unverified_row_is_stale_on_a_never_rebaselined_oracle(self) -> None:
+        """The exact configuration that was uncapped: count 0, budget 0."""
+        row = make_row("D1", sources=[make_source(verified=False)])
+        assert row.is_stale(self.FRESHLY_TRANSCRIBED) is True
+
+    def test_a_blocker_from_unresolved_doctrine_is_capped_from_the_first_review(self) -> None:
+        oracle = oracle_with(
+            [make_row("D1", tier="PR", sources=[make_source(verified=False)])],
+            freshness=self.FRESHLY_TRANSCRIBED,
+        )
+        finding = make_finding(
+            severity=Severity.BLOCKER,
+            original_severity=Severity.BLOCKER,
+            doctrine_refs=["D1"],
+            supports=[doctrine("D1")],
+        )
+        capped = SeverityPolicy(oracle).cap(finding, "conformance")
+        assert capped.severity is Severity.MINOR
+        assert capped.original_severity is Severity.BLOCKER
+
+    def test_a_verified_row_is_unaffected(self) -> None:
+        row = make_row("D1", sources=[make_source(verified=True)])
+        assert row.is_stale(self.FRESHLY_TRANSCRIBED) is False
+
+    def test_a_disclosed_gap_row_is_never_stale(self) -> None:
+        """A row that openly declares it has no evidence is not a transcription failure."""
+        row = make_row("D6a", tier="NONE", disclosed_gap=True, sources=[])
+        assert row.is_stale(self.FRESHLY_TRANSCRIBED) is False
+
+    def test_a_nonzero_grace_budget_is_still_an_available_escape_hatch(self) -> None:
+        """Operators may opt into a grace window; they just no longer get one by default."""
+        lenient = FreshnessMeta(
+            last_rebaselined=date(2026, 1, 1),
+            rebaseline_count=0,
+            max_rebaselines_without_verification=2,
+        )
+        row = make_row("D1", sources=[make_source(verified=False)])
+        assert row.is_stale(lenient) is False
+
+    def test_has_verified_source_matches_the_staleness_decision(self) -> None:
+        assert make_row("D1", sources=[make_source(verified=True)]).has_verified_source()
+        assert not make_row("D1", sources=[make_source(verified=False)]).has_verified_source()
+        assert make_row(
+            "D1", sources=[make_source(verified=False), make_source(verified=True)]
+        ).has_verified_source()

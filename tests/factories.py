@@ -62,10 +62,14 @@ def make_oracle(**overrides: Any) -> OracleTable:
         "conformance": ConformanceConfig(
             markers=["Mini Program"], advisory_severity_cap=Severity.INFO
         ),
+        # Grace budget of zero matches the shipped default (DEC-F13): an unverified row is
+        # stale immediately. `make_source` defaults to `verified=True`, so a row built
+        # without an explicit unverified source is unaffected — a test that wants the
+        # staleness cap has to ask for it, which is the point.
         "freshness": FreshnessMeta(
             last_rebaselined=date(2026, 1, 1),
             rebaseline_count=0,
-            max_rebaselines_without_verification=2,
+            max_rebaselines_without_verification=0,
         ),
         "severity_policy": SeverityPolicyConfig(
             tier_caps=[

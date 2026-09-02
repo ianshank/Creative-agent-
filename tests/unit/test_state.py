@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from creative_agent.errors import StateCorruptError
+from creative_agent.errors import StateConflictError, StateCorruptError
 from creative_agent.harness.state import CycleEscalator, FileStateStore
 from creative_agent.models.findings import Severity
 from creative_agent.models.review import ReviewResult
@@ -147,3 +147,114 @@ class TestCycleEscalator:
             ]
         )
         assert self.escalator().check(state, result_with([("D1", "gap")])) is None
+
+
+class TestOptimisticConcurrency:
+    """A concurrent review must not silently erase the escalation (DEC-F14).
+
+    The lock only ever covered the write, while the pipeline loaded state up to 144
+    provider calls earlier and computed its escalation verdict from that snapshot. Two
+    reviews of one artifact both read cycle N, both wrote N+1, and the second `os.replace`
+    discarded the first's history wholesale — taking the recurrence count that drives the
+    cycle-3 charter-review STOP with it. Nothing exercised the lock at all before this.
+    """
+
+    def test_save_without_expected_cycle_stays_permissive(self, tmp_path: Path) -> None:
+        """The keyword is optional so existing callers and test doubles keep working."""
+        store = FileStateStore(tmp_path)
+        store.save(ReviewState(artifact_id="a", cycle=1))
+        store.save(ReviewState(artifact_id="a", cycle=9))
+        assert store.load("a").cycle == 9
+
+    def test_save_succeeds_when_the_stored_cycle_is_what_the_caller_loaded(
+        self, tmp_path: Path
+    ) -> None:
+        store = FileStateStore(tmp_path)
+        store.save(ReviewState(artifact_id="a", cycle=2))
+        loaded = store.load("a")
+        store.save(ReviewState(artifact_id="a", cycle=3), expected_cycle=loaded.cycle)
+        assert store.load("a").cycle == 3
+
+    def test_a_fresh_artifact_expects_cycle_zero(self, tmp_path: Path) -> None:
+        store = FileStateStore(tmp_path)
+        loaded = store.load("brand-new")
+        assert loaded.cycle == 0
+        store.save(ReviewState(artifact_id="brand-new", cycle=1), expected_cycle=loaded.cycle)
+        assert store.load("brand-new").cycle == 1
+
+    def test_a_concurrent_writer_is_refused_rather_than_overwritten(self, tmp_path: Path) -> None:
+        store = FileStateStore(tmp_path)
+        store.save(ReviewState(artifact_id="a", cycle=1))
+        ours = store.load("a")  # our review starts here, at cycle 1
+
+        # A second review of the same artifact finishes first.
+        store.save(ReviewState(artifact_id="a", cycle=2, history=[record(2, [("D1", "x")])]))
+
+        with pytest.raises(StateConflictError) as excinfo:
+            store.save(ReviewState(artifact_id="a", cycle=2), expected_cycle=ours.cycle)
+        assert "cycle 1 to 2" in str(excinfo.value)
+
+    def test_the_concurrent_writers_history_survives_the_refusal(self, tmp_path: Path) -> None:
+        """The refusal must leave the other run's state exactly as it was."""
+        store = FileStateStore(tmp_path)
+        store.save(ReviewState(artifact_id="a", cycle=1))
+        ours = store.load("a")
+        theirs = ReviewState(artifact_id="a", cycle=2, history=[record(2, [("D1", "theirs")])])
+        store.save(theirs, "their summary")
+
+        with pytest.raises(StateConflictError):
+            store.save(
+                ReviewState(artifact_id="a", cycle=2, history=[record(2, [("D9", "ours")])]),
+                "our summary",
+                expected_cycle=ours.cycle,
+            )
+
+        surviving = store.load("a")
+        assert surviving.cycle == 2
+        assert [f.key.row_id for f in surviving.history[0].findings] == ["D1"]
+        assert "their summary" in store.path_for("a").read_text(encoding="utf-8")
+
+    def test_no_temp_file_is_left_behind_by_a_refused_write(self, tmp_path: Path) -> None:
+        store = FileStateStore(tmp_path)
+        store.save(ReviewState(artifact_id="a", cycle=1))
+        ours = store.load("a")
+        store.save(ReviewState(artifact_id="a", cycle=2))
+
+        with pytest.raises(StateConflictError):
+            store.save(ReviewState(artifact_id="a", cycle=2), expected_cycle=ours.cycle)
+
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_state_that_became_corrupt_mid_review_is_an_abort_not_a_config_error(
+        self, tmp_path: Path
+    ) -> None:
+        """A partial file from another writer is not this operator's misconfiguration.
+
+        Raising StateCorruptError here would send the user to `--reset-state`, which would
+        destroy the concurrent run's history — the opposite of the right action.
+        """
+        store = FileStateStore(tmp_path)
+        store.save(ReviewState(artifact_id="a", cycle=1))
+        store.path_for("a").write_text("not front matter at all", encoding="utf-8")
+
+        with pytest.raises(StateConflictError):
+            store.save(ReviewState(artifact_id="a", cycle=2), expected_cycle=1)
+
+
+class TestResetIsLocked:
+    def test_reset_removes_the_state_file(self, tmp_path: Path) -> None:
+        store = FileStateStore(tmp_path)
+        store.save(ReviewState(artifact_id="a", cycle=1))
+        store.reset("a")
+        assert not store.path_for("a").exists()
+        assert store.load("a").cycle == 0
+
+    def test_reset_on_a_missing_artifact_is_a_no_op(self, tmp_path: Path) -> None:
+        FileStateStore(tmp_path).reset("never-existed")
+
+    def test_reset_takes_the_same_lock_a_write_takes(self, tmp_path: Path) -> None:
+        """`--reset-state` raced the writer before: it unlinked outside the lock."""
+        store = FileStateStore(tmp_path)
+        store.save(ReviewState(artifact_id="a", cycle=1))
+        store.reset("a")
+        assert (tmp_path / ".a.lock").exists()

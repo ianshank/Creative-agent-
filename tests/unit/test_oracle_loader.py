@@ -1,5 +1,7 @@
 """OracleLoader hardening + the shipped sutton oracle's named invariants."""
 
+import logging
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -9,8 +11,8 @@ from hypothesis import strategies as st
 
 from creative_agent.errors import ConfigError, CreativeAgentError, OracleValidationError
 from creative_agent.harness.oracle import OracleLoader
-from creative_agent.models.oracle import OracleTable
-from tests.factories import make_oracle
+from creative_agent.models.oracle import FreshnessMeta, OracleTable
+from tests.factories import make_oracle, make_row, make_source
 
 MAX_BYTES = 2_000_000
 
@@ -169,3 +171,93 @@ class TestShippedSuttonOracle:
     def test_escalation_cycle_and_marker(self, sutton: OracleTable) -> None:
         assert sutton.protocol.escalation_cycle == 3
         assert sutton.protocol.unverified_marker.startswith("[Unverified")
+
+
+class TestUnverifiedDoctrineIsVisible:
+    """Silence about weak doctrine is how ten unresolved rows went uncapped (DEC-F13).
+
+    A row with no verified source relies on the staleness cap to hold its findings down.
+    A nonzero grace budget suppresses that cap, so the loader says so at WARNING with the
+    row ids — a stable, greppable event rather than a comment nobody reads.
+    """
+
+    def _oracle_yaml(self, grace: int, verified: bool) -> str:
+        table = make_oracle(
+            rows=[make_row("D1", tier="PR", sources=[make_source(verified=verified)])],
+            freshness=FreshnessMeta(
+                last_rebaselined=date(2026, 1, 1),
+                rebaseline_count=0,
+                max_rebaselines_without_verification=grace,
+            ),
+        )
+        return yaml.safe_dump(table.model_dump(mode="json"), sort_keys=False)
+
+    def _load(self, tmp_path: Path, text: str) -> None:
+        path = tmp_path / "mini.yaml"
+        path.write_text(text, encoding="utf-8")
+        OracleLoader([tmp_path], max_bytes=1_000_000).load_file(path)
+
+    def test_a_grace_budget_over_unverified_blocker_rows_warns(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="creative_agent"):
+            self._load(tmp_path, self._oracle_yaml(grace=2, verified=False))
+        assert any("oracle.unverified_rows_uncapped" in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_when_the_cap_will_actually_fire(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Budget 0 means the unverified row is capped, so there is nothing to warn about."""
+        with caplog.at_level(logging.WARNING, logger="creative_agent"):
+            self._load(tmp_path, self._oracle_yaml(grace=0, verified=False))
+        assert not any("oracle.unverified_rows_uncapped" in r.getMessage() for r in caplog.records)
+
+    def test_no_warning_when_every_blocker_row_is_verified(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="creative_agent"):
+            self._load(tmp_path, self._oracle_yaml(grace=2, verified=True))
+        assert not any("oracle.unverified_rows_uncapped" in r.getMessage() for r in caplog.records)
+
+    def test_unverified_blocker_rows_ignores_non_blocker_tiers_and_disclosed_gaps(self) -> None:
+        table = make_oracle(
+            rows=[
+                make_row("D1", tier="PR", sources=[make_source(verified=False)]),
+                make_row("D2", tier="T", sources=[make_source(verified=False)]),
+                make_row("D3", tier="NONE", disclosed_gap=True, sources=[]),
+                make_row("D4", tier="AP", sources=[make_source(verified=True)]),
+            ]
+        )
+        assert table.unverified_blocker_rows() == ["D1"]
+
+
+class TestShippedOracleStalenessInvariants:
+    """Named invariants on the product data, per CLAUDE.md.
+
+    Engine behaviour is tested against synthetic oracles; these assert only facts about
+    the shipped corpus that a careless edit would quietly reverse.
+    """
+
+    def _sutton(self) -> OracleTable:
+        return OracleLoader([], max_bytes=5_000_000).load("sutton")
+
+    def test_the_shipped_grace_budget_is_zero(self) -> None:
+        assert self._sutton().freshness.max_rebaselines_without_verification == 0
+
+    def test_every_unverified_row_is_actually_stale(self) -> None:
+        """The whole point of DEC-F13: no unresolved row escapes the cap."""
+        table = self._sutton()
+        for row in table.rows:
+            if row.disclosed_gap or row.has_verified_source():
+                continue
+            assert row.is_stale(table.freshness), f"{row.id} is unverified but not stale"
+
+    def test_the_rebaselined_rows_carry_a_verification_date(self) -> None:
+        """D5, D8 and D11 were resolved by hand against the papers' own title pages."""
+        table = self._sutton()
+        for row_id in ("D5", "D8", "D11"):
+            row = table.row(row_id)
+            assert row.has_verified_source(), f"{row_id} lost its verified source"
+            assert any(s.verified and s.last_verified for s in row.sources), (
+                f"{row_id} claims verification with no last_verified date"
+            )
