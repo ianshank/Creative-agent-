@@ -11,7 +11,22 @@ compatible for data, or the reverse. Changes to any of those are called out expl
 
 ## [Unreleased]
 
-Post-merge next-steps work, not yet in `main`.
+Work on top of the PR #7 merge.
+
+### Changed
+
+- **`docs/roadmap.md` rewritten as a sequenced development plan**, after a peer review that
+  re-verified every claim the previous version made against the code. Four of its
+  statements were wrong and two of its priorities were inverted, and the corrections are
+  recorded inline rather than dropped. The review found seven places where a documented
+  guarantee does not hold — among them a tool-honesty check satisfiable by a fetch that
+  never happened, a staleness severity cap that never fires because its trigger is coupled
+  to a counter that is still zero, and a concurrent review that can erase the cycle-3
+  charter-review escalation — and nine gates that report success while verifying nothing,
+  including a mutation gate that passes on zero mutants. Every finding carries a
+  `file:line` and was reproduced. Controls that were attacked and held are recorded too,
+  so the fixes are not read as a verdict on the whole boundary. No behaviour changed in
+  this entry; the plan says what to change and in what order.
 
 ### Added
 
