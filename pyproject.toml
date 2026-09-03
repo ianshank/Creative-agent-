@@ -95,10 +95,18 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
-addopts = "--cov=creative_agent --cov-branch --cov-report=term-missing --cov-report=xml --cov-fail-under=90 -m 'not live'"
+# --strict-markers: an unregistered marker is a typo, and a typo'd marker silently does
+# nothing — `@pytest.mark.liv` would quietly opt a test out of nothing at all while
+# reading as if it had. With it, the typo fails collection instead.
+addopts = "--cov=creative_agent --cov-branch --cov-report=term-missing --cov-report=xml --cov-fail-under=90 -m 'not live' --strict-markers"
 markers = [
     "live: tests that call the real Claude Agent SDK (require ANTHROPIC_API_KEY; run by live.yml)",
 ]
+# Warnings are errors: a DeprecationWarning from a dependency is the notice that a future
+# upgrade will break the harness, and printed among 500 dots nobody reads it. The suite
+# currently raises none, so the list below carries no allowances — anything added here
+# needs a comment saying which dependency raises it and why it cannot be fixed instead.
+filterwarnings = ["error"]
 
 [tool.coverage.run]
 branch = true

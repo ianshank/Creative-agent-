@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import re
 import stat
@@ -23,6 +24,10 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+
+from creative_agent.harness.logging import get_logger, log_event
+
+_LOGGER = get_logger(__name__)
 
 _FRONT_MATTER = re.compile(r"\A---\r?\n(?P<yaml>.*?)\r?\n---\r?\n", re.DOTALL)
 # A name that appears in a slash command or an agent reference: lowercase, hyphenated.
@@ -36,6 +41,37 @@ REQUIRED_KEYS = frozenset({"name", "description"})
 
 # Descriptions are the trigger surface: too short and the asset never fires.
 MIN_DESCRIPTION_CHARS = 40
+
+
+@dataclass(frozen=True)
+class AssetKind:
+    """One directory of assets a `.claude` tree must contain, and how to find its files."""
+
+    name: str
+    directory: str
+    pattern: str
+
+    def files(self, claude_dir: Path) -> list[Path]:
+        """Every file of this kind, or an empty list if the directory is absent."""
+        source = claude_dir / self.directory
+        return sorted(source.glob(self.pattern)) if source.is_dir() else []
+
+
+# The expected inventory, as data rather than literals inside `collect`: each kind must
+# actually yield something. Every walk below is guarded by `is_dir()`, so a renamed,
+# moved or gutted directory — `agents/` to `agent/` — produced an empty inventory, no
+# defects, and a clean "all assets valid". A validator that passes on nothing is worse
+# than none, because it is trusted. This mirrors the oracle path, which already refuses to
+# call a run successful when it loaded no oracle files.
+AGENT_ASSETS = AssetKind("agent", "agents", "*.md")
+SKILL_ASSETS = AssetKind("skill", "skills", "*/SKILL.md")
+HOOK_ASSETS = AssetKind("hook", "hooks", "*.sh")
+EXPECTED_ASSET_KINDS: tuple[AssetKind, ...] = (AGENT_ASSETS, SKILL_ASSETS, HOOK_ASSETS)
+
+# settings.json is a single file rather than a directory of them, so it is named on its
+# own — but it is required for the same reason: the hooks it wires up do not run without
+# it, and its absence is silent.
+SETTINGS_FILENAME = "settings.json"
 
 
 @dataclass
@@ -184,15 +220,48 @@ def validate_settings(path: Path, hook_dir: Path) -> list[AssetDefect]:
     return defects
 
 
+def _empty_inventory_defects(
+    claude_dir: Path, found: dict[str, int], has_settings: bool
+) -> list[AssetDefect]:
+    """One defect per asset kind that yielded nothing at all.
+
+    Not "this asset is malformed" but "there is no asset here to be malformed" — the
+    condition under which every other check in this module silently has nothing to say.
+    """
+    defects = [
+        AssetDefect(
+            f"{claude_dir.name}/{kind.directory}",
+            f"no {kind.name} files matching {kind.pattern!r}: the directory is missing, "
+            "renamed or empty, so validation would otherwise pass on an empty inventory",
+        )
+        for kind in EXPECTED_ASSET_KINDS
+        if not found.get(kind.name)
+    ]
+    if not has_settings:
+        defects.append(
+            AssetDefect(
+                f"{claude_dir.name}/{SETTINGS_FILENAME}",
+                "missing: permissions and hook wiring are unset, and every hook this "
+                "directory ships is inert",
+            )
+        )
+    return defects
+
+
 def collect(
     claude_dir: Path, known_tools: frozenset[str] | None = None
 ) -> tuple[AssetInventory, list[AssetDefect]]:
-    """Load and validate every asset under a `.claude` directory."""
+    """Load and validate every asset under a `.claude` directory.
+
+    An inventory that came back empty is itself a defect: see `_empty_inventory_defects`.
+    """
     inventory = AssetInventory()
     defects: list[AssetDefect] = []
+    found: dict[str, int] = {}
 
-    agents_dir = claude_dir / "agents"
-    for path in sorted(agents_dir.glob("*.md")) if agents_dir.is_dir() else []:
+    agent_paths = AGENT_ASSETS.files(claude_dir)
+    found[AGENT_ASSETS.name] = len(agent_paths)
+    for path in agent_paths:
         defects.extend(validate_agent(path, known_tools))
         try:
             meta, _ = parse_front_matter(path)
@@ -200,8 +269,9 @@ def collect(
             continue
         inventory.agents[str(meta.get("name", path.stem))] = meta
 
-    skills_dir = claude_dir / "skills"
-    for path in sorted(skills_dir.glob("*/SKILL.md")) if skills_dir.is_dir() else []:
+    skill_paths = SKILL_ASSETS.files(claude_dir)
+    found[SKILL_ASSETS.name] = len(skill_paths)
+    for path in skill_paths:
         defects.extend(validate_skill(path))
         try:
             meta, _ = parse_front_matter(path)
@@ -209,16 +279,30 @@ def collect(
             continue
         inventory.skills[str(meta.get("name", path.parent.name))] = meta
 
-    hooks_dir = claude_dir / "hooks"
-    for path in sorted(hooks_dir.glob("*.sh")) if hooks_dir.is_dir() else []:
+    hook_paths = HOOK_ASSETS.files(claude_dir)
+    found[HOOK_ASSETS.name] = len(hook_paths)
+    for path in hook_paths:
         inventory.hooks.append(path)
         defects.extend(validate_hook(path))
 
-    settings_path = claude_dir / "settings.json"
-    if settings_path.is_file():
-        defects.extend(validate_settings(settings_path, hooks_dir))
+    settings_path = claude_dir / SETTINGS_FILENAME
+    has_settings = settings_path.is_file()
+    if has_settings:
+        defects.extend(validate_settings(settings_path, claude_dir / HOOK_ASSETS.directory))
         with contextlib.suppress(json.JSONDecodeError):
             inventory.settings = json.loads(settings_path.read_text(encoding="utf-8"))
+
+    missing = _empty_inventory_defects(claude_dir, found, has_settings)
+    if missing:
+        log_event(
+            _LOGGER,
+            logging.WARNING,
+            "assets.inventory_incomplete",
+            claude_dir=str(claude_dir),
+            missing_kinds=[defect.path for defect in missing],
+            counts=found,
+        )
+    defects.extend(missing)
 
     return inventory, defects
 

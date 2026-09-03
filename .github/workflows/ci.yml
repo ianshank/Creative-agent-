@@ -96,10 +96,24 @@ jobs:
           path: coverage.xml
 
   container:
-    name: Container build
+    name: Container build and gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The test stage was only ever asserted statically — that the Dockerfile *says* it
+      # runs `make gate` — so nothing noticed that a file the suite reads was missing from
+      # the build context and `make docker-test` had been failing. Building and running it
+      # here is what makes "a green container means a green CI" a checked claim.
+      - name: Build test image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          target: test
+          push: false
+          load: true
+          tags: creative-agent:test
+      - name: Run the gate inside the container
+        run: docker run --rm creative-agent:test
       - name: Build runtime image
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:

@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 from creative_agent.harness.llm.base import CallKind
 from creative_agent.harness.prompting import PromptAssembler, render_oracle_rows
 from creative_agent.harness.rendering import OutputRenderer
@@ -20,6 +22,17 @@ from tests.conftest import GOLDEN_DIR, GoldenComparer
 from tests.factories import make_finding, make_key, make_oracle
 
 MARKER = "[Unverified — flagged for human check]"
+
+# Environment that must never reach a golden file: an absolute path from whoever ran
+# `--update-goldens`, or a wall-clock timestamp. Both make the goldens unreproducible on
+# anyone else's machine.
+#
+# The Windows alternative is `[A-Z]:` followed by ONE literal backslash. Written as
+# `[A-Z]:\\\\` inside a raw string it compiled to two consecutive backslashes, which no
+# Windows path contains — a dead branch that could never match, in a check whose whole job
+# is to match. `TestGoldenHygiene.test_the_leak_pattern_matches_real_leaks` now holds the
+# pattern to its claim.
+ENVIRONMENT_LEAK = re.compile(r"(/home/|/root/|/tmp/|[A-Z]:\\|\d{4}-\d{2}-\d{2}T\d{2}:)")
 
 
 def full_report() -> ReviewReport:
@@ -144,8 +157,32 @@ class TestPromptGoldens:
 class TestGoldenHygiene:
     def test_no_environment_leaks_into_goldens(self) -> None:
         assert GOLDEN_DIR.is_dir(), "goldens not generated — run pytest --update-goldens"
-        forbidden = re.compile(r"(/home/|/root/|/tmp/|[A-Z]:\\\\|\d{4}-\d{2}-\d{2}T\d{2}:)")
         for path in GOLDEN_DIR.rglob("*.md"):
             text = path.read_text(encoding="utf-8")
-            match = forbidden.search(text)
+            match = ENVIRONMENT_LEAK.search(text)
             assert match is None, f"{path.name} leaks environment: {match.group(0)!r}"
+
+    @pytest.mark.parametrize(
+        "leak",
+        [
+            "/home/someone/repo/docs/design.md",
+            "/root/repo/docs/design.md",
+            "/tmp/pytest-of-runner/artifact.md",
+            r"C:\Users\someone\repo\docs\design.md",
+            "2026-01-01T09:30:00Z",
+        ],
+    )
+    def test_the_leak_pattern_matches_real_leaks(self, leak: str) -> None:
+        """The scan above only proves something if every alternative can actually fire.
+
+        The Windows branch could not: it required two consecutive backslashes. A goldens
+        file regenerated on Windows would have passed this hygiene check while carrying an
+        absolute path, and nothing would have said so.
+        """
+        assert ENVIRONMENT_LEAK.search(leak), f"the hygiene scan cannot see {leak!r}"
+
+    def test_the_leak_pattern_does_not_match_ordinary_report_text(self) -> None:
+        """The other direction: a pattern that matches everything would make the goldens
+        unwritable and get deleted rather than fixed."""
+        for benign in ("docs/design.md", "arxiv:2001.00001", "cycle 3", "2026-01-01"):
+            assert ENVIRONMENT_LEAK.search(benign) is None, f"{benign!r} is not a leak"

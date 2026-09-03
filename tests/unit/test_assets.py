@@ -11,8 +11,11 @@ depend on (exit codes referenced by the subagent, tools the harness actually use
 from __future__ import annotations
 
 import json
+import os
 import re
+import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -22,6 +25,9 @@ from creative_agent.cli import app
 from creative_agent.config import HarnessSettings
 from creative_agent.errors import ExitCode
 from creative_agent.harness.assets import (
+    AGENT_ASSETS,
+    EXPECTED_ASSET_KINDS,
+    SETTINGS_FILENAME,
     AssetDefect,
     collect,
     default_claude_dir,
@@ -52,6 +58,12 @@ KNOWN_TOOLS = frozenset(
         "SlashCommand",
     }
 )
+
+# Every tool Claude Code can use to change a file on disk. The PostToolUse validation hook
+# must fire after all of them: a doctrine table edited through `MultiEdit` breaks the
+# schema exactly as one edited through `Edit`, and a matcher that omits a tool fails
+# silently — the hook simply never runs and nothing reports that it did not.
+EDIT_CAPABLE_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 
 
 @pytest.fixture(scope="module")
@@ -167,12 +179,46 @@ class TestSettingsMatchTheHarness:
         """A bare Bash(*) grant would defeat the point of an allowlist."""
         assert "Bash(*)" not in settings_json["permissions"]["allow"]
 
+    @pytest.mark.parametrize("tool", sorted(EDIT_CAPABLE_TOOLS))
+    def test_post_tool_use_matcher_names_every_edit_capable_tool(
+        self, settings_json: dict, tool: str
+    ) -> None:
+        """CLAUDE.md says the hook re-validates after "any edit"; the matcher must agree.
+
+        It listed only `Edit|Write`, so a `MultiEdit` or `NotebookEdit` to a doctrine table
+        never fired the validator and the schema break surfaced in CI instead of at edit
+        time. Nothing tested the wiring at all — `TestHookBehaviour` runs the scripts by
+        subprocess, which bypasses the matcher entirely, so the hook looked well-tested
+        while the tool list that decides whether it ever runs was unasserted.
+        """
+        matchers = [entry.get("matcher", "") for entry in settings_json["hooks"]["PostToolUse"]]
+        named = {name for matcher in matchers for name in matcher.split("|")}
+        assert tool in named, f"a {tool} edit would not re-validate the data it changed"
+
+
+@pytest.fixture
+def broken_oracle_dir(tmp_path: Path) -> Iterator[Path]:
+    """A schema-invalid oracle in a throwaway search path the hook will actually load.
+
+    The path ends in `data/oracles/` because the hook decides whether to run oracle
+    validation by matching that substring in its payload.
+    """
+    directory = tmp_path / "data" / "oracles"
+    directory.mkdir(parents=True)
+    (directory / "_hooktest_broken.yaml").write_text(
+        "schema_version: 1\noracle_id: broken\n", encoding="utf-8"
+    )
+    yield directory
+    shutil.rmtree(tmp_path, ignore_errors=True)
+
 
 class TestHookBehaviour:
     """Hooks are shell scripts with real side effects; assert what they actually do."""
 
     @staticmethod
-    def _run(script: str, payload: str) -> subprocess.CompletedProcess[str]:
+    def _run(
+        script: str, payload: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [str(CLAUDE_DIR / "hooks" / script)],
             input=payload,
@@ -180,6 +226,7 @@ class TestHookBehaviour:
             text=True,
             timeout=300,
             check=False,
+            env={**os.environ, **(env or {})},
         )
 
     def test_oracle_hook_passes_for_valid_data(self) -> None:
@@ -194,18 +241,32 @@ class TestHookBehaviour:
         assert result.returncode == 0
         assert result.stdout == ""
 
-    def test_oracle_hook_blocks_on_invalid_data(self, tmp_path: Path) -> None:
-        """Exit 2 is what feeds the error back to Claude to fix immediately."""
-        repo_root = Path(__file__).resolve().parents[2]
-        broken = repo_root / "src/creative_agent/data/oracles/_hooktest_broken.yaml"
-        broken.write_text("schema_version: 1\noracle_id: broken\n", encoding="utf-8")
-        try:
-            payload = json.dumps({"tool_input": {"file_path": str(broken)}})
-            result = self._run("validate-data.sh", payload)
-            assert result.returncode == 2
-            assert "Oracle validation failed" in result.stderr
-        finally:
-            broken.unlink(missing_ok=True)
+    def test_oracle_hook_blocks_on_invalid_data(self, broken_oracle_dir: Path) -> None:
+        """Exit 2 is what feeds the error back to Claude to fix immediately.
+
+        The broken oracle is written into a tmp search path, never into the packaged
+        `src/creative_agent/data/oracles/`: an earlier version of this test wrote there
+        and relied on a `finally` to clean up, so an interrupted or killed run left
+        `_hooktest_broken.yaml` in the checkout and broke `make oracles` for everything
+        afterwards. `TestTheSuiteDoesNotMutateTheRepository` states the rule this now
+        keeps: the suite must not write into the repository.
+        """
+        broken = broken_oracle_dir / "_hooktest_broken.yaml"
+        payload = json.dumps({"tool_input": {"file_path": str(broken)}})
+        result = self._run(
+            "validate-data.sh",
+            payload,
+            env={"CREATIVE_AGENT_ORACLE_SEARCH_PATHS": str(broken_oracle_dir)},
+        )
+        assert result.returncode == 2
+        assert "Oracle validation failed" in result.stderr
+
+    def test_the_broken_oracle_never_lands_in_the_checkout(self) -> None:
+        """Directly asserts what the fixture above is for: whatever happens to a run, no
+        test artefact is left in the packaged oracle directory."""
+        packaged = Path(__file__).resolve().parents[2] / "src/creative_agent/data/oracles"
+        stray = sorted(p.name for p in packaged.glob("_hooktest*"))
+        assert not stray, f"test data leaked into the packaged oracle directory: {stray}"
 
     def test_session_start_hook_reports_readiness(self) -> None:
         result = self._run("session-start.sh", "")
@@ -313,9 +374,39 @@ class TestAssetValidatorItself:
         settings.write_text("{not json", encoding="utf-8")
         assert "invalid JSON" in validate_settings(settings, tmp_path)[0].message
 
-    def test_collect_on_an_empty_directory_is_clean(self, tmp_path: Path) -> None:
+    def test_collect_on_an_empty_directory_reports_every_missing_kind(self, tmp_path: Path) -> None:
+        """An empty inventory is a failure, not a clean bill of health.
+
+        This test previously asserted the opposite — that `collect` on an empty directory
+        is clean — which enshrined the defect: every walk in `collect` is guarded by
+        `is_dir()`, so renaming `.claude/agents` to `.claude/agent` (or deleting the whole
+        tree) validated nothing and reported "ok: all assets valid". The oracle path
+        already refuses that shape ("no oracle files found"); the asset path now does too.
+        """
         inventory, defects = collect(tmp_path)
-        assert not defects and not inventory.agents and not inventory.skills
+        assert not inventory.agents and not inventory.skills and not inventory.hooks
+        reported = " ".join(str(d) for d in defects)
+        for kind in EXPECTED_ASSET_KINDS:
+            assert kind.directory in reported, f"a missing {kind.name} directory went unreported"
+        assert SETTINGS_FILENAME in reported
+
+    def test_collect_reports_a_kind_whose_directory_was_renamed(self, tmp_path: Path) -> None:
+        """The concrete way this happens: everything else is present and valid, so the
+        run looks healthy while one asset kind has quietly stopped being validated."""
+        shutil.copytree(CLAUDE_DIR, tmp_path / "claude")
+        claude_dir = tmp_path / "claude"
+        (claude_dir / AGENT_ASSETS.directory).rename(claude_dir / "agent")
+
+        _, defects = collect(claude_dir, known_tools=KNOWN_TOOLS)
+        assert any(AGENT_ASSETS.directory in str(d) for d in defects), (
+            "a renamed agents/ directory produced no defect; `assets validate` would pass"
+        )
+
+    def test_a_complete_directory_reports_no_missing_kinds(self, tmp_path: Path) -> None:
+        """The failure direction: a guard that always fires would be turned off."""
+        shutil.copytree(CLAUDE_DIR, tmp_path / "claude")
+        _, defects = collect(tmp_path / "claude", known_tools=KNOWN_TOOLS)
+        assert not defects, "the shipped .claude tree must not trip the emptiness guard"
 
 
 class TestAgentToolsMatchHarnessCapabilities:
