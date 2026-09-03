@@ -44,7 +44,10 @@ permission_mode: dontAsk  # default | acceptEdits | plan | dontAsk | auto | bypa
 # http(s) from one of these hosts (or a subdomain of one), so a decoy URL that merely
 # mentions `arxiv.org/abs/<id>`, or a local Read of a file named after it, proves nothing.
 # Data rather than literals: an institutional mirror or a DOI proxy belongs here, not in a
-# code change. From the environment this one takes JSON:
+# code change. KNOWN LIMIT (DEC-F19): this reaches the honesty checker only. The fetch
+# allowlist the PreToolUse hook enforces is built separately, so a mirror named here is
+# accepted as evidence but its fetch is still denied at the call boundary. Configuring a
+# mirror is not yet a settings change end to end. From the environment this one takes JSON:
 #   CREATIVE_AGENT_IDENTIFIER_AUTHORITY_HOSTS='{"arxiv": ["arxiv.org", "mirror.example"]}'
 identifier_authority_hosts:
   arxiv: [arxiv.org]

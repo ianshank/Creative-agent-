@@ -22,14 +22,21 @@ building on a green that has not been earning itself.
 
 ## Status, 2026-09-03
 
-Tranches 1, 3 and 4 have landed, and Tranche 2 has landed except for 2.3 and 2.4. Each item
-below keeps its problem statement — a roadmap that deletes what it fixed cannot be audited —
-and carries a **Done** note naming the decision entry that governs it, or a **Still open**
-note saying precisely what is left. Nothing here was marked done without re-reading the code.
+Tranches 1 through 4 have landed. Each item below keeps its problem statement — a roadmap
+that deletes what it fixed cannot be audited — and carries a **Done** note naming the
+decision entry that governs it, or a **Still open** note saying precisely what is left.
+Nothing here was marked done without re-reading the code.
 
-What remains: **0.1** and **0.2** (both owner-blocked), **1.7's artifact-path half**, **2.3**
-and **2.4**, the parts of **3.1** that need network egress, the review-time citation check in
-**3.3**, **4.2's** full Windows support, and all of **Tranche 5**.
+An independent adversarial review then attacked the implementation and found that four of
+the seven claimed fixes did not achieve what their decision entries asserted, including a
+forged Blocker row reaching the published report through the one field the renderer pass
+missed. Those corrections are DEC-F19; the entries they correct were left standing, because
+what was believed at the time is part of the record.
+
+What remains: **0.1** and **0.2** (both owner-blocked), the parts of **3.1** that need
+network egress, the review-time citation check in **3.3**, **4.2's** full Windows support,
+the end-to-end half of configurable identifier authorities (see DEC-F19), and all of
+**Tranche 5**.
 
 ---
 
@@ -290,12 +297,10 @@ scope-item reference and the model-supplied `row_id` — not just table cells, a
 handles `\r` as well as `\n`. Harness-assigned structural fields are left alone, which a test
 asserts rather than assumes.
 
-**Still open, small:** `pipeline.py` still passes `sweep.judgement.scope` into the report
-without laundering it (DEC-F16's text says otherwise). The published report is safe — the
-renderer escapes `ScopeItem.reference` — but the value serialised into `--output-json` is
-unlaundered, so the `max_prose_chars` cap and the format-character strip do not apply to it.
-Launder it at assembly like every other prose block, and correct DEC-F16's wording in the
-same pass.
+**Done — DEC-F19.** `ReviewPipeline._laundered_scope` puts `ScopeItem.reference` through
+`ThreatGuard.launder_prose` at assembly, so the cap and the format-character strip now reach
+`--output-json` as well as the rendered report. DEC-F16's wording was corrected in the same
+pass; an independent review found the claim false before the code caught up with it.
 
 ### 1.7 Symlink handling on the write and read paths
 
@@ -323,13 +328,14 @@ further defect in the original code: the partial-file cleanup was scoped to `exc
 so a non-`OSError` failure mid-write left the fragment on disk — the exact case the earlier
 "partial state files" fix was meant to cover. It is a `finally` now.
 
-**Still open, the read half.** `harness/artifact.py` is unchanged: nothing checks
-`is_symlink()` or `S_ISREG`, so a symlink at `docs/design.md` inside a reviewed worktree —
-the documented `--artifact-repo` flow, and something git carries — is still read and sent to
-the model, and `path.stat().st_size` still reports 0 for a character device, passing the size
-cap before an unbounded `read_bytes()`. The containment check against `--artifact-repo` is
-also not written. This is the smaller half by exposure (a read the operator asked for, not a
-write primitive) but it is the half that is still open.
+**Done.** `read_artifact` refuses anything that is not a regular file, which closes the
+character-device case where `st_size` reported 0 and the size cap passed before an unbounded
+read. It also takes a `containment_root`: a path the operator located *inside* the reviewed
+repository must still resolve inside it, so a symlink at `docs/design.md` pointing at
+`~/.ssh/id_rsa` is refused. The check is deliberately conditional on where the operator
+pointed — naming a document that lives elsewhere while passing `--artifact-repo` so the
+repository's own decision log is what `DecisionGate` reads is a legitimate pattern, and the
+first cut of this fix broke it.
 
 ### Controls that were attacked and held
 
@@ -397,10 +403,11 @@ touches the SDK.
 **Do:** one test that monkeypatches `claude_agent_sdk.query` and calls the public
 `generate()`, and one covering the `ImportError` to `LLMTransportError` branch.
 
-**Still open.** Nothing in `tests/unit/test_claude_sdk_adapter.py` calls `generate()`; the
-DEC-F15 work added tests around the hook, which is reached through `_options`, not through
-the SDK bind. This is the last Tranche 2 item that has not moved, and it did not move because
-the branch's changes to that module were all in the hook.
+**Done.** `TestGenerateIsTheRealEntryPoint` monkeypatches `claude_agent_sdk.query` and
+calls the public `generate()`, asserting that the prompt text and the computed options
+actually reach the SDK rather than only that the symbol was bound, plus the
+`ImportError` to `LLMTransportError` branch that keeps a missing optional extra from
+escaping to the CLI as exit 5.
 
 ### 2.4 The security tests for DEC-F11 can silently vanish
 
@@ -413,11 +420,11 @@ verification claim is honest about existence; 1.4 is about their coverage.
 
 **Do:** hard import, plus one test asserting the `llm` extra is present in the dev sync.
 
-**Still open, and now larger.** The DEC-F15 work added `TestPreToolUseClosedHoles`, whose
-`_hook` helper is gated behind the same `pytest.importorskip("claude_agent_sdk")`. Every test
-covering the three holes that fix closed therefore vanishes in an environment synced without
-`--all-extras`, alongside the ones this item already named — so the sandbox-escape class is
-now bigger, not smaller, and still silently skippable.
+**Done.** Every `importorskip` is gone and the SDK is imported at module scope, so a
+missing extra fails loudly at collection instead of quietly deleting the sandbox-escape
+tests. `TestTheOptionalExtraIsPresent` states the requirement explicitly rather than leaving
+it implicit in an ImportError, and asserts that `make install` still passes
+`--all-extras`.
 
 ### 2.5 The report contract is asserted only by regenerable goldens
 
@@ -795,9 +802,9 @@ Small, and all of it is the honesty class this repository polices in others.
   it names". It does not. `tests/unit/test_assets.py:129` uses `CliRunner` in-process, and
   the test's own docstring says so. The test is sound; the changelog overclaims it.~~
   **Done.** The entry now says what the test does, and says that it previously overclaimed.
-- `pyproject.toml:11` declares `license = { text = "MIT" }` and there is no `LICENSE` file
-  in the repository. The package claims a licence it does not ship. **Still open** — the file
-  is still absent.
+- `pyproject.toml:11` declares `license = { text = "MIT" }` and there was no `LICENSE` file
+  in the repository, so the package claimed a licence it did not ship. **Done** — the MIT
+  text is now at `LICENSE`, matching the declared metadata.
 - DEC-F9, DEC-F11 and `docs/architecture.md` §8 each assert a control that 1.1, 1.4 and 1.5
   show does not hold as written. Correct the text in the same pull requests that fix the
   code, so the decision log never describes a mechanism that is not there. **Half done.**
