@@ -12,6 +12,7 @@ import os
 import re
 import textwrap
 import tomllib
+from collections import Counter
 from pathlib import Path, PurePosixPath
 from typing import ClassVar, get_origin
 
@@ -862,4 +863,50 @@ class TestEverySourceModuleIsUnderAFloor:
         assert not unfloored, (
             "these modules match no coverage floor, so they can regress to zero while "
             f"every gate stays green: {unfloored}"
+        )
+
+
+class TestNoTestIsSilentlyShadowed:
+    """A duplicate class or method name discards the earlier definition without a word.
+
+    This is not hypothetical here. A fix for a CI failure was appended as a second
+    `TestArtifactPathEdgeCases`, Python kept the later definition, and the corrected tests
+    never ran — the same CI job failed again on the same test name, and the fix looked
+    ineffective when it had simply been shadowed. Neither pytest nor ruff says anything:
+    the collected count is silently lower than the count someone wrote.
+
+    That is the branch's whole subject wearing a different hat — a test that does not run
+    is the limit case of a test that does not hold — so it gets a guard rather than a
+    resolution to be careful.
+    """
+
+    def test_no_test_module_defines_a_name_twice(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        shadowed: list[str] = []
+        for path in sorted(root.rglob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            top_level = [
+                node.name
+                for node in tree.body
+                if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+            ]
+            shadowed += [
+                f"{path.name}::{name}" for name, count in Counter(top_level).items() if count > 1
+            ]
+            for node in tree.body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                methods = [
+                    child.name
+                    for child in node.body
+                    if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+                ]
+                shadowed += [
+                    f"{path.name}::{node.name}::{name}"
+                    for name, count in Counter(methods).items()
+                    if count > 1
+                ]
+        assert not shadowed, (
+            "these names are defined twice, so the earlier definition never runs and the "
+            f"suite silently collects fewer tests than were written: {shadowed}"
         )

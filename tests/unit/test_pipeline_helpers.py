@@ -401,31 +401,115 @@ class TestArtifactPathEdgeCases:
         with pytest.raises(ConfigError, match="cannot read artifact"):
             read_artifact(first, 10_000, containment_root=repo)
 
-    def test_an_unresolvable_containment_root_is_a_typed_config_error(self, tmp_path: Path) -> None:
-        """The other branch, which the loop-at-the-artifact case never reaches.
+    @pytest.mark.parametrize("raised", [OSError("ELOOP"), RuntimeError("loop"), ValueError("x")])
+    def test_an_unresolvable_path_is_a_typed_config_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: Exception
+    ) -> None:
+        """The `except (OSError, RuntimeError, ValueError)` branch, driven directly.
 
-        `Path.resolve()` raises `RuntimeError` — not `OSError` — on a symlink loop, and
-        `containment_root` is resolved separately from the artifact. A regular artifact
-        under a looping repo root therefore takes the `except (OSError, RuntimeError,
-        ValueError)` path, which is why that tuple has three members. Both are shapes a
-        checked-out worktree can have, since git carries symlinks.
+        This test used to plant a symlink loop and rely on `Path.resolve()` raising
+        `RuntimeError`. It does on 3.11 and **not on 3.13**, where `resolve()` returns the
+        path unchanged — so the test passed on two of the three supported interpreters and
+        failed CI on the third with "DID NOT RAISE". It was asserting CPython's behaviour
+        rather than this function's promise.
+
+        The promise is that whatever the standard library does when a path cannot be
+        resolved, the caller gets a typed `ConfigError` and not an untyped crash. All three
+        exception types are parametrized because all three are caught, and a tuple member
+        nothing exercises is a tuple member nobody knows is needed.
         """
         repo = tmp_path / "repo"
-        other = tmp_path / "repo2"
-        repo.symlink_to(other)
-        other.symlink_to(repo)
-        artifact = tmp_path / "design.md"
+        (repo / "docs").mkdir(parents=True)
+        artifact = repo / "docs" / "design.md"
         artifact.write_text("# Design\n", encoding="utf-8")
+
+        def explode(self: Path, *args: object, **kwargs: object) -> Path:
+            raise raised
+
+        monkeypatch.setattr(Path, "resolve", explode)
         with pytest.raises(ConfigError, match="cannot resolve artifact"):
             read_artifact(artifact, 10_000, containment_root=repo)
 
+    def test_a_symlink_loop_does_not_crash_whatever_pathlib_does(self, tmp_path: Path) -> None:
+        """The real-world shape, asserted without depending on which call raises.
+
+        A reviewed worktree can contain a symlink loop, and across supported interpreters
+        it surfaces differently — `stat()` raises ELOOP on every version, `resolve()` only
+        on some. Either way the caller must get a typed error naming the artifact, never an
+        untyped traceback.
+        """
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(parents=True)
+        first = repo / "docs" / "design.md"
+        second = repo / "docs" / "other.md"
+        first.symlink_to(second)
+        second.symlink_to(first)
+        with pytest.raises(ConfigError):
+            read_artifact(first, 10_000, containment_root=repo)
+
     def test_a_character_device_is_refused_before_it_is_read(self, tmp_path: Path) -> None:
         """`stat().st_size` reports 0 for /dev/zero, so the size cap passed and the read
-        then never terminated — an out-of-memory from a one-line symlink."""
-        device = tmp_path / "design.md"
-        device.symlink_to(Path("/dev/zero"))
+        that followed was unbounded — a plausible out-of-memory from a one-line symlink."""
+        link = tmp_path / "design.md"
+        link.symlink_to("/dev/zero")
         with pytest.raises(ConfigError, match="not a regular file"):
-            read_artifact(device, 10_000)
+            read_artifact(link, 1_000_000)
+
+    def test_a_directory_is_refused(self, tmp_path: Path) -> None:
+        target = tmp_path / "a-directory"
+        target.mkdir()
+        with pytest.raises(ConfigError, match="not a regular file"):
+            read_artifact(target, 1_000_000)
+
+    def test_a_symlink_escaping_the_reviewed_repo_is_refused(self, tmp_path: Path) -> None:
+        secret = tmp_path / "outside" / "id_rsa"
+        secret.parent.mkdir()
+        secret.write_text("PRIVATE KEY", encoding="utf-8")
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(parents=True)
+        planted = repo / "docs" / "design.md"
+        planted.symlink_to(secret)
+
+        with pytest.raises(ConfigError, match="outside it"):
+            read_artifact(planted, 1_000_000, containment_root=repo)
+
+    def test_a_symlink_inside_the_reviewed_repo_is_allowed(self, tmp_path: Path) -> None:
+        """Refusing every symlink would break ordinary checkouts to no benefit."""
+        repo = tmp_path / "repo"
+        (repo / "docs").mkdir(parents=True)
+        real = repo / "real.md"
+        real.write_text("# Design\n", encoding="utf-8")
+        link = repo / "docs" / "design.md"
+        link.symlink_to(real)
+
+        assert read_artifact(link, 1_000_000, containment_root=repo) == "# Design\n"
+
+    def test_an_artifact_outside_the_repo_is_allowed_when_the_operator_says_so(
+        self, tmp_path: Path
+    ) -> None:
+        """Containment applies to where the operator POINTED, not to every path.
+
+        Naming a document that lives elsewhere while passing `--artifact-repo` so the
+        repository's own decision log is what DecisionGate reads is a legitimate pattern;
+        the attack this guards is a symlink *inside* the reviewed tree escaping it.
+        """
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        elsewhere = tmp_path / "design.md"
+        elsewhere.write_text("# Elsewhere\n", encoding="utf-8")
+
+        assert read_artifact(elsewhere, 1_000_000, containment_root=repo) == "# Elsewhere\n"
+
+    def test_containment_is_not_applied_when_no_repo_is_given(self, tmp_path: Path) -> None:
+        target = tmp_path / "design.md"
+        target.write_text("# Plain\n", encoding="utf-8")
+        assert read_artifact(target, 1_000_000) == "# Plain\n"
+
+    def test_the_size_cap_still_applies_to_a_regular_file(self, tmp_path: Path) -> None:
+        target = tmp_path / "design.md"
+        target.write_text("x" * 500, encoding="utf-8")
+        with pytest.raises(ConfigError, match="exceeds"):
+            read_artifact(target, 100)
 
     def test_a_file_that_grows_after_the_stat_is_still_refused(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

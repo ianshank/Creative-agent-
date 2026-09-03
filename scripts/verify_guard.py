@@ -35,9 +35,17 @@ several files or contains awkward quoting:
     {"name": "...", "tests": ["..."], "edits": [{"file": "...", "find": "...",
      "replace": "..."}]}
 
-Exit codes: 0 the guard holds, 1 the guard does not hold (or the baseline was already
-failing), 2 the tool could not run the check — a spec that does not apply, a file it
-cannot restore.
+Exit codes, and the distinction between the last two is the point:
+
+    0  the guard holds — the revert applied and the named tests failed
+    1  the guard is WEAK — the behaviour was removed and the tests still passed
+    2  the check could not run, so nothing was measured: the baseline was already red,
+       the revert did not apply or was ambiguous, the reverted tree would not import or
+       collect, the selector matched no test, or a file could not be restored
+
+A failing baseline is 2, not 1. It used to be documented as 1, which was wrong in the
+direction that matters: a shell script branching on the exit code would have read "your
+tree is broken" as "your test is weak" and sent someone to rewrite a test that was fine.
 """
 
 from __future__ import annotations
