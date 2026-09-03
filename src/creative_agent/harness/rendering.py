@@ -84,7 +84,17 @@ class OutputRenderer:
             lines.append("| ID | Severity | Finding | Doctrine/gate | Required disposition |")
             lines.append("|---|---|---|---|---|")
             for finding in _sorted_findings(report.findings):
-                refs = ", ".join([*finding.doctrine_refs, *finding.gate_refs]) or "—"
+                # gate_refs is copied verbatim from the model's CandidateFinding and is
+                # an unconstrained list[str]; doctrine_refs is filtered against known
+                # rows but is model-supplied too. Interpolated raw, one entry could
+                # close this cell and open a forged Blocker row in the findings table —
+                # the exact defect DEC-F16 exists to close, in the exact table it names.
+                refs = (
+                    ", ".join(
+                        _md_escape(ref) for ref in [*finding.doctrine_refs, *finding.gate_refs]
+                    )
+                    or "—"
+                )
                 severity = Severity.parse(finding.severity).name.title()
                 if finding.cap_reason:
                     severity += f" (was {Severity.parse(finding.original_severity).name.title()})"

@@ -114,8 +114,17 @@ def fetched_identifier(
     host = (parsed.hostname or "").lower()
     if not host:
         return None
-    canonical = canonicalize(target)
-    scheme = identifier_scheme(canonical)
-    if canonical is None or scheme is None:
+    # The host must be a registrar for *some* configured scheme, not specifically for the
+    # scheme canonicalization happens to pick. Cross-registrar is deliberate and necessary:
+    # arXiv's own DOI prefix is 10.48550, so `doi.org/10.48550/arXiv.<id>` — the standard
+    # modern citation form — is a legitimate arXiv retrieval served by doi.org. Demanding
+    # per-scheme agreement refused it and failed the review with exit 3.
+    if not any(_host_is_under(host, a) for hosts in authorities.values() for a in hosts):
         return None
-    return canonical if any(_host_is_under(host, a) for a in authorities.get(scheme, ())) else None
+    # Only the host and path may carry the identifier. A registrar returns 200 for
+    # arbitrary query strings, so `arxiv.org/?x=arxiv.org/abs/<id>` is the model choosing a
+    # string, not evidence of what was served; matching anywhere in the URL let the decoy
+    # simply move to the registrar host. The host is included because arXiv's own URLs
+    # carry the identifier as `/abs/<id>` and need `arxiv.org` for context — and because
+    # `urlparse` has already stripped the port, which otherwise defeated the match.
+    return canonicalize(f"{host}{parsed.path}")

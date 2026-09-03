@@ -3,6 +3,7 @@
 import asyncio
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -533,3 +534,83 @@ class TestRunBudgetAndTimeout:
         assert BudgetExceededError.exit_code is ExitCode.RUN_ABORTED
         assert LLMTimeoutError.exit_code is ExitCode.RUN_ABORTED
         assert ReviewFailedError.exit_code is not ExitCode.RUN_ABORTED
+
+
+class TestBudgetOvershootIsBounded:
+    """A pre-call check cannot know what the call will cost (adversarial review, M4).
+
+    With `max_budget_usd=2.0` and $1.90 calls the run spent $3.80 before stopping — 190% of
+    the setting — because the check was `spent < budget` with no reservation for the call
+    about to be made. Separately, the adapter passed the same setting to the SDK as a *per
+    call* cap, so one number meant two different things and the practical bound was roughly
+    twice the setting. The remaining run budget is now the per-call ceiling.
+    """
+
+    async def test_the_remaining_budget_reaches_the_backend_as_its_per_call_cap(
+        self, tmp_path: Path
+    ) -> None:
+        seen: list[float | None] = []
+
+        class Recording:
+            def __init__(self, inner: FakeLLMClient) -> None:
+                self._inner = inner
+
+            async def generate(self, prompt: Any) -> Any:
+                seen.append(prompt.remaining_budget_usd)
+                return await self._inner.generate(prompt)
+
+        fake = FakeLLMClient(base_scripts(cost_usd=0.25))
+        pipeline, _ = build_pipeline(tmp_path, fake, max_budget_usd=10.0)
+        pipeline._llm = Recording(fake)  # type: ignore[assignment]
+        await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+
+        assert seen[0] == 10.0, "the first call should see the whole budget"
+        assert seen[-1] < seen[0], "the remainder must shrink as the run spends"
+        assert all(value is not None and value >= 0.0 for value in seen)
+
+    async def test_an_uncapped_run_passes_no_per_call_ceiling(self, tmp_path: Path) -> None:
+        seen: list[float | None] = []
+
+        class Recording:
+            def __init__(self, inner: FakeLLMClient) -> None:
+                self._inner = inner
+
+            async def generate(self, prompt: Any) -> Any:
+                seen.append(prompt.remaining_budget_usd)
+                return await self._inner.generate(prompt)
+
+        fake = FakeLLMClient(base_scripts())
+        pipeline, _ = build_pipeline(tmp_path, fake, max_budget_usd=None)
+        pipeline._llm = Recording(fake)  # type: ignore[assignment]
+        await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+
+        assert seen and all(value is None for value in seen)
+
+    async def test_the_budget_check_runs_inside_the_retry_loop(self, tmp_path: Path) -> None:
+        """DEC-F17's placement claim, which no test previously distinguished.
+
+        Every scripted payload validated first time, so there was one attempt per call and
+        moving `_check_budget` above the attempt loop left the suite green. A row call that
+        fails schema validation once forces a second attempt, and the budget consumed by
+        the first attempt must be seen by the second.
+        """
+        seen: list[float | None] = []
+
+        class Recording:
+            def __init__(self, inner: FakeLLMClient) -> None:
+                self._inner = inner
+
+            async def generate(self, prompt: Any) -> Any:
+                seen.append(prompt.remaining_budget_usd)
+                return await self._inner.generate(prompt)
+
+        scripts = base_scripts(cost_usd=0.5, rows={"D1": [{"row_id": "D1"}, row_payload("D1")]})
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake, max_budget_usd=100.0, max_regen=1)
+        pipeline._llm = Recording(fake)  # type: ignore[assignment]
+        await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+
+        # Strictly decreasing across every attempt, retries included: a check hoisted out
+        # of the attempt loop would repeat a value across the two attempts of one call.
+        assert seen == sorted(seen, reverse=True)
+        assert len(set(seen)) == len(seen), "a repeated remainder means an attempt was not counted"

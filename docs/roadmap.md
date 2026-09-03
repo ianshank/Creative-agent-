@@ -20,6 +20,17 @@ escalation can be erased by a second concurrent run. A mutation gate passes on z
 and a live-SDK job has never executed a test. Building new capability on that signal is
 building on a green that has not been earning itself.
 
+## Status, 2026-09-03
+
+Tranches 1, 3 and 4 have landed, and Tranche 2 has landed except for 2.3 and 2.4. Each item
+below keeps its problem statement — a roadmap that deletes what it fixed cannot be audited —
+and carries a **Done** note naming the decision entry that governs it, or a **Still open**
+note saying precisely what is left. Nothing here was marked done without re-reading the code.
+
+What remains: **0.1** and **0.2** (both owner-blocked), **1.7's artifact-path half**, **2.3**
+and **2.4**, the parts of **3.1** that need network egress, the review-time citation check in
+**3.3**, **4.2's** full Windows support, and all of **Tranche 5**.
+
 ---
 
 ## Tranche 0 — Owner actions. Nothing downstream is real until these land.
@@ -86,6 +97,17 @@ identifier's own authority host, not anywhere in an arbitrary string, and refuse
 local `Read` as a fetch for a remote identifier. Needs a decision-log entry: this changes
 what counts as evidence, which is the heart of DEC-F9.
 
+**Done — DEC-F12.** `canonical.fetched_identifier` credits an identifier only from an
+`http`/`https` fetch whose host is an authority for that identifier's scheme (host or
+dot-anchored subdomain, so `notarxiv.org` fails and `export.arxiv.org` passes), and
+`VerificationLogChecker.check_tool_honesty` matches a `canonical_id` entry by identifier
+only — a raw-target match can no longer back a scholarly claim, while an entry making no
+such claim still accepts one, so reading the artifact under review keeps working.
+Authorities are `HarnessSettings.identifier_authority_hosts`, threaded from settings at the
+composition root, so a mirror or DOI proxy is configuration. `canonicalize` is deliberately
+unchanged: it is right for identity bucketing, and the defect was trusting its output as
+proof of retrieval. Decoy-URL and local-`Read` cases are now tests rather than a blessing.
+
 ### 1.2 The staleness severity cap never fires
 
 `models/oracle.py:108-114` returns
@@ -110,6 +132,15 @@ long a *previously verified* source stays trusted. That reading matches the orac
 own warning that transcription without resolution is the defect class the file exists to
 catch. Needs a decision-log entry, since it changes published severities, and a test that
 fails on the inert case.
+
+**Done — DEC-F13.** The grace budget defaults to zero, so a row with no verified source is
+stale from the first review and its findings are capped at
+`severity_policy.unverified_row_cap`. `max_rebaselines_without_verification` keeps its
+meaning, its schema position and its mechanism, so an operator who wants a grace window
+raises it and owns that; no migration was needed. `sutton.v2.yaml` sets it to `0` with the
+reason inline. `OracleLoader` now emits `oracle.unverified_rows_uncapped` at WARNING when a
+corpus combines blocker-tier unverified rows with a nonzero budget, which is the
+configuration that let this survive silently.
 
 ### 1.3 A concurrent review can erase the charter-review escalation
 
@@ -146,6 +177,17 @@ markdown are all built from the stale snapshot, so the verdict is already wrong.
 at `state.py:107` is unlocked and races with `--reset-state` too. DEC-F4 states single-writer
 is assumed, so this needs a superseding entry. No test exercises the lock.
 
+**Done — DEC-F14, superseding part of DEC-F4.** `StateStore.save` takes
+`expected_cycle: int | None = None` and `FileStateStore` re-reads the stored cycle under the
+lock it already holds, raising `StateConflictError` on a mismatch; the pipeline passes the
+cycle it loaded. The keyword default keeps every existing implementation and test double
+working — the protocol widened rather than broke. The run aborts (exit 6) rather than
+retrying, because by `save` the verdict, report and rendered markdown are already built from
+the stale snapshot. State that has become unreadable at that point is reported as a conflict
+rather than a `StateCorruptError`, so a concurrent writer's partial file is not
+misattributed to this run. `reset()` takes the same lock. The lock is now exercised by
+`tests/unit/test_filelock.py` and the conflict path by `tests/unit/test_state.py`.
+
 ### 1.4 `Glob` patterns are unchecked, and the hook is fail-open outside four tools
 
 `harness/llm/claude_sdk.py:35,80` reads the target from `("file_path", "path")` and falls
@@ -170,6 +212,19 @@ channel for an artifact that can steer the model's search terms.
 default; and either drop `WebSearch` from the default tool set or state in DEC-F9 why an
 unconstrained query is acceptable. Also handle a `null` `tool_input` at `claude_sdk.py:65`,
 which currently raises inside the hook.
+
+**Done — DEC-F15.** The `HookMatcher` carries no matcher, so the hook sees every tool, and
+it denies by default: a call is allowed only when explicitly scoped or when its tool is in
+the new `unscoped_tools` setting. `Glob`'s `pattern` is scoped as a path via
+`security.glob_pattern_root` plus the existing containment predicate, and per-tool argument
+shapes are data (`_TOOL_SCOPES`) so `Grep`'s regex is not mistaken for a path while its
+`glob` is scoped. A present-but-empty path key is a denial. A null or non-mapping
+`tool_input` is normalised to an empty mapping and judged on its merits, since whether the
+SDK reads a hook exception as allow or deny is not something to depend on. `WebSearch` was
+kept in the default set with its residual risk written down rather than dropped, and now
+logs `security.websearch_issued` with the query's length and never its text; a multi-tenant
+deployment must empty `unscoped_tools`. The test that enshrined the fail-open behaviour is
+replaced by `TestPreToolUseClosedHoles`.
 
 ### 1.5 The internal-host filter misses non-dotted-quad IPv4 literals
 
@@ -198,6 +253,14 @@ allowlist unconditionally, so this needs no artifact cooperation.
 name or a canonical IP literal, add RFC 6598 to the reserved set, and require the scheme to
 be `http` or `https`.
 
+**Done — DEC-F15.** `security._as_ip_address` normalises through `socket.inet_aton`, the
+same parser a real fetcher uses, so the gap is closed at its source rather than by
+pattern-matching the four known spellings. Hostnames are unaffected: `inet_aton` rejects
+anything with a letter that is not a hex-digit prefix. `not is_global` is checked alongside
+the explicit categories, which brings in RFC 6598 — neither predicate is sufficient alone,
+since IPv4 multicast is `is_global`. `is_fetch_allowed` now rejects any scheme outside
+`{http, https}`. `tests/unit/test_security.py` parametrizes the non-canonical forms.
+
 ### 1.6 Model prose injects markdown into the published report
 
 `harness/security.py:22` defines `_CONTROL_CHARS` as `[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]`, so
@@ -217,6 +280,23 @@ Zero-width and bidi characters survive too — `U+200B`, `U+202E`, `U+2066`, `U+
 `launder_prose`, and escape every model-supplied field at the renderer rather than only
 table cells. `tests/unit/test_security.py:288` checks only NUL, ESC and the length cap.
 
+**Done — DEC-F16.** `launder_prose` folds line breaks, tabs and the other layout characters
+to a single space *before* deleting control characters (so `\v` and `\f` do not splice two
+words together), removes Unicode category `Cf`, maps non-breaking spaces, and collapses
+whitespace runs; it is idempotent, which matters because prose passes through once per
+repair-loop iteration. The renderer escapes every model-supplied field it emits — the verdict
+headline, the escalation message, the `what_survives` and `residual_risks` bullets, the
+scope-item reference and the model-supplied `row_id` — not just table cells, and `_md_escape`
+handles `\r` as well as `\n`. Harness-assigned structural fields are left alone, which a test
+asserts rather than assumes.
+
+**Still open, small:** `pipeline.py` still passes `sweep.judgement.scope` into the report
+without laundering it (DEC-F16's text says otherwise). The published report is safe — the
+renderer escapes `ScopeItem.reference` — but the value serialised into `--output-json` is
+unlaundered, so the `max_prose_chars` cap and the format-character strip do not apply to it.
+Launder it at assembly like every other prose block, and correct DEC-F16's wording in the
+same pass.
+
 ### 1.7 Symlink handling on the write and read paths
 
 `harness/state.py:47,88-91` — `tmp_path.write_text` and the lock-file `open` both follow an
@@ -234,6 +314,22 @@ the size cap before an unbounded `read_bytes()`.
 
 **Do:** `O_NOFOLLOW | O_EXCL` on the tmp and lock files, `fsync` before `os.replace`, and a
 regular-file check plus a containment check against `--artifact-repo` on the artifact path.
+
+**Done, the write half — DEC-F14.** Locking and atomic writes moved into
+`harness/filelock.py`. The tmp path is unlinked and re-created with `O_EXCL` (`unlink`
+removes a symlink itself, never its target), the lock opens with `O_NOFOLLOW`, and content is
+fsynced before the rename with the directory entry fsynced after. Writing the tests found a
+further defect in the original code: the partial-file cleanup was scoped to `except OSError`,
+so a non-`OSError` failure mid-write left the fragment on disk — the exact case the earlier
+"partial state files" fix was meant to cover. It is a `finally` now.
+
+**Still open, the read half.** `harness/artifact.py` is unchanged: nothing checks
+`is_symlink()` or `S_ISREG`, so a symlink at `docs/design.md` inside a reviewed worktree —
+the documented `--artifact-repo` flow, and something git carries — is still read and sent to
+the model, and `path.stat().st_size` still reports 0 for a character device, passing the size
+cap before an unbounded `read_bytes()`. The containment check against `--artifact-repo` is
+also not written. This is the smaller half by exposure (a read the operator asked for, not a
+write primitive) but it is the half that is still open.
 
 ### Controls that were attacked and held
 
@@ -271,6 +367,11 @@ have and this is not among them.
 **Do:** fail when `total` is 0 or falls below the baseline by more than a declared
 tolerance, and add the case to `TestMalformedInputFailsLoudly`.
 
+**Done.** `total` is gated downwards against the baseline with a named tolerance
+(`MAX_POPULATION_SHRINK_RATIO`), a collapse to zero fails outright with a message saying why
+the categories above it are meaningless, and the docstring now lists the failure mode it
+omitted. Covered in `tests/unit/test_mutation_baseline.py`.
+
 ### 2.2 The weekly live-SDK job has never run a test
 
 `live.yml` runs `uv run pytest -m live`, and the only live test skips itself when
@@ -280,6 +381,10 @@ evidence the SDK surface has not drifted. It is evidence of nothing.
 
 **Do:** fail when the secret is missing rather than skipping, so the false green cannot
 recur after the key is added and later rotated. Worth doing before 0.2, not after.
+
+**Done.** `live.yml` gains a pre-flight step that fails the job with a message before pytest
+runs when `ANTHROPIC_API_KEY` is absent. The fork guard is unchanged. This is now waiting on
+0.2 rather than hiding it.
 
 ### 2.3 `ClaudeSDKAdapter.generate()` is verified by nothing
 
@@ -292,6 +397,11 @@ touches the SDK.
 **Do:** one test that monkeypatches `claude_agent_sdk.query` and calls the public
 `generate()`, and one covering the `ImportError` to `LLMTransportError` branch.
 
+**Still open.** Nothing in `tests/unit/test_claude_sdk_adapter.py` calls `generate()`; the
+DEC-F15 work added tests around the hook, which is reached through `_options`, not through
+the SDK bind. This is the last Tranche 2 item that has not moved, and it did not move because
+the branch's changes to that module were all in the hook.
+
 ### 2.4 The security tests for DEC-F11 can silently vanish
 
 `tests/unit/test_claude_sdk_adapter.py:128,143,156,209` gate the `PreToolUse` enforcement
@@ -302,6 +412,12 @@ happens to use `--all-extras`. The tests do run in the locked dev environment, s
 verification claim is honest about existence; 1.4 is about their coverage.
 
 **Do:** hard import, plus one test asserting the `llm` extra is present in the dev sync.
+
+**Still open, and now larger.** The DEC-F15 work added `TestPreToolUseClosedHoles`, whose
+`_hook` helper is gated behind the same `pytest.importorskip("claude_agent_sdk")`. Every test
+covering the three holes that fix closed therefore vanishes in an environment synced without
+`--all-extras`, alongside the ones this item already named — so the sandbox-escape class is
+now bigger, not smaller, and still silently skippable.
 
 ### 2.5 The report contract is asserted only by regenerable goldens
 
@@ -317,6 +433,11 @@ goldens guard formatting and unit tests guard existence. Fix
 `test_no_environment_leaks_into_goldens` while there: its Windows path pattern `[A-Z]:\\\\`
 requires two literal backslashes and is a dead branch.
 
+**Done.** `tests/unit/test_report_contract.py` asserts the marker and every required section
+directly, with no reference to the golden files, so the goldens guard formatting and these
+guard existence. The Windows-path pattern is fixed and covered by a test that it matches a
+real leak.
+
 ### 2.6 `assets validate` passes on a gutted `.claude`
 
 `harness/assets.py:187-217` glob-walks `agents/*.md`, `skills/*/SKILL.md` and `hooks/*.sh`,
@@ -326,6 +447,11 @@ the pytest suite, which the `data-validate` CI job does not run.
 
 **Do:** fail on an empty inventory, mirroring the `"no oracle files found"` guard at
 `cli.py:110`.
+
+**Done.** The expected inventory is data (`EXPECTED_ASSET_KINDS`, one `AssetKind` per
+directory) rather than literals inside `collect`, and an empty result for any kind is a
+defect. `settings.json` is named separately for the same reason: the hooks it wires up do not
+run without it, and its absence was silent.
 
 ### 2.7 The PostToolUse hook does not cover every edit tool
 
@@ -338,6 +464,11 @@ nothing tests the wiring — the matcher could be `"Bash"` and every test would 
 same file: `tests/unit/test_assets.py:189` writes `_hooktest_broken.yaml` into the real
 `src/creative_agent/data/oracles/`, and an interrupted run leaves it behind and breaks
 `make oracles`, in a suite containing `TestTheSuiteDoesNotMutateTheRepository`.
+
+**Done.** The matcher covers `MultiEdit` and `NotebookEdit`, and a test asserts the wiring
+rather than only running the scripts by subprocess — which bypasses the matcher entirely, so
+it could have named `Bash` and the suite would have stayed green. The hook test now writes
+its broken oracle into a tmp search path instead of the packaged directory.
 
 ### 2.8 The container gate is asserted statically and the assertion has a hole
 
@@ -353,6 +484,12 @@ passes.
 **Do:** add `CLAUDE.md` to the `COPY`, run the `test` stage in CI, and make the scan resolve
 parametrize lists rather than adjacent literals.
 
+**Done.** `CLAUDE.md` is copied, the `container` job builds the `test` target and runs the
+gate inside it, and the dependency scan resolves parametrized path lists via the AST. Two
+tests guard the scan itself — one that it still discovers the known dependencies, one on a
+synthetic module that a parametrized path is seen — and a third that it does not
+over-collect, since a scan demanding `COPY` lines for strings nobody opens gets deleted.
+
 ### 2.9 Smaller gate repairs
 
 - `tests/unit/test_project_config.py:196` skips the leaked-state detector when
@@ -364,6 +501,12 @@ parametrize lists rather than adjacent literals.
   run with no signal.
 - The CI-covers-`make gate` test greps only `run: make <target>`, so any check added as a
   raw step is invisible to the comparison. That blind spot is why 2.8 went unnoticed.
+
+**Done, all three.** The leaked-state detector asserts the directory exists instead of
+skipping. `pyproject.toml` sets `--strict-markers` and `filterwarnings = ["error"]`, and the
+suite needed no allowances. The CI test now accounts for every step: setup, a `gate`
+dependency, or an entry in `CHECKS_OUTSIDE_THE_GATE` carrying its reason — and each declared
+exception must match a real step, so a stale entry cannot quietly widen what is accepted.
 
 ---
 
@@ -402,6 +545,22 @@ request with the diff, rather than a manual local step. Ship incrementally. Sepa
 failure and a proxy block alike, so an operator cannot tell "arXiv is down" from "this
 identifier does not exist" — give the failure modes distinct detail strings.
 
+**Done, the hand-resolved part.** The three rows above are now `verified: true` with
+`last_verified: 2026-09-02` and a note on each source recording how it was resolved and that
+`arxiv.org` was unreachable from the review environment. The file header now also states,
+per row, which sources are expected to stay unverified forever — a blog post (D1), a book
+chapter (D3), an OpenReview workshop paper (D4), an author-hosted PDF (D7's second source and
+D10) and an unpublished talk (D12) have no resolvable archival identifier — so the cap is
+their correct end state, not a backlog item.
+
+**Still open, and it needs egress.** D9's and D10's identifiers are still untranscribed and
+the two rows stay `verified: false`; the scheduled rebaseline job with network access, opening
+a pull request with the diff, is not built. The failure-mode detail strings are unchanged: the
+arXiv backend already distinguishes a transport error, a malformed feed, an empty feed and an
+arXiv error entry, but a proxy 403 still surfaces only as the transport exception's text, so
+"blocked here" and "arXiv is down" still read alike. The Crossref backend added in 3.2 has the
+same shape and the same limitation.
+
 ### 3.2 Add a DOI resolver, and reconsider what `verified` gates
 
 `harness/citations.py:43-45` returns `skipped` whenever `arxiv_id` is absent. There is no
@@ -420,6 +579,21 @@ the IDBD reference stay unverified, which for a blog post, a book chapter, an Op
 workshop paper and an unpublished talk is the correct end state, not a failure. Consider
 marking an unresolvable-by-construction source as such in data rather than sharing a flag
 with "not yet checked".
+
+**Done.** `CrossrefCitationResolver` resolves DOI-identified sources and
+`CompositeCitationResolver` dispatches to whichever backend can identify a source, with
+`oracles rebaseline` wiring arXiv first and Crossref second. The Crossref backend mirrors the
+arXiv one's contract including both of its hard-won refusals — a source declaring no authors
+is `unreachable` rather than auto-verified, and a transport or shape failure is `unreachable`
+rather than `mismatch`. The composite reports `skipped` only when every backend skipped, so a
+source with no resolvable identifier says so instead of borrowing another backend's failure.
+`crossref_api_url` and `citation_user_agent` are settings; the user agent deliberately is not
+an operator email.
+
+**Deliberately not done:** the "unresolvable by construction" data flag. It stays a
+suggestion. The distinction is currently carried in the oracle file's header prose, which is
+weaker than a field but does not add a schema version to a format that has one — revisit it
+when a second corpus makes the case.
 
 ### 3.3 Make `--offline` honest about what it cannot do
 
@@ -458,6 +632,17 @@ review-offline` and `make docker-review` are pass-throughs as written, and anyon
 review time, which is the largest fidelity gap that does not need an API key, and which
 also closes the fabricated-citation hole 1.1 leaves open from the other side.
 
+**Done, the banner.** `creative-agent review --offline` prints a ceiling banner to **stderr**
+— stderr because the rendered report on stdout is a byte-stable published contract — saying
+that the run performed deterministic checks only, and, in `auto` mode, that it resolves to
+advisory and therefore could not have failed on content, naming `--mode conformance` as the
+gating alternative. A test asserts the banner stays out of the `--output-json` payload.
+`README.md` carries the same statement where a user reads before wiring `--offline` into CI.
+
+**Still open: the review-time citation-existence check.** Resolution still lives only in
+`oracles rebaseline`, so a fabricated identifier in the artifact is still not caught at review
+time from either side. This remains the largest fidelity gap that needs no API key.
+
 ### 3.4 Fix the budget knobs before measuring anything with them
 
 The previous plan said the budget settings are "plumbed but never exercised". One is not
@@ -481,6 +666,19 @@ of "roughly twenty".
 when the run budget is exhausted; wrap `generate` in an `asyncio.timeout`; give the abort
 its own error class and exit code, since a partial sweep must not be published under the
 never-soften rule. Then measure. The measurement stays blocked on 0.2.
+
+**Done — DEC-F17.** Cost accumulates across `sweep.calls` and is checked inside `_call`'s
+attempt loop, before each provider call, so one logical call cannot burn several times what
+is left; a backend reporting no cost contributes zero rather than aborting the run. Each call
+runs under `asyncio.timeout(llm_timeout_seconds)`, making that setting live. Both raise
+`RunAbortedError` subclasses carrying the new `ExitCode.RUN_ABORTED = 6`, and a test asserts
+an aborted run writes no state and publishes no report. Enforcement lives in `pipeline.py`
+rather than the SDK adapter, because that adapter is the one approved coverage omit (DEC-F8)
+and a budget check written there would ship unmeasured.
+
+**Still blocked on 0.2:** the measurement itself. What a real review costs and how long it
+takes is unknown until something runs against the live SDK, so the settings now enforce a
+number nobody has calibrated.
 
 ---
 
@@ -509,6 +707,17 @@ needs a frozen copy of the old field list to mean anything.
 
 **Size:** roughly 10-14h, 2 pull requests, plus a decision-log entry.
 
+**Done — DEC-F18.** `harness/migrations.py` holds one reusable `MigrationChain`, applied
+between the version read and `model_validate` in both `harness/oracle.py` and
+`harness/state.py`. The chain is empty (v1 is current for both), so it is an identity pass
+whose plumbing is tested, and `supported_versions` truncates at a gap rather than skipping a
+version, so a half-registered chain cannot claim to read a file it would mangle. The frozen
+v1 oracle fixture is at `tests/fixtures/oracle/v1-example.yaml` — frozen bytes with a header
+saying not to regenerate it, because `tests/factories.py::make_oracle` builds against the
+live model and can never prove a v1 file still loads. Both durable read formats now have one.
+The report contract is excluded and stays excluded: it has no read side, so what it needed
+was a documented consumer promise, which `README.md` now carries.
+
 ### 4.2 State POSIX-only, or support Windows properly
 
 There are two independent Windows breaks, not one:
@@ -532,9 +741,31 @@ silently claims portability it does not have. A README line, a classifier and a 
 10-22h and 2-3 pull requests, most of it the unbounded cost of a `windows-latest` leg the
 suite has never seen.
 
+**Done, the recommended half — and more than the recommendation.** `pyproject.toml` carries
+`Operating System :: POSIX`, `POSIX :: Linux` and `MacOS` classifiers, and `README.md` and
+`docs/architecture.md` say POSIX is what is tested and that there is no Windows CI leg. Both
+breaks are actually fixed rather than merely declared: `fcntl` moved behind
+`harness/filelock.py`, which binds both platform backends at module scope so the non-POSIX
+branch is substitutable in a test rather than pragma'd past the coverage gate, and
+`assets validate`'s execute-bit check is POSIX-gated. The four CRLF-emitting `write_text`
+calls pin `newline="\n"`, with a test scanning `src/` so a fifth cannot appear, and a second
+test forbids a bare `import fcntl` outside the locking module.
+
+**Still open: full Windows support.** No `windows-latest` CI leg exists, so nothing above is
+verified on Windows — the classifier states what is tested, and that is the point of it. The
+`msvcrt` locking branch is exercised only by substitution, and the "clean `ConfigError`
+instead of an exit-5 crash" fallback is not written; `FileLockUnavailableError` is a bare
+`RuntimeError` and would still surface as exit 5 on a platform with neither backend. The
+10-22h estimate stands, and most of it is still the unbounded cost of a leg the suite has
+never seen.
+
 ---
 
 ## Tranche 5 — Longer term. Not before the reviewer has been used in anger.
+
+Neither item has moved, and neither should have: the precondition is use, not effort. The
+reviewer has still never run against the live SDK (0.2), so nothing yet says which parts of
+the harness generalise.
 
 ### 5.1 The `adversarial-reviewer` companion
 
@@ -557,21 +788,33 @@ different corpora combine is a product decision before it is an engineering one.
 
 Small, and all of it is the honesty class this repository polices in others.
 
-- `CHANGELOG.md:14` still says the Unreleased work is "not yet in `main`". PR #7 merged on
-  2026-08-22. This is the second time this exact line has gone stale.
-- `CHANGELOG.md` says the `inspect-state` skill's guard "subprocess-confirms every command
+- ~~`CHANGELOG.md:14` still says the Unreleased work is "not yet in `main`". PR #7 merged on
+  2026-08-22. This is the second time this exact line has gone stale.~~ **Done**, and the
+  line now scopes what the section covers rather than asserting where it lives.
+- ~~`CHANGELOG.md` says the `inspect-state` skill's guard "subprocess-confirms every command
   it names". It does not. `tests/unit/test_assets.py:129` uses `CliRunner` in-process, and
-  the test's own docstring says so. The test is sound; the changelog overclaims it.
+  the test's own docstring says so. The test is sound; the changelog overclaims it.~~
+  **Done.** The entry now says what the test does, and says that it previously overclaimed.
 - `pyproject.toml:11` declares `license = { text = "MIT" }` and there is no `LICENSE` file
-  in the repository. The package claims a licence it does not ship.
+  in the repository. The package claims a licence it does not ship. **Still open** — the file
+  is still absent.
 - DEC-F9, DEC-F11 and `docs/architecture.md` §8 each assert a control that 1.1, 1.4 and 1.5
   show does not hold as written. Correct the text in the same pull requests that fix the
-  code, so the decision log never describes a mechanism that is not there.
+  code, so the decision log never describes a mechanism that is not there. **Half done.**
+  `docs/architecture.md` §8 is rewritten: the tool-honesty bullet now describes authority
+  binding and says outright that the previous text asserted the opposite, the fetch bullet
+  covers the non-canonical IPv4 forms, RFC 6598 and the scheme check, and read scoping has
+  its own deny-by-default bullet. The decision log took the other route: DEC-F9's and
+  DEC-F11's original text is left intact and DEC-F12, DEC-F15 and DEC-F16 supersede or extend
+  them, each stating what the earlier entry got wrong. That is defensible for an append-only
+  log, but a reader who stops at DEC-F9 still reads a claim that no longer holds, so the two
+  older entries need a forward pointer.
 - The version is still `0.1.0` with no tag and no dated release section. Once Tranches 1 and
-  2 land, cut `0.2.0`.
+  2 land, cut `0.2.0`. **Now actionable:** Tranche 1 is complete apart from 1.7's read half,
+  and Tranche 2 apart from 2.3 and 2.4.
 - Deterministic findings render under `placeholder_row_id: "-"`, producing keys like
   `-+duplicate-definition-alpha` in `state show`. Cosmetic, but it is the operator-facing
-  identifier for the recurrence mechanism.
+  identifier for the recurrence mechanism. **Still open**, unchanged.
 
 ---
 

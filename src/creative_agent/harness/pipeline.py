@@ -56,6 +56,7 @@ from creative_agent.models.sweeps import (
     ClassifyResult,
     JudgementSweepResult,
     RowDisposition,
+    ScopeItem,
     SourceQualityResult,
     SynthesisResult,
 )
@@ -151,6 +152,13 @@ class ReviewPipeline:
                 total += float(cost)
         return total
 
+    def _remaining_budget(self, sweep: _SweepState) -> float | None:
+        """What is left of `max_budget_usd` for this run, or None when uncapped."""
+        budget = self._settings.max_budget_usd
+        if budget is None:
+            return None
+        return max(budget - self._spent_usd(sweep), 0.0)
+
     def _check_budget(self, sweep: _SweepState, *, kind: CallKind, ref: str) -> None:
         budget = self._settings.max_budget_usd
         if budget is None:
@@ -223,6 +231,9 @@ class ReviewPipeline:
                 fetch_domain_allowlist=context.get("fetch_domains", []),  # type: ignore[arg-type]
                 allowed_read_roots=context.get("read_roots", []),  # type: ignore[arg-type]
                 context={**context, "repair_defects": defects},
+            )
+            prompt = prompt.model_copy(
+                update={"remaining_budget_usd": self._remaining_budget(sweep)}
             )
             # Budget is checked *inside* the attempt loop, before each provider call, so a
             # single logical call cannot burn several times the remaining budget: `_call`
@@ -399,7 +410,13 @@ class ReviewPipeline:
 
     async def _run(self, request: ReviewRequest, review_log: dict[str, object]) -> PipelineOutcome:
         state = self._state_store.load(request.artifact_id)
-        artifact_text = read_artifact(request.artifact_path, self._settings.max_artifact_bytes)
+        artifact_text = read_artifact(
+            request.artifact_path,
+            self._settings.max_artifact_bytes,
+            # A reviewed worktree is untrusted, and git carries symlinks: an artifact
+            # path that resolves outside the repository under review is refused.
+            containment_root=request.artifact_repo,
+        )
         fetch_domains = self._guard.fetch_domain_allowlist(artifact_text)
         rejected_hosts = self._guard.rejected_fetch_hosts(artifact_text)
         read_roots = self._guard.allowed_read_roots(
@@ -656,7 +673,10 @@ class ReviewPipeline:
             ],
             what_survives=self._guard.launder_all(final_synthesis.what_survives),
             residual_risks=self._guard.launder_all(final_synthesis.residual_risks),
-            scope_items=sweep.judgement.scope if sweep.judgement else [],
+            # DEC-F16 claimed these were laundered and they were not: only the
+            # renderer's pipe/newline escape ran, so a bidi override or a zero-width
+            # run reached the report and the length cap never applied.
+            scope_items=self._laundered_scope(sweep),
             verification_log=self._all_entries(sweep),
             escalation=escalation,
         )
@@ -724,6 +744,15 @@ class ReviewPipeline:
             rendered=rendered,
             state_path=str(state_path),
         )
+
+    def _laundered_scope(self, sweep: _SweepState) -> list[ScopeItem]:
+        """Scope references are model prose and pass through ThreatGuard like the rest."""
+        if sweep.judgement is None:
+            return []
+        return [
+            item.model_copy(update={"reference": self._guard.launder_prose(item.reference)})
+            for item in sweep.judgement.scope
+        ]
 
     def _write_audit_bundle(self, request: ReviewRequest, cycle: int, sweep: _SweepState) -> None:
         bundle_dir = self._settings.review_log_dir / request.artifact_id / f"cycle-{cycle}"

@@ -510,24 +510,74 @@ Where each control sits:
   `SourceRef` URLs, the resolver hosts (`arxiv.org`, `doi.org`), and the artifact's own
   bibliography — never a hard-coded vendor list. Hosts harvested from the untrusted
   artifact are then filtered against the internal-host policy: loopback, private,
-  link-local, reserved and multicast IP literals, cloud metadata addresses, configured
-  internal suffixes, and single-label names. A rejected host is logged as
-  `security.fetch_hosts_rejected` rather than silently dropped. Read/Grep/Glob are scoped
-  to the artifact directory, the oracle directories, and the artifact repo. Permission
-  mode comes from settings and is never `bypassPermissions`.
+  link-local, reserved and multicast IP literals, cloud metadata addresses, the RFC 6598
+  carrier-grade NAT range at 100.64.0.0/10, configured internal suffixes, and single-label
+  names. Non-canonical IPv4 literals are covered too: `ipaddress` accepts only dotted quads,
+  so `127.1`, `127.0.1`, `0x7f.0.0.1` and `0177.0.0.1` were all classified as public while
+  any real fetcher expands them to loopback. Hosts now normalise through `socket.inet_aton`,
+  the parser those callers use, and `not is_global` is checked alongside the explicit
+  categories — neither predicate is sufficient alone, since IPv4 multicast is `is_global`.
+  `is_fetch_allowed` also checks the **scheme**: host membership said nothing about how a URL
+  would be dereferenced, so `file://arxiv.org/etc/passwd` passed on every review, needing no
+  cooperation from the artifact because the resolver hosts are on every allowlist
+  unconditionally. Only `http` and `https` are fetchable. A rejected host is logged as
+  `security.fetch_hosts_rejected` rather than silently dropped. Permission mode comes from
+  settings and is never `bypassPermissions`.
+- **Read scoping, deny-by-default.** The `PreToolUse` hook matches **every** tool, not a
+  named set, and allows a call only when it is explicitly scoped or the tool is listed in
+  `HarnessSettings.unscoped_tools`; an unrecognised tool is denied and logged. `Read`, `Grep`
+  and `Glob` are checked against the computed read roots — the artifact directory, the oracle
+  directories, and the artifact repo when `--artifact-repo` is given — **including their
+  path-shaped glob arguments**. `Glob` takes a required `pattern` and an optional `path`, so
+  the pattern is what decides where a search starts; scoping takes its longest leading
+  literal segment, joins it to the call's base directory, resolves it and applies the same
+  containment predicate, which denies `/etc/**/*` and `../../**/*` while allowing a plain
+  `*.md`. `Grep`'s `pattern` is a regex, not a path, and only its `glob` filters paths —
+  scoping the regex would deny a legitimate search for a path-looking string inside the
+  artifact — so per-tool argument shapes are data rather than an `in (...)` chain. A
+  present-but-empty path key is a denial rather than a fallback to the working directory,
+  and a relative path resolves against the tool call's own reported `cwd`, never this
+  process's. `WebSearch` ships in `unscoped_tools` with its residual risk accepted: its query
+  is unconstrained, so an artifact that can steer the model's search terms has an outbound
+  channel, and issuance is logged with the query's *length* and never its text. A
+  multi-tenant deployment must empty that list.
 - **Output laundering.** Every LLM prose field that reaches the rendered report — finding
   summaries, dispositions, the headline, what-survives and residual-risks — passes through
-  `launder_prose`: control characters removed, length capped at `max_prose_chars`. The
-  renderer additionally escapes pipes and newlines for the markdown tables, and the model
-  never emits the report itself.
+  `launder_prose`: line breaks and tabs folded to a single space (folded before control
+  characters are deleted, so `\v` and `\f` do not splice two words together), C0/C1 control
+  characters removed, Unicode format characters removed (category `Cf`: zero-width spaces,
+  bidi overrides and isolates, the BOM), whitespace runs collapsed, and length capped at
+  `max_prose_chars`. Laundering is idempotent, which matters because prose passes through
+  once per repair-loop iteration. The renderer does not rely on its caller having laundered
+  correctly: it escapes every model-supplied field it emits — the verdict headline, the
+  escalation message, the what-survives and residual-risk bullets, scope-item references and
+  the model-supplied `row_id` — not only table cells, and escapes `\r` as well as `\n`
+  because most markdown renderers break a line on a bare carriage return. The model never
+  emits the report itself. Structural fields the harness assigns, such as `finding_id`, are
+  not model input and are deliberately left alone.
 - **The tool-honesty check.** This is the control that makes the verification log worth
-  reading. `fetched=True` is verified against observed tool **results** with
-  `is_error == False`, matched on canonicalized arXiv ids and DOIs so that `/abs` versus
-  `/pdf`, version suffixes and redirects neither defeat nor fake-satisfy the check.
-  `WebSearch` is excluded from the fetch-tool set by default: snippets support existence,
-  never content and never absence. The companion attribution sweep rejects invented
-  positions ("X would argue", "X believes") for any author named in the oracle's sources,
-  matched diacritic-folded. Any defect the repair budget cannot clear raises
+  reading, and it is **authority-bound**. `fetched=True` is verified against observed tool
+  **results** with `is_error == False`; an identifier enters the observed-evidence set only
+  from a successful fetch-class result whose target is an `http`/`https` URL *and* whose host
+  is an authority for that identifier's scheme, matched on the host or a dot-anchored
+  subdomain so `notarxiv.org` cannot pass as `arxiv.org` while `export.arxiv.org` does.
+  Authorities are configuration (`HarnessSettings.identifier_authority_hosts`), so an
+  institutional mirror or a DOI proxy is a settings change rather than a code change.
+  Entries are then matched by kind: an entry naming a `canonical_id` is a scholarly claim and
+  must be matched by identifier, while an entry with no `canonical_id` makes no scholarly
+  claim and may still be satisfied by an exact target match, which keeps a legitimate `Read`
+  of the artifact under review working. This document previously said the opposite — that
+  canonical matching meant URL noise "neither defeats nor fake-satisfies" the check.
+  Canonicalization is a substring match over an arbitrary string, which is right for identity
+  bucketing and wrong as proof of retrieval: it was exactly what made the check
+  fake-satisfiable, by a decoy URL on any allowlisted host and by a local `Read` of a file
+  whose name the artifact's own author controls (DEC-F12). The consequence for reviewers is
+  deliberately strict: a DOI claim is creditable only from a `doi.org` fetch, not from the
+  publisher page a DOI redirects to, and the failure direction is a refused review, never a
+  published false claim. `WebSearch` is excluded from the fetch-tool set by default: snippets
+  support existence, never content and never absence. The companion attribution sweep rejects
+  invented positions ("X would argue", "X believes") for any author named in the oracle's
+  sources, matched diacritic-folded. Any defect the repair budget cannot clear raises
   `ReviewFailedError` and exit code 3 — the review refuses to publish rather than
   softening.
 - **The model is never taken at its word on structure.** Required sections are read from
@@ -536,7 +586,29 @@ Where each control sits:
   during assembly and, in `SeverityPolicy`, contribute no corroboration — so citing a
   non-existent row can never lift a severity cap.
 
+- **The state path is a write target, not just a trusted file.** The state temp file and the
+  lock file are opened without following symlinks — the temp file is unlinked and re-created
+  with `O_EXCL`, since `unlink` removes a symlink itself rather than its target, and the lock
+  opens with `O_NOFOLLOW` — because a symlink planted at either path previously turned an
+  atomic state write into an arbitrary-file overwrite with partly attacker-influenced
+  content, plus a truncate primitive via the lock. Content is fsynced before `os.replace`, so
+  "atomic" survives a crash and not only an interleaving; `os.replace` onto the final path
+  was already safe.
+
 What is deliberately outside the boundary: the oracle YAML files and prompt templates are
 trusted configuration owned by the operator, and `docs/review-log/<id>.md` is trusted
-state written only by this harness under a per-artifact lock, with single-writer semantics
-assumed and documented.
+state written only by this harness. Concurrency is no longer assumed away: a second review
+of the same artifact is **detected and refused**, not merged and not serialised.
+`FileStateStore.save` re-reads the stored cycle under the lock that guards the write and
+raises `StateConflictError` (exit 6) when it no longer matches the cycle the caller loaded,
+because by that point the verdict, the report and the rendered markdown are all built from a
+snapshot that no longer describes the artifact's history — and the recurrence count that
+drives the cycle-3 charter-review STOP is part of what was lost. The lock itself stays
+advisory and single-host by design; correctness against a concurrent writer comes from that
+cycle check, not from the lock (DEC-F14, superseding the part of DEC-F4 that said
+single-writer was assumed and documented).
+
+Two residual risks are documented and declined rather than fixed, both because closing them
+needs a fetcher the harness does not own: a `WebFetch` redirect chain from an allowed host to
+an internal one is invisible to a hook that sees only the initial URL, and an authority-bound
+fetch is credited without inspecting the response body (DEC-F11, DEC-F12).

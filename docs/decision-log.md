@@ -365,3 +365,75 @@ shipped product data for engine behaviour.
 the markdown and serialised into `--output-json`, and nothing anywhere parses a report
 back. A migration chain for a format with no read side would be ceremony. What that
 contract needs is a documented consumer promise, which `README.md` now carries.
+
+## DEC-F19 — Corrections to F12, F15, F16 and F17 after adversarial review — CONFIRMED
+
+DEC-F12 through DEC-F18 were implemented and then attacked by an independent review. Four
+of the entries asserted more than the code delivered. A decision log that overstates is
+worse than none, for the same reason those entries give about a validator that passes on
+nothing, so the corrections are recorded here rather than by editing the originals — what
+was believed at the time is part of the record.
+
+**F16 was false about the findings table.** "The renderer escapes every model-supplied
+field it emits" — it did not escape `doctrine_refs` or `gate_refs`, which are joined and
+interpolated raw into the Doctrine/gate cell. `gate_refs` is copied verbatim from the
+model's `CandidateFinding` and is an unconstrained `list[str]`, so a single entry closed
+the cell and opened a forged **Blocker** row in the published report: the exact defect the
+entry exists to close, in the exact table it names, surviving the fix that named it. Both
+ref lists now pass through `_md_escape`, and the guard is a test that counts data rows
+rather than one that greps for an escape sequence.
+
+**F16 was also false about `scope_items`.** "The pipeline launders `scope_items` like every
+other prose block" — nothing laundered them; only the renderer's pipe-and-newline escape
+ran, so a bidi override or a zero-width run reached the report and `max_prose_chars` never
+applied. They now pass through `ThreatGuard.launder_prose` with the rest.
+
+**F15's Glob claim held only for patterns whose first segment is literal.**
+`glob_pattern_root` trimmed the partial final segment with `rsplit("/", 1)[0]`, which
+returns `""` when the first metacharacter falls inside the first segment — and `""` reads
+as "relative to the base directory", which is allowed. `/etc*/*`, `/h*me/user/.ssh/*` and
+`/*` were all permitted; only `/etc/**/*` was caught. A one-character change walked past
+the check. The trailing separator is now kept, so an absolute pattern stays absolute, and
+brace or bracket groups containing a path separator, and leading `~`, are refused outright
+rather than guessed at. The original tests all used a literal first segment: they were
+written to the implementation rather than against it, and the replacements lead with the
+escapes.
+
+**F12 was opt-out.** The entry says an entry naming a `canonical_id` is judged by
+identifier and one without makes no scholarly claim. But `canonical_id` is optional and the
+model writes the entry, so the party the control constrains chose which branch judged it:
+omitting the field restored the original local-`Read` forgery verbatim, and a
+`canonical_id` that does not canonicalize fell through the same way. A source that carries
+a scholarly identifier is now judged by identifier however the entry is shaped, and an
+evidence target that canonicalizes can no longer be credited as plain-string evidence.
+
+**F12's authority binding constrained the host, not the retrieval.** `arxiv.org` and
+`doi.org` are on every computed allowlist unconditionally and both return 200 for arbitrary
+paths, so the decoy simply moved to the registrar: `arxiv.org/?x=arxiv.org/abs/<id>` was
+credited. Only the host and path are considered now; a query string or fragment is the
+model's choice of string, not evidence of what was served.
+
+**F12 would have failed legitimate reviews.** Requiring the host to be an authority for the
+scheme *canonicalization happened to pick* refused `doi.org/10.48550/arXiv.<id>` — arXiv's
+own DOI prefix, and the standard modern citation form — because canonicalization prefers
+arXiv and `doi.org` is not an arXiv authority. A conformance review citing a preprint
+through the DOI resolver the entry explicitly blesses would have exited 3. A port also
+defeated the match. The host must now be a registrar for *some* configured scheme;
+cross-registrar is deliberate, because a DOI registrar legitimately serves arXiv
+identifiers.
+
+**F17 understated the budget overshoot.** "A single logical call cannot burn several times
+the remaining budget" was true of the retry loop and false of the run: a pre-call check
+cannot know what the call will cost, so a $2 budget with $1.90 calls spent $3.80. Worse,
+the adapter still passed the raw setting to the SDK as a *per call* cap, so one number
+meant two different things and the practical bound was roughly twice the setting. The
+remaining run budget is now carried on `AssembledPrompt` and used as the backend's per-call
+ceiling, which bounds the overshoot at the budget itself.
+
+**Known and accepted, not fixed here.** `identifier_authority_hosts` reaches the honesty
+checker but not `ThreatGuard.fetch_domain_allowlist`, so configuring a mirror makes the
+checker accept a fetch the `PreToolUse` hook will deny; F12's "a mirror is a settings
+change" is therefore not yet true end to end, and is recorded in `docs/roadmap.md` rather
+than half-fixed. Deny-by-default has no live verification, because that needs the API key
+Tranche 0 is blocked on. `_EVIDENCE_SCHEMES` and `ALLOWED_FETCH_SCHEMES` are two literals
+for one policy.

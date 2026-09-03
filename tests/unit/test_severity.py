@@ -354,9 +354,15 @@ class TestStalenessCapFiresByDefault:
         assert row.is_stale(self.FRESHLY_TRANSCRIBED) is True
 
     def test_a_blocker_from_unresolved_doctrine_is_capped_from_the_first_review(self) -> None:
+        """Built from the MODEL DEFAULT, not an explicit budget of 0.
+
+        Passing `max_rebaselines_without_verification=0` explicitly made this test survive
+        a revert of the default that is the whole of DEC-F13 — it would have stayed green
+        with the defect restored. Omitting the field is what ties it to the fix.
+        """
         oracle = oracle_with(
             [make_row("D1", tier="PR", sources=[make_source(verified=False)])],
-            freshness=self.FRESHLY_TRANSCRIBED,
+            freshness=FreshnessMeta(last_rebaselined=date(2026, 1, 1), rebaseline_count=0),
         )
         finding = make_finding(
             severity=Severity.BLOCKER,

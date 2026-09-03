@@ -356,36 +356,68 @@ class TestFetchSchemeIsChecked:
 
 
 class TestGlobPatternScoping:
-    """A pattern is the only thing that decides where Glob searches when `path` is absent."""
+    """A pattern is the only thing that decides where Glob searches when `path` is absent.
+
+    The first version of this class was written to the implementation rather than against
+    it: every case put a literal first segment before the metacharacter, so it never
+    exercised the branch that trimmed a pattern like `/etc*/*` down to `""` — which reads
+    as "relative to the base directory" and was therefore allowed. A one-character change
+    to `/etc/**/*` walked past the whole check. The escape cases below come first now.
+    """
+
+    ROOT = "/tmp/creative-agent-glob-root"
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "/etc/**/*",
+            "/etc*/*",  # first metacharacter inside the first segment
+            "/h*me/user/.ssh/*",
+            "/*",
+            "/",
+            "{/etc,.}/**/*",  # brace group expanding to an absolute path
+            "[/]etc/passwd",  # bracket group containing the separator
+            "../../**/*",
+            "../outside/*.md",
+            "~/*",  # home reference
+            "~/.ssh/*",
+        ],
+    )
+    def test_patterns_that_can_escape_are_refused(self, pattern: str) -> None:
+        assert not is_glob_within_roots(pattern, [Path(self.ROOT)], cwd=self.ROOT)
+
+    @pytest.mark.parametrize(
+        "pattern",
+        ["*.md", "**/*.py", "sub/*.txt", "src/foo*.py", "[abc]/x.md", "docs/**/*.md", "plain.txt"],
+    )
+    def test_patterns_that_stay_inside_are_allowed(self, pattern: str) -> None:
+        """The fix must not break the searches a reviewer legitimately needs."""
+        assert is_glob_within_roots(pattern, [Path(self.ROOT)], cwd=self.ROOT)
 
     @pytest.mark.parametrize(
         ("pattern", "expected"),
         [
             ("*.md", ""),
             ("**/*.py", ""),
-            ("/etc/**/*", "/etc"),
-            ("../../**/*", "../.."),
-            ("src/foo*.py", "src"),
-            ("src/creative_agent/*.py", "src/creative_agent"),
+            ("/etc/**/*", "/etc/"),
+            ("/etc*/*", "/"),
+            ("/*", "/"),
+            ("../../**/*", "../../"),
+            ("src/foo*.py", "src/"),
+            ("src/creative_agent/*.py", "src/creative_agent/"),
             ("plain.txt", "plain.txt"),
         ],
     )
-    def test_literal_root_extraction(self, pattern: str, expected: str) -> None:
+    def test_literal_root_extraction_keeps_the_separator(self, pattern: str, expected: str) -> None:
+        """The trailing separator is what preserves absoluteness.
+
+        Dropping it is what turned `/etc*/*` into `""`. `src/foo*.py` still trims its
+        partial final segment; it just keeps the slash that says where `src` is anchored.
+        """
         assert glob_pattern_root(pattern) == expected
 
-    def test_an_absolute_pattern_escapes_the_roots(self, tmp_path: Path) -> None:
-        assert not is_glob_within_roots("/etc/**/*", [tmp_path], cwd=str(tmp_path))
-
-    def test_a_traversing_pattern_escapes_the_roots(self, tmp_path: Path) -> None:
-        root = tmp_path / "inside"
-        root.mkdir()
-        assert not is_glob_within_roots("../../**/*", [root], cwd=str(root))
-
-    def test_a_relative_pattern_stays_inside(self, tmp_path: Path) -> None:
-        assert is_glob_within_roots("**/*.md", [tmp_path], cwd=str(tmp_path))
-
-    def test_a_relative_subdirectory_pattern_stays_inside(self, tmp_path: Path) -> None:
-        assert is_glob_within_roots("sub/*.md", [tmp_path], cwd=str(tmp_path))
+    def test_an_empty_pattern_is_allowed(self) -> None:
+        assert is_glob_within_roots("", [Path(self.ROOT)], cwd=self.ROOT)
 
 
 class TestLaunderProseRemovesLayoutCharacters:

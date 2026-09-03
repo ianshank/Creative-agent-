@@ -1,5 +1,7 @@
 """FileStateStore round-trip, corruption handling, BC fixture; CycleEscalator matrix."""
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -252,9 +254,27 @@ class TestResetIsLocked:
     def test_reset_on_a_missing_artifact_is_a_no_op(self, tmp_path: Path) -> None:
         FileStateStore(tmp_path).reset("never-existed")
 
-    def test_reset_takes_the_same_lock_a_write_takes(self, tmp_path: Path) -> None:
-        """`--reset-state` raced the writer before: it unlinked outside the lock."""
+    def test_reset_takes_the_same_lock_a_write_takes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--reset-state` raced the writer before: it unlinked outside the lock.
+
+        Asserting the lock *file* exists proves nothing — the preceding save creates it, so
+        the assertion held even with the lock removed from `reset`. This observes whether
+        the lock was actually *entered*, which is the behaviour under test.
+        """
         store = FileStateStore(tmp_path)
         store.save(ReviewState(artifact_id="a", cycle=1))
+
+        entered: list[str] = []
+        original = FileStateStore._locked
+
+        @contextmanager
+        def watched(self: FileStateStore, artifact_id: str) -> Iterator[None]:
+            entered.append(artifact_id)
+            with original(self, artifact_id):
+                yield
+
+        monkeypatch.setattr(FileStateStore, "_locked", watched)
         store.reset("a")
-        assert (tmp_path / ".a.lock").exists()
+        assert entered == ["a"], "reset unlinked without taking the write lock"

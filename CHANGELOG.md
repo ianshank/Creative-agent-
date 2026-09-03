@@ -178,10 +178,12 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
 - **`inspect-state` skill**: documents the CLI commands that had no skill/agent coverage
   (`oracles list`, `agents list`, `decisions check`, `state show`, `assets validate`, plus
   `review --mode`/`--output-json` and the global `--log-format` flag). A new
-  `TestSkillContracts` case subprocess-confirms every command it names actually resolves,
-  the same pattern `TestHookBehaviour` already uses for hooks — a purely descriptive skill
-  with no runnable check was found to be a real gap in this repo's own documentation-honesty
-  philosophy.
+  `TestSkillContracts` case invokes every command it names through the real Typer app and
+  asserts each still resolves — in-process via `CliRunner`, in the same spirit as
+  `TestHookBehaviour` running the real hooks rather than only checking they exist. (An
+  earlier revision of this entry said "subprocess-confirms"; it does not, and the test's own
+  docstring says so.) A purely descriptive skill with no runnable check was a real gap in
+  this repo's own documentation-honesty philosophy.
 
 - **DEC-F11a: real WebFetch scoping.** `ThreatGuard`'s fetch-domain allowlist (DEC-F9)
   reached the model only as prose in the system prompt — nothing stopped a `WebFetch` call
@@ -231,7 +233,10 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
   Result: **452/452 mutants killed**, checked into `docs/mutation-baseline.json` and
   enforced by the new `scripts/check_mutation_baseline.py`, which fails the job on any
   regression in survived/no_tests/suspicious/timeout counts rather than the previous
-  `continue-on-error: true` silently swallowing them.
+  `continue-on-error: true` silently swallowing them. (Now **470/470**: the population grew
+  when DEC-F12's authority binding added real branching to `verification.py`, and the
+  baseline records the new `total` so the population floor moves up with the code — see the
+  gate repairs under **Fixed**.)
 
 ### Fixed
 
@@ -417,6 +422,19 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
     gap went unnoticed. Every step is now accounted for: setup, a `gate` dependency, or a
     declared exception carrying its reason, and each declared exception must match a real
     step so a stale entry cannot quietly widen what the test accepts.
+  - **A false *kill*, opened by the warnings-as-errors change above** and found by re-running
+    mutation testing after the DEC-F12 work. Under mutmut's multi-process re-import model a
+    garbage-collected `ScandirIterator` surfaces as an unraisable exception at interpreter
+    shutdown, and `filterwarnings = ["error"]` promotes that to a test-run failure — which
+    mutmut reads as a KILL, so a mutant that actually survived would have been counted as
+    caught. That is the same false-green class as a gate passing on zero mutants, arriving
+    through a different door. The allowance is scoped to mutmut's own pytest invocation, so
+    the main suite keeps warnings as errors, and it errs the safe way: a genuine unraisable
+    exception now leaves the mutant surviving and the gate reports it. The baseline moved
+    452 → 470 in the same pass, with the reason recorded in the file — authority binding
+    added real branching to `verification.py` — because leaving the floor at 452 would have
+    let eighteen mutants' worth of enforcement core be deleted without the guard noticing,
+    which is the hole the guard exists to close.
 
 - **CRLF on non-POSIX checkouts.** Four `write_text` calls emitted platform-native line
   endings and would have failed the golden tests for a reason unrelated to content; all four

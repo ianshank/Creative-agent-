@@ -1,5 +1,7 @@
 """VerificationLogChecker: completeness, tool honesty, attribution sweep."""
 
+import pytest
+
 from creative_agent.harness.llm.base import ToolEvidence
 from creative_agent.harness.verification import VerificationLogChecker
 from creative_agent.models.verification import VerificationEntry
@@ -243,3 +245,123 @@ class TestEvidenceIsAuthorityBound:
         """
         entry = self._entry(fetched=False, status="unverified_flagged")
         assert self._checker().check_tool_honesty([entry], []) == []
+
+
+class TestEvidenceBindingCannotBeOptedOutOf:
+    """DEC-F12's first cut branched on `canonical_id` alone, which made it opt-out.
+
+    `canonical_id` is `str | None` and the model writes the entry, so the party the control
+    exists to constrain chose which branch judged it: omit the field, and a local `Read` of
+    an author-controlled filename backed a claim about a paper again. A source that carries
+    a scholarly identifier is now judged by identifier however the entry is shaped, and an
+    evidence target that carries one is never plain-string evidence.
+    """
+
+    PAPER = "2401.12345"
+
+    def _checker(self) -> VerificationLogChecker:
+        return VerificationLogChecker(author_names=set())
+
+    def test_omitting_canonical_id_does_not_reopen_the_local_read_forgery(self) -> None:
+        local = f"refs/arxiv.org/abs/{self.PAPER}.md"
+        entry = VerificationEntry(
+            assertion="Sutton et al. say X",
+            row_id="D1",
+            source_url=local,
+            canonical_id=None,
+            confidence="Certain",
+            fetched=True,
+            status="verified",
+        )
+        evidence = [ToolEvidence(tool_name="Read", target=local, ok=True)]
+        assert len(self._checker().check_tool_honesty([entry], evidence)) == 1
+
+    def test_a_non_canonicalizing_canonical_id_does_not_fall_through(self) -> None:
+        """`arXiv 2401.12345` with a space does not canonicalize; it must not be a bypass."""
+        local = f"refs/arxiv.org/abs/{self.PAPER}.md"
+        entry = VerificationEntry(
+            assertion="Sutton et al. say X",
+            row_id="D1",
+            source_url=local,
+            canonical_id=f"arXiv {self.PAPER}",
+            confidence="Certain",
+            fetched=True,
+            status="verified",
+        )
+        evidence = [ToolEvidence(tool_name="Read", target=local, ok=True)]
+        assert len(self._checker().check_tool_honesty([entry], evidence)) == 1
+
+    def test_a_genuinely_non_scholarly_entry_still_passes(self) -> None:
+        """Reading the artifact under review remains legitimate evidence about it."""
+        local = "/repo/docs/design.md"
+        entry = VerificationEntry(
+            assertion="the document says so",
+            row_id="D1",
+            source_url=local,
+            canonical_id=None,
+            confidence="Certain",
+            fetched=True,
+            status="verified",
+        )
+        evidence = [ToolEvidence(tool_name="Read", target=local, ok=True)]
+        assert self._checker().check_tool_honesty([entry], evidence) == []
+
+
+class TestIdentifierMustComeFromTheServedResource:
+    """Authority binding constrained *which host*, not *what was retrieved*.
+
+    arxiv.org and doi.org are on every computed allowlist unconditionally and both return
+    200 for arbitrary junk, so the decoy simply moved to the registrar. Only the host and
+    path may carry the identifier now — a query string or fragment is the model's choice of
+    string, not evidence of what was served.
+    """
+
+    PAPER = "2401.12345"
+
+    def _entry(self) -> VerificationEntry:
+        return VerificationEntry(
+            assertion="a",
+            row_id="D1",
+            canonical_id=f"arXiv:{self.PAPER}",
+            source_url=f"https://arxiv.org/abs/{self.PAPER}",
+            confidence="Certain",
+            fetched=True,
+            status="verified",
+        )
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "https://arxiv.org/?x=arxiv.org/abs/2401.12345",
+            "https://arxiv.org/list/cs.LG/recent#arxiv.org/abs/2401.12345",
+            "https://doi.org/?q=arxiv.org/abs/2401.12345",
+        ],
+    )
+    def test_an_identifier_in_a_query_or_fragment_is_not_retrieval(self, target: str) -> None:
+        evidence = [ToolEvidence(tool_name="WebFetch", target=target, ok=True)]
+        assert len(VerificationLogChecker(set()).check_tool_honesty([self._entry()], evidence)) == 1
+
+    def test_arxivs_own_doi_prefix_through_doi_org_is_credited(self) -> None:
+        """`10.48550` is arXiv's DOI prefix and the standard modern citation form.
+
+        Demanding that the host be an authority for the *scheme canonicalization picked*
+        refused a fetch of the paper through doi.org — the resolver DEC-F12 explicitly
+        blesses — and failed the review with exit 3. A reviewer that always refuses is not
+        a reviewer.
+        """
+        evidence = [
+            ToolEvidence(
+                tool_name="WebFetch",
+                target=f"https://doi.org/10.48550/arXiv.{self.PAPER}",
+                ok=True,
+            )
+        ]
+        assert VerificationLogChecker(set()).check_tool_honesty([self._entry()], evidence) == []
+
+    def test_a_port_does_not_defeat_the_match(self) -> None:
+        evidence = [
+            ToolEvidence(
+                tool_name="WebFetch", target=f"https://arxiv.org:443/abs/{self.PAPER}", ok=True
+            )
+        ]
+        assert VerificationLogChecker(set()).check_tool_honesty([self._entry()], evidence) == []

@@ -240,8 +240,17 @@ class ClaudeSDKAdapter:
             kwargs["model"] = self._settings.model
         if self._settings.fallback_model:
             kwargs["fallback_model"] = self._settings.fallback_model
-        if self._settings.max_budget_usd is not None:
-            kwargs["max_budget_usd"] = self._settings.max_budget_usd
+        # The SDK's max_budget_usd is per call. Passing the raw setting made the same
+        # number mean "per call" here and "per run" in the pipeline, so the practical bound
+        # was roughly twice the setting. The pipeline's remaining-run budget is the correct
+        # per-call ceiling; the setting is only the fallback when no run context exists.
+        per_call_budget = (
+            prompt.remaining_budget_usd
+            if prompt.remaining_budget_usd is not None
+            else self._settings.max_budget_usd
+        )
+        if per_call_budget is not None:
+            kwargs["max_budget_usd"] = max(per_call_budget, 0.0)
         return ClaudeAgentOptions(**kwargs)
 
     async def generate(self, prompt: AssembledPrompt) -> RawLLMResult:

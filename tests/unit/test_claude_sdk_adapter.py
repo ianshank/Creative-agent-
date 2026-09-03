@@ -7,16 +7,19 @@ real SDK so this mock cannot silently fossilize.
 
 from __future__ import annotations
 
+import builtins
 import logging
+import tomllib
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import claude_agent_sdk
 import pytest
 
 from creative_agent.config import HarnessSettings
-from creative_agent.errors import LLMOutputError
+from creative_agent.errors import LLMOutputError, LLMTransportError
 from creative_agent.harness.llm.base import AssembledPrompt, CallKind
 from creative_agent.harness.llm.claude_sdk import ClaudeSDKAdapter, _target_from_input
 
@@ -126,7 +129,6 @@ class TestGenerate:
             await adapter()._run(query, prompt())
 
     async def test_options_carry_settings_and_schema(self) -> None:
-        pytest.importorskip("claude_agent_sdk")
         query = transport([ResultMessage(structured_output={})])
         sdk_adapter = adapter(model="opus", max_turns=3, permission_mode="dontAsk")
         await sdk_adapter._run(query, prompt())
@@ -141,7 +143,6 @@ class TestGenerate:
         assert "bypass" not in str(options.permission_mode).lower()
 
     async def test_inherit_model_is_not_passed(self) -> None:
-        pytest.importorskip("claude_agent_sdk")
         query = transport([ResultMessage(structured_output={})])
         await adapter(model="inherit")._run(query, prompt())
         assert query.captured["options"].model is None
@@ -154,7 +155,6 @@ class TestPreToolUseWebFetchEnforcement:
 
     @staticmethod
     def _wired_hook(assembled_prompt: AssembledPrompt) -> Any:
-        pytest.importorskip("claude_agent_sdk")
         options = adapter()._options(assembled_prompt)
         (matcher,) = options.hooks["PreToolUse"]
         # No matcher at all: the hook denies by default (DEC-F15), so it has to see every
@@ -216,7 +216,6 @@ class TestPreToolUseReadEnforcement:
 
     @staticmethod
     def _wired_hook(assembled_prompt: AssembledPrompt) -> Any:
-        pytest.importorskip("claude_agent_sdk")
         options = adapter()._options(assembled_prompt)
         (matcher,) = options.hooks["PreToolUse"]
         (hook,) = matcher.hooks
@@ -334,7 +333,6 @@ class TestPreToolUseClosedHoles:
 
     @staticmethod
     def _hook(roots: list[Path]) -> Any:
-        pytest.importorskip("claude_agent_sdk")
         options = adapter()._options(prompt().model_copy(update={"allowed_read_roots": roots}))
         (matcher,) = options.hooks["PreToolUse"]
         (hook,) = matcher.hooks
@@ -478,3 +476,76 @@ class TestPreToolUseClosedHoles:
         assert events[0]["query_chars"] == len(secret)
         assert secret not in str(events[0])
         assert secret not in " ".join(r.getMessage() for r in caplog.records)
+
+
+class TestTheOptionalExtraIsPresent:
+    """The DEC-F11/F15 enforcement tests must not be skippable (plan item 2.4).
+
+    They sat behind `pytest.importorskip("claude_agent_sdk")`, and `claude-agent-sdk` is an
+    optional extra. Any environment synced without `--all-extras` therefore dropped the
+    whole sandbox-escape class and reported green; CI was safe only because `make install`
+    happens to pass that flag. The skips are gone, so a missing extra now fails at import.
+    This test makes the requirement explicit rather than implicit in an ImportError.
+    """
+
+    def test_the_sdk_is_importable_in_the_dev_environment(self) -> None:
+        assert claude_agent_sdk is not None
+
+    def test_the_llm_extra_is_part_of_the_locked_dev_sync(self) -> None:
+        """`make install` uses --all-extras; if that changes, say so here, loudly."""
+        pyproject = tomllib.loads(
+            (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        extras = pyproject["project"]["optional-dependencies"]
+        assert any("claude-agent-sdk" in dep for dep in extras["llm"])
+        makefile = (Path(__file__).resolve().parents[2] / "Makefile").read_text(encoding="utf-8")
+        assert "--all-extras" in makefile
+
+
+class TestGenerateIsTheRealEntryPoint:
+    """`generate()` was covered by nothing at all (plan item 2.3).
+
+    It is the only place the real `claude_agent_sdk.query` is bound. Every other test —
+    including the shared LLMClient contract suite's sdk-mocked leg — calls the private
+    `_run` with a hand-written transport, the module is coverage-omitted under DEC-F8, and
+    the live test skipped for want of an API key. Three independent gates all declined to
+    look at the one function that touches the SDK, so a renamed or re-signatured entry
+    point would have surfaced only in a user's review.
+    """
+
+    async def test_generate_binds_and_calls_the_sdk_query_function(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        seen: dict[str, Any] = {}
+
+        def fake_query(*, prompt: str, options: Any) -> AsyncIterator[Any]:
+            seen["prompt"] = prompt
+            seen["options"] = options
+            return transport([ResultMessage(structured_output={"ok": True})])(
+                prompt=prompt, options=options
+            )
+
+        monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+        result = await adapter().generate(prompt())
+
+        assert result.payload == {"ok": True}
+        # The prompt text and the computed options must actually reach the SDK; binding the
+        # symbol without passing them would still have satisfied a laxer assertion.
+        assert seen["prompt"] == prompt().user
+        assert seen["options"].allowed_tools == prompt().allowed_tools
+
+    async def test_a_missing_sdk_raises_a_typed_transport_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The `[llm]` extra is optional, so its absence must be a typed error, not an
+        ImportError escaping to the CLI as exit 5."""
+        real_import = builtins.__import__
+
+        def refuse(name: str, *args: Any, **kwargs: Any) -> Any:
+            if name == "claude_agent_sdk":
+                raise ImportError("no claude_agent_sdk")
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "__import__", refuse)
+        with pytest.raises(LLMTransportError):
+            await adapter().generate(prompt())

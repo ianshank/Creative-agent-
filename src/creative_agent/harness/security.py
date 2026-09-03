@@ -37,6 +37,9 @@ ALLOWED_FETCH_SCHEMES = frozenset({"http", "https"})
 # is the literal directory prefix a pattern is rooted at, which is the part that decides
 # whether the pattern can escape the read roots.
 _GLOB_MAGIC = "*?[]{}!"
+# A brace or bracket group whose body carries a path separator or a home reference can
+# expand to an absolute path while the pattern's literal prefix is empty.
+_GLOB_GROUP_WITH_SEPARATOR = re.compile(r"[\[{][^\]}]*[/~][^\]}]*[\]}]")
 
 # Internal-only name suffixes. The artifact under review is untrusted, so a URL it
 # contains must never widen the fetch allowlist to an internal target (SSRF).
@@ -87,9 +90,14 @@ def glob_pattern_root(pattern: str) -> str:
     the path keys, which meant `/etc/**/*` and `../../**/*` validated the session cwd and
     ignored the pattern entirely (DEC-F15).
 
-    Everything up to the first glob metacharacter is literal, so that prefix is what has
-    to be inside the read roots. `*.md` yields "" (the base directory itself), `/etc/**/*`
-    yields "/etc", and `../../**/*` yields "../..".
+    Everything up to the first glob metacharacter is literal. The partial final segment is
+    trimmed — `src/foo*.py` is rooted at `src`, not `src/foo` — but the trailing separator
+    is KEPT, so an absolute pattern stays absolute. Dropping it turned `/etc*/*` into `""`,
+    which reads as "relative to the base directory" and was therefore allowed: a
+    one-character change to `/etc/**/*` walked past the whole check.
+
+    `*.md` yields "" (the base directory itself), `/etc/**/*` yields "/etc/", `/etc*/*`
+    yields "/", and `../../**/*` yields "../../".
     """
     cut = len(pattern)
     for index, character in enumerate(pattern):
@@ -97,18 +105,36 @@ def glob_pattern_root(pattern: str) -> str:
             cut = index
             break
     literal = pattern[:cut]
-    if cut < len(pattern) and "/" in literal:
-        # Trim the partial final segment: "src/foo*.py" is rooted at "src", not "src/foo".
-        literal = literal.rsplit("/", 1)[0]
+    if cut < len(pattern):
+        head, separator, _partial = literal.rpartition("/")
+        literal = f"{head}{separator}" if separator else ""
     return literal
 
 
 def is_glob_within_roots(pattern: str, roots: list[Path], cwd: str = "") -> bool:
     """True when a glob pattern cannot search outside `roots`.
 
-    An empty literal prefix means the pattern is relative to the base directory, which the
-    caller has already checked, so it is allowed.
+    Two rules, because a pattern can escape in two ways.
+
+    A brace or bracket group can expand to something the literal prefix cannot represent:
+    `{/etc,.}/**/*` and `[/]etc/passwd` both begin with a metacharacter, so their literal
+    prefix is empty and they read as relative. Any group containing a path separator or a
+    home reference is refused outright rather than guessed at — enumerating brace
+    expansions to decide is more machinery than the case deserves, and no legitimate review
+    needs a separator inside a group.
+
+    Otherwise the literal prefix decides. An empty prefix means the pattern is genuinely
+    relative to the base directory, which the caller has already checked.
     """
+    if not pattern:
+        return True
+    if _GLOB_GROUP_WITH_SEPARATOR.search(pattern):
+        return False
+    # A leading `~` is a home reference. Python's own `glob` does not expand it, but the
+    # tool on the other side of this hook is not Python's `glob`, and `is_path_within_roots`
+    # would treat `~/` as an ordinary relative segment under the base directory.
+    if pattern.startswith("~"):
+        return False
     literal = glob_pattern_root(pattern)
     if not literal:
         return True

@@ -292,3 +292,49 @@ class TestFindingsTableIsAuditable:
         )
         rendered = _render(report)
         assert rendered.index("F-blocker") < rendered.index("F-minor")
+
+
+class TestModelSuppliedRefsCannotForgeARow:
+    """`gate_refs` reached the findings table unescaped (adversarial review, H1).
+
+    DEC-F16 claimed the renderer escapes every model-supplied field it emits. It did not:
+    `refs = ", ".join([*doctrine_refs, *gate_refs])` was interpolated raw, and `gate_refs`
+    is copied verbatim from the model's `CandidateFinding` — an unconstrained `list[str]`
+    that `launder_prose` never touched. One entry closed the cell and opened a forged
+    Blocker row in the published report: the exact defect that decision exists to close, in
+    the exact table it names, surviving the fix that named it.
+    """
+
+    FORGED = "ok |\n| F99 | Blocker | FORGED ROW | D1 | none |"
+
+    def _render(self, **finding_kwargs: object) -> str:
+        finding = make_finding(finding_id="F1", summary="benign", **finding_kwargs)
+        report = ReviewReport(
+            artifact_id="a",
+            cycle=1,
+            oracle_id="mini",
+            oracle_version="1.0",
+            verdict=Verdict(mode="advisory", confidence="Certain", headline="h"),
+            findings=[finding],
+        )
+        return OutputRenderer("[Unverified]").render(report)
+
+    def test_a_forged_row_in_gate_refs_does_not_become_a_row(self) -> None:
+        rendered = self._render(gate_refs=[self.FORGED])
+        assert "| F99 | Blocker |" not in rendered
+        assert rendered.count("| F1 |") == 1
+
+    def test_a_forged_row_in_doctrine_refs_does_not_become_a_row(self) -> None:
+        rendered = self._render(doctrine_refs=[self.FORGED])
+        assert "| F99 | Blocker |" not in rendered
+
+    def test_the_findings_table_keeps_exactly_one_data_row_per_finding(self) -> None:
+        """Counting rows is the assertion that survives a change of escaping strategy."""
+        rendered = self._render(gate_refs=[self.FORGED, "also | bad"])
+        body = rendered.split("## Findings", 1)[1].split("## What survives", 1)[0]
+        data_rows = [
+            line
+            for line in body.splitlines()
+            if line.startswith("|") and not set(line) <= set("|- ")
+        ]
+        assert len(data_rows) == 2, data_rows  # header + one finding
