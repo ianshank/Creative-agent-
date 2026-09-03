@@ -2,6 +2,8 @@
 
 import pytest
 
+from creative_agent.harness import canonical, citations, policy, security, sourcequality
+from creative_agent.harness import verification as verification_module
 from creative_agent.harness.llm.base import ToolEvidence
 from creative_agent.harness.verification import VerificationLogChecker
 from creative_agent.models.verification import VerificationEntry
@@ -365,3 +367,97 @@ class TestIdentifierMustComeFromTheServedResource:
             )
         ]
         assert VerificationLogChecker(set()).check_tool_honesty([self._entry()], evidence) == []
+
+
+class TestTheTwoUntestedHonestyBranches:
+    """G3 and G4: the two branches nothing held, in opposite directions.
+
+    Both were provably unheld — deleting either left the whole suite green. The cause is
+    the same in both cases: `tests/factories.py::make_verification` supplies a default
+    `canonical_id`, so every test that reaches this checker through the factory exits at
+    the *canonical_id* branch and the two below never execute. A control tested only
+    through a factory is tested on the factory's defaults, not on its own inputs.
+
+    They fail in opposite directions, which is why both matter. Without the negative case
+    a fabricated non-scholarly claim publishes; without the positive case an honest
+    reviewer citing a paper by URL alone is failed with exit 3, and a reviewer that always
+    refuses is not a reviewer.
+    """
+
+    PAPER = "2401.12345"
+
+    def _entry(self, **overrides: object) -> VerificationEntry:
+        fields: dict[str, object] = {
+            "assertion": "the notes say so",
+            "row_id": "D1",
+            "source_url": "docs/notes.md",
+            "canonical_id": None,
+            "confidence": "Certain",
+            "fetched": True,
+            "status": "verified",
+        }
+        fields.update(overrides)
+        return VerificationEntry(**fields)  # type: ignore[arg-type]
+
+    def test_a_non_scholarly_claim_with_no_matching_fetch_is_a_defect(self) -> None:
+        """G3, the negative side: `fetched=True` with nothing fetched at all.
+
+        No `canonical_id`, a plain-file `source_url`, and an empty evidence list. The
+        model asserts it read something it never touched and mints `status=verified`.
+        """
+        defects = VerificationLogChecker(author_names=set()).check_tool_honesty([self._entry()], [])
+        assert len(defects) == 1
+        assert "no successful fetch" in defects[0]
+
+    def test_evidence_for_a_different_target_does_not_satisfy_the_claim(self) -> None:
+        """The near miss: something *was* read, just not the thing claimed."""
+        evidence = [ToolEvidence(tool_name="Read", target="docs/other.md", ok=True)]
+        defects = VerificationLogChecker(author_names=set()).check_tool_honesty(
+            [self._entry()], evidence
+        )
+        assert len(defects) == 1
+
+    def test_a_fetched_source_url_identifier_is_credited_without_a_canonical_id(self) -> None:
+        """G4, the positive side: an honest entry that names its paper only by URL.
+
+        This is the common shape for a review that cites a preprint and genuinely fetched
+        it. Judging it by identifier is right; judging it a fabrication is a false refusal
+        of a correct document.
+        """
+        entry = self._entry(source_url=f"https://arxiv.org/abs/{self.PAPER}")
+        evidence = [
+            ToolEvidence(
+                tool_name="WebFetch", target=f"https://arxiv.org/abs/{self.PAPER}", ok=True
+            )
+        ]
+        assert (
+            VerificationLogChecker(author_names=set()).check_tool_honesty([entry], evidence) == []
+        )
+
+
+class TestOnePolicyHasOneDefinition:
+    """DEC-F25: constants two modules must agree on are one object, not two literals.
+
+    Identity, not equality. Two equal frozensets satisfy `==` on the day they are written
+    and drift the day one of them is edited, which is the failure this guards: loosening
+    the fetch schemes without loosening the evidence schemes (or the reverse) reopens
+    `file://arxiv.org/...` on exactly one of the two paths, and which one is worse depends
+    on which was edited.
+    """
+
+    def test_the_fetch_and_evidence_scheme_sets_are_the_same_object(self) -> None:
+        assert security.ALLOWED_FETCH_SCHEMES is policy.EVIDENCE_SCHEMES
+        assert canonical._EVIDENCE_SCHEMES is policy.EVIDENCE_SCHEMES
+
+    def test_the_url_pattern_is_the_same_object_in_both_readers(self) -> None:
+        """The bibliography checker and the allowlist harvester must agree on what a URL
+        is, or a citation is judged by one and unreachable by the other."""
+        assert security._URL is policy.URL_PATTERN
+        assert sourcequality._URL is policy.URL_PATTERN
+
+    def test_name_folding_is_the_same_function_for_the_sweep_and_the_diff(self) -> None:
+        """A name that folds one way for the impersonation sweep and another for the
+        rebaseline diff is a rebaseline that clears an author the sweep still flags."""
+        assert verification_module._fold is policy.fold_name
+        assert citations._fold_surname is policy.fold_surname
+        assert policy.fold_surname("Alberto Hernández-García") == "hernandez-garcia"

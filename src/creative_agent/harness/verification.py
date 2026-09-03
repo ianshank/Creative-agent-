@@ -9,7 +9,6 @@ oracle-source authors is swept deterministically.
 from __future__ import annotations
 
 import re
-import unicodedata
 from collections.abc import Mapping
 
 from creative_agent.harness.canonical import (
@@ -18,6 +17,7 @@ from creative_agent.harness.canonical import (
     fetched_identifier,
 )
 from creative_agent.harness.llm.base import ToolEvidence
+from creative_agent.harness.policy import fold_name
 from creative_agent.models.findings import Finding
 from creative_agent.models.oracle import DEFAULT_IMPERSONATION_PATTERNS
 from creative_agent.models.verification import VerificationEntry
@@ -28,10 +28,10 @@ from creative_agent.models.verification import VerificationEntry
 DEFAULT_FETCH_TOOLS = frozenset({"WebFetch", "Read"})
 
 
-def _fold(text: str) -> str:
-    """NFKD-fold + casefold so 'Hernández-García' matches 'Hernandez-Garcia'."""
-    decomposed = unicodedata.normalize("NFKD", text)
-    return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
+# Shared with the author-list diff in `citations` (DEC-F25). A name that folds one way for
+# the impersonation sweep and another for the rebaseline diff is a rebaseline that clears
+# an author the sweep still flags.
+_fold = fold_name
 
 
 class VerificationLogChecker:

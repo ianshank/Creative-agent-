@@ -106,7 +106,17 @@ def _path_scope_violation(
                 "outside this review's read roots"
             )
 
-    base = str(tool_input.get(scope.path_keys[0], "") or cwd)
+    # A glob is rooted at the call's `path` argument when it has one, and at the session
+    # working directory otherwise — but a *relative* `path` has to be joined to `cwd`
+    # first. Passing it through raw made `is_path_within_roots` resolve `"docs"` against
+    # this process's working directory, which is the exact "resolving against the wrong
+    # one is a scoping bypass" case the docstring below warns about, applied to the
+    # pattern instead of the path. The two arguments of one call were then judged against
+    # two different roots.
+    declared = tool_input.get(scope.path_keys[0])
+    base = str(declared) if isinstance(declared, str) and declared.strip() else cwd
+    if base and cwd and not Path(base).is_absolute():
+        base = str(Path(cwd) / base)
     for key in scope.glob_keys:
         pattern = tool_input.get(key)
         if (
@@ -118,13 +128,24 @@ def _path_scope_violation(
     return None
 
 
-def _pre_tool_use_hook(prompt: AssembledPrompt, unscoped_tools: frozenset[str]) -> Any:
+def _pre_tool_use_hook(
+    prompt: AssembledPrompt,
+    unscoped_tools: frozenset[str],
+    protocol_tools: frozenset[str],
+) -> Any:
     """Builds a PreToolUse hook closed over this call's computed scopes.
 
-    Deny-by-default (DEC-F15). A tool is allowed only if it is explicitly handled here or
-    named in `HarnessSettings.unscoped_tools`; the previous version returned allow for
-    anything it did not recognise, and its matcher only fired for four tool names, so
-    nothing else was ever inspected.
+    Deny-by-default (DEC-F15). A tool is allowed only if it is explicitly handled here,
+    named in `HarnessSettings.protocol_tools`, or named in
+    `HarnessSettings.unscoped_tools`; the previous version returned allow for anything it
+    did not recognise, and its matcher only fired for four tool names, so nothing else was
+    ever inspected.
+
+    The protocol branch exists because deny-by-default, as first written, denied
+    `StructuredOutput` — the SDK's own response channel — and so made every real review
+    fail with "failed to provide valid structured output" while every test passed
+    (DEC-F20). A capability the model may use and the envelope the SDK answers in are
+    different things, and the hook now says so.
 
     WebFetch (DEC-F11a) is checked against the exact allowlist computed for this review —
     not a fresh internal-host check, which would permit any public host rather than only
@@ -174,6 +195,20 @@ def _pre_tool_use_hook(prompt: AssembledPrompt, unscoped_tools: frozenset[str]) 
                 tool_name, tool_input, str(input_data.get("cwd", "")), prompt.allowed_read_roots
             )
             return _refuse(tool_name, reason) if reason else {}
+
+        if tool_name in protocol_tools:
+            # The SDK's own response channel, not a granted capability (DEC-F20). Logged
+            # at DEBUG rather than silently allowed so the permitted set stays observable
+            # in a trace: this is the one allow-branch whose entries are not in
+            # `agent_tools` and therefore never appear in the system prompt.
+            log_event(
+                _LOG,
+                logging.DEBUG,
+                "security.protocol_tool_allowed",
+                call_kind=prompt.kind.value,
+                tool_name=tool_name,
+            )
+            return {}
 
         if tool_name in unscoped_tools:
             if tool_name == "WebSearch":
@@ -231,7 +266,13 @@ class ClaudeSDKAdapter:
             "hooks": {
                 "PreToolUse": [
                     HookMatcher(
-                        hooks=[_pre_tool_use_hook(prompt, frozenset(self._settings.unscoped_tools))]
+                        hooks=[
+                            _pre_tool_use_hook(
+                                prompt,
+                                frozenset(self._settings.unscoped_tools),
+                                frozenset(self._settings.protocol_tools),
+                            )
+                        ]
                     )
                 ]
             },

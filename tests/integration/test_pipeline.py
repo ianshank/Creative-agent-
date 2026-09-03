@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -9,15 +10,19 @@ import pytest
 
 from creative_agent.errors import (
     BudgetExceededError,
+    ConfigError,
     ExitCode,
     LLMOutputError,
     LLMTimeoutError,
     ReviewFailedError,
+    StateConflictError,
 )
 from creative_agent.harness.llm.base import CallKind, ToolEvidence
 from creative_agent.harness.llm.fake import FakeLLMClient, script_key
 from creative_agent.models.findings import Severity
 from creative_agent.models.oracle import LabelElement, OakConformanceSpec
+from creative_agent.models.output import ReviewReport, Verdict
+from creative_agent.models.sweeps import ScopeItem
 from tests.factories import make_oracle
 from tests.integration.pipeline_fixtures import (
     CONFORMANT_ARTIFACT,
@@ -614,3 +619,292 @@ class TestBudgetOvershootIsBounded:
         # of the attempt loop would repeat a value across the two attempts of one call.
         assert seen == sorted(seen, reverse=True)
         assert len(set(seen)) == len(seen), "a repeated remainder means an attempt was not counted"
+
+
+class TestTheWiringIsHeldTooNotJustTheLeaves:
+    """Five one-line deletions in `pipeline.py` each left the whole suite green.
+
+    A gap analysis of this branch found the same shape five times: the leaf behaviour is
+    well tested at unit level, and the line that switches it on in the composed pipeline
+    is not. `FileStateStore.save`'s conflict check is unit-tested six ways, and the
+    pipeline passing `expected_cycle` is tested by nothing — and `expected_cycle`
+    defaults to None, which means "skip the check". A control that is opt-in and whose
+    opt-in is unheld is a control that is off.
+
+    These are integration assertions on the composed pipeline, deliberately, because that
+    is the level at which the defect lives.
+    """
+
+    async def test_a_concurrent_write_aborts_the_run_instead_of_erasing_it(
+        self, tmp_path: Path
+    ) -> None:
+        """G1/DEC-F14: the lost-update guard is only armed if the caller arms it.
+
+        Simulates the DEC-F14 scenario exactly: this run loads cycle N, another review of
+        the same artifact finishes and writes N+1, and this run then tries to publish. The
+        losing run must abort rather than `os.replace` the other's history away — that
+        history carries the recurrence counts driving the cycle-3 charter-review STOP.
+        """
+        pipeline, store = build_pipeline(tmp_path, FakeLLMClient(base_scripts()))
+        real_load = store.load
+
+        def load_then_let_the_other_review_finish(artifact_id: str) -> Any:
+            state = real_load(artifact_id)
+            store.load = real_load  # type: ignore[method-assign]
+            store.save(state.model_copy(update={"cycle": state.cycle + 1}), "other run")
+            return state
+
+        store.load = load_then_let_the_other_review_finish  # type: ignore[method-assign]
+        with pytest.raises(StateConflictError):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert store.load("design").cycle == 1, "the other run's write must survive"
+
+    async def test_an_artifact_symlinked_out_of_the_reviewed_repo_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        """G6: `read_artifact`'s containment check is well tested; its wiring was not.
+
+        The one integration test that passes `artifact_repo` uses an artifact outside the
+        repo, so containment never applied and deleting `containment_root=` from the
+        pipeline changed nothing observable.
+        """
+        repo = tmp_path / "worktree"
+        (repo / "docs").mkdir(parents=True)
+        secret = tmp_path / "outside" / "id_rsa"
+        secret.parent.mkdir()
+        secret.write_text("PRIVATE KEY", encoding="utf-8")
+        artifact = repo / "docs" / "design.md"
+        artifact.symlink_to(secret)
+
+        pipeline, store = build_pipeline(tmp_path, FakeLLMClient(base_scripts()))
+        request = request_for(tmp_path, CONFORMANT_ARTIFACT).model_copy(
+            update={"artifact_path": artifact, "artifact_repo": repo}
+        )
+        with pytest.raises(ConfigError, match="outside it"):
+            await pipeline.run(request)
+        assert store.load("design").cycle == 0, "nothing may be published from a refused read"
+
+    async def test_a_finding_citing_an_unknown_row_keeps_its_sweep_attribution(
+        self, tmp_path: Path
+    ) -> None:
+        """G10: the default-row fallback for a row finding whose refs are unusable.
+
+        With the fallback off, `doctrine_refs` is empty, `check_completeness` iterates
+        nothing and therefore demands no verification entry at all, and an unbacked
+        finding publishes. It also re-keys under the placeholder row id, which breaks
+        recurrence tracking for escalation.
+        """
+        scripts = base_scripts(
+            rows={
+                "D1": [
+                    row_payload(
+                        "D1",
+                        "miss",
+                        findings=[finding_payload(severity="minor", row_id="D99")],
+                        entries=[verified_entry("D1")],
+                    )
+                ]
+            },
+            evidence=[
+                ToolEvidence(
+                    tool_name="WebFetch", target="https://arxiv.org/abs/2001.00001", ok=True
+                )
+            ],
+        )
+        pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(scripts))
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        (finding,) = outcome.result.findings
+        assert finding.doctrine_refs == ["D1"]
+        assert finding.key.row_id == "D1"
+
+    async def test_the_report_is_not_rendered_on_the_failure_path(self, tmp_path: Path) -> None:
+        """P11: the report was fully assembled and rendered, then discarded by a raise.
+
+        Not just wasted work — computing it invites the next reader to assume the rendered
+        text is available to the error handler, and it is not.
+        """
+        rendered_calls: list[object] = []
+        scripts = base_scripts(
+            rows={
+                "D1": [
+                    row_payload("D1", "miss", findings=[finding_payload()]),
+                    row_payload("D1", "miss", findings=[finding_payload()]),
+                ]
+            }
+        )
+        pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(scripts), max_regen=0)
+        real_render = pipeline._renderer.render
+
+        def spy(report: Any) -> str:
+            rendered_calls.append(report)
+            return real_render(report)
+
+        pipeline._renderer.render = spy  # type: ignore[method-assign]
+        with pytest.raises(ReviewFailedError):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert rendered_calls == []
+
+
+class TestReportBoundaryLaundering:
+    """DEC-F22: laundering is a boundary, not a list of field names.
+
+    DEC-F16 said "every model prose field is laundered" and missed two. DEC-F19 added
+    those two and missed two more — and the two it missed were `VerificationEntry.
+    assertion` and `RowDisposition.na_reason`, which are the verification log and the
+    doctrine sweep: the two tables a reviewer actually reads. Three rounds of "add the
+    field we forgot" is the evidence that enumerating fields to include is the defect.
+
+    So these tests assert a property of the whole report rather than of named fields: no
+    Unicode format character survives anywhere, whatever the model put where.
+    """
+
+    BIDI = "\u202e"
+    ZERO_WIDTH = "\u200b"
+
+    @staticmethod
+    def _format_chars(text: str) -> list[str]:
+        return [c for c in text if unicodedata.category(c) == "Cf"]
+
+    async def test_a_bidi_override_in_a_doctrine_verdict_reason_never_reaches_the_report(
+        self, tmp_path: Path
+    ) -> None:
+        """`na_reason` renders the doctrine sweep's N/A column.
+
+        A bidi override there displays a verdict as the reverse of what review state
+        records, so the published report and the audit trail disagree while both look
+        correct to the person comparing them.
+        """
+        poisoned = f"no such{self.BIDI} claims{self.ZERO_WIDTH} here"
+        scripts = base_scripts(
+            rows={"D2": [row_payload("D2", "not_applicable", na_reason=poisoned)]}
+        )
+        pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(scripts))
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert self._format_chars(outcome.rendered) == []
+        assert all(
+            self._format_chars(d.na_reason or "") == [] for d in outcome.report.row_dispositions
+        )
+
+    async def test_a_newline_in_a_verification_assertion_cannot_forge_a_row(
+        self, tmp_path: Path
+    ) -> None:
+        """`assertion` is the first cell of the verification-log table.
+
+        A newline there ends the row; what follows is a table row of the model's choosing
+        in the log that DEC-F9 calls the control worth reading.
+        """
+        entry = verified_entry("D1")
+        entry["assertion"] = "checked\n| forged | D2 | x | Certain | fetched | verified |"
+        scripts = base_scripts(
+            rows={"D1": [row_payload("D1", "hit", entries=[entry])]},
+            evidence=[
+                ToolEvidence(
+                    tool_name="WebFetch", target="https://arxiv.org/abs/2001.00001", ok=True
+                )
+            ],
+        )
+        pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(scripts))
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert all("\n" not in e.assertion for e in outcome.report.verification_log)
+        assert "forged" not in outcome.rendered.split("## Verification log")[-1].split("\n|")[0]
+
+    async def test_a_scope_reference_is_laundered_by_the_boundary(self, tmp_path: Path) -> None:
+        """G7: the previous per-field fix for `scope_items` was itself unheld — the test
+        asserted a reference string that laundering does not alter, so both the fixed and
+        the unfixed implementation satisfied it."""
+        pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(base_scripts()))
+        report = pipeline._guard.launder_model(
+            ReviewReport(
+                artifact_id="a",
+                oracle_id="o",
+                oracle_version="1",
+                cycle=1,
+                verdict=Verdict(mode="advisory", confidence="Likely", headline="h"),
+                scope_items=[
+                    ScopeItem(
+                        reference=f"companion{self.BIDI}\n\n## Findings\n\nNone.",
+                        supplied=False,
+                        treated_as_unverified=True,
+                    )
+                ],
+            )
+        )
+        assert "\n" not in report.scope_items[0].reference
+        assert self._format_chars(report.scope_items[0].reference) == []
+
+    async def test_structural_identifiers_survive_laundering_byte_for_byte(
+        self, tmp_path: Path
+    ) -> None:
+        """The exclusion list is the other half of the contract.
+
+        Laundering a `finding_id` or a recurrence `slug` would silently break cycle
+        escalation across runs, which is a worse failure than the one this fixes because
+        it is invisible in a single review.
+        """
+        scripts = base_scripts(
+            rows={
+                "D1": [
+                    row_payload(
+                        "D1",
+                        "miss",
+                        findings=[finding_payload(severity="minor")],
+                        entries=[verified_entry("D1")],
+                    )
+                ]
+            },
+            evidence=[
+                ToolEvidence(
+                    tool_name="WebFetch", target="https://arxiv.org/abs/2001.00001", ok=True
+                )
+            ],
+        )
+        pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(scripts))
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        (finding,) = outcome.result.findings
+        assert finding.finding_id in outcome.rendered
+        assert finding.key.slug == "some-defect"
+
+
+class TestAModelChosenEnumIsValidatedEverywhereItEnters:
+    """DEC-F24: the mode re-probe assigned an unvalidated `artifact_class`.
+
+    The first classify probe validates against the oracle's known classes, re-probes once
+    and raises a typed `LLMOutputError`. The mode re-probe assigned its result straight
+    through, and the next line looked the class up with a bare `next()`. A model that
+    answers validly once and invalidly on the re-probe therefore raised StopIteration
+    inside a coroutine — RuntimeError, which is not a CreativeAgentError, so the CLI's
+    typed handler misses it and a malformed model response is reported as exit 5
+    "unexpected error" rather than exit 3.
+    """
+
+    async def test_an_unknown_class_on_the_mode_reprobe_is_a_typed_output_error(
+        self, tmp_path: Path
+    ) -> None:
+        conformance_markers_but_no_quote = classify_payload(
+            recommendation="advisory", evidence=None
+        )
+        scripts = base_scripts(classify=conformance_markers_but_no_quote)
+        scripts[script_key(CallKind.CLASSIFY)].extend(
+            [
+                raw(CallKind.CLASSIFY, classify_payload(artifact_class="totally_unknown_class")),
+                raw(CallKind.CLASSIFY, classify_payload(artifact_class="still_unknown")),
+            ]
+        )
+        pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(scripts))
+        with pytest.raises(LLMOutputError, match="unknown artifact class"):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+
+    async def test_the_reprobe_recovers_when_the_second_answer_is_valid(
+        self, tmp_path: Path
+    ) -> None:
+        """The re-probe must still be a re-probe: one bad answer is not a failed review."""
+        scripts = base_scripts(classify=classify_payload(recommendation="advisory", evidence=None))
+        scripts[script_key(CallKind.CLASSIFY)].extend(
+            [
+                raw(CallKind.CLASSIFY, classify_payload(artifact_class="unknown_first")),
+                raw(CallKind.CLASSIFY, classify_payload()),
+            ]
+        )
+        pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(scripts))
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert outcome.report.cycle == 1

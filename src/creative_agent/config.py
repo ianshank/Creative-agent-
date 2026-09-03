@@ -102,6 +102,17 @@ class HarnessSettings(BaseSettings):
     # should empty this list.
     unscoped_tools: list[str] = Field(default_factory=lambda: ["WebSearch"])
 
+    # Tools that are part of the SDK's own request/response protocol rather than a
+    # capability granted to the review (DEC-F20). `StructuredOutput` is how the SDK
+    # delivers a structured answer, so denying it does not harden the review — it stops
+    # the review from receiving any answer at all, which is exactly what deny-by-default
+    # did until the first live end-to-end run. Kept separate from `unscoped_tools` because
+    # the guidance for that list is "a multi-tenant deployment should empty it": emptying
+    # this one breaks the harness instead, so conflating the two would make the security
+    # advice self-defeating. Permitting the envelope grants nothing — the payload it
+    # carries is schema-validated on arrival and laundered before it reaches a report.
+    protocol_tools: list[str] = Field(default_factory=lambda: ["StructuredOutput"])
+
     # Which hosts may vouch for a scholarly identifier in the tool-honesty check
     # (DEC-F12). A fetch only credits an identifier when it came from that identifier's
     # own registrar, so a decoy URL mentioning `arxiv.org/abs/<id>` proves nothing. Data

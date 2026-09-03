@@ -437,3 +437,141 @@ change" is therefore not yet true end to end, and is recorded in `docs/roadmap.m
 than half-fixed. Deny-by-default has no live verification, because that needs the API key
 Tranche 0 is blocked on. `_EVIDENCE_SCHEMES` and `ALLOWED_FETCH_SCHEMES` are two literals
 for one policy.
+
+## DEC-F20 — The SDK's own response channel is not a granted capability — CONFIRMED, corrects DEC-F15
+
+**Problem: deny-by-default made every real review fail, and nothing caught it.** The first
+end-to-end run of `creative-agent review` against the live SDK on this branch ended in
+`ResultError: Failed to provide valid structured output after 5 attempts`, exit 5. The
+`PreToolUse` hook denied `StructuredOutput` — the tool the SDK itself invokes to deliver a
+structured response — because F15 denies anything not explicitly scoped and not listed in
+`unscoped_tools`. The harness therefore could not receive an answer to any of its six call
+kinds. This is not a corner case: it is every review, on the default configuration.
+
+Three gates should have caught it and none could. The mocked transport in
+`tests/unit/test_claude_sdk_adapter.py` yields `ResultMessage` objects directly, so no hook
+ever runs; the shared contract suite inherits that transport; and the live-marked test
+skips itself (see below). A control that denies the response channel is indistinguishable
+from a working one when every test hands the answer over out of band.
+
+**Decision: distinguish a capability from the protocol.** `HarnessSettings.protocol_tools`
+(default `["StructuredOutput"]`) names the tools that are part of the SDK's own request or
+response protocol rather than a capability granted to the review. The hook allows them
+before the scope check and after the explicitly-scoped tools, and logs the allowance at
+DEBUG so the set stays observable. This is deliberately *not* `unscoped_tools`: that list
+carries accepted residual risk (`WebSearch` is an outbound channel) and the guidance for a
+multi-tenant deployment is to empty it. Emptying `protocol_tools` breaks the harness
+instead, so conflating the two would make the security advice self-defeating.
+
+Permitting `StructuredOutput` grants nothing: the payload it carries is validated against
+the call's JSON schema by `_run` and laundered before it reaches a report. The tool is the
+envelope, not the content.
+
+**Threat-model note.** Every other SDK-internal tool stays denied, and the same live run
+shows `ToolSearch` being refused with no ill effect. `protocol_tools` is a list rather than
+a boolean so that an SDK that renames or adds a protocol tool is a settings change, and it
+is separate from `agent_tools` because a protocol tool is never advertised to the model.
+
+## DEC-F21 — Live verification gates on SDK capability, not on one credential form — CONFIRMED, corrects DEC-F19
+
+**Problem:** `tests/unit/test_llm_contract.py::TestLiveSmoke` skips unless
+`ANTHROPIC_API_KEY` is set, and `.github/workflows/live.yml` fails the job when that
+variable is absent. But `claude_agent_sdk` does not require an API key: it spawns the
+`claude` CLI, which authenticates from whatever credential that CLI holds — an API key, or
+an OAuth/subscription session. Gating on one credential form meant the live leg reported
+"no API key" in an environment where a live call demonstrably succeeds, which is how
+DEC-F19 came to record "deny-by-default has no live verification, because that needs the
+API key Tranche 0 is blocked on". That premise was false, and F20 is the defect it hid.
+
+**Decision:** the live tests gate on a capability probe — can the SDK complete one
+minimal call — rather than on an environment variable, and the probe result is cached for
+the session so the cost is one call. `live.yml` keeps its explicit pre-flight failure,
+because in CI an absent secret really does mean the job would verify nothing, but the
+message now says "no usable SDK credential" rather than naming one variable.
+
+The general rule this encodes: **a skip predicate must test the capability the test needs,
+not a proxy for it.** A proxy that is wrong in the safe direction turns a gate into
+decoration, and a decorative gate is worse than none because it reports success.
+
+## DEC-F22 — Laundering is a boundary, not a field list — CONFIRMED, corrects DEC-F16 and DEC-F19
+
+**Problem:** F16 said "every LLM prose field that reaches the rendered report" is
+laundered, F19 corrected two fields it had missed, and two more were still raw:
+`VerificationEntry.assertion` and `RowDisposition.na_reason`, both free model prose, both
+reaching the report through `_md_escape` alone — pipe and newline escaping, no `Cf` strip,
+no length cap. A bidi override in `na_reason` renders a doctrine verdict as the reverse of
+what review state records, so the published report and the audit trail disagree while both
+look correct; `assertion` is the verification log, which the architecture calls the control
+that makes the log worth reading.
+
+Twice now the fix has been "add the field we missed to the list". The list is the defect.
+
+**Decision:** the pipeline launders at the report boundary. One function walks the
+`ReviewReport` about to be constructed and launders every model-authored string on it, so a
+new prose field on any model output model is covered the day it is added rather than the
+day someone remembers. Harness-authored structural fields — `finding_id`, oracle row ids,
+`row_id` on a disposition, versions, hashes — are enumerated as *exclusions*, which is a
+list that fails safe: forgetting to exclude something launders it (harmless), where
+forgetting to include something published it (the defect).
+
+The renderer keeps its own escaping. Two independent layers is the point: the renderer must
+not assume its caller laundered, and the pipeline must not assume the renderer escapes.
+
+## DEC-F23 — One artifact read, validated before it happens — CONFIRMED, corrects DEC-F19
+
+**Problem:** F19 added a containment check to `read_artifact` and said a symlink out of the
+reviewed tree "is refused rather than read". The CLI reads the artifact twenty lines before
+the pipeline does, without a containment root, to derive the artifact id from front matter
+— and then, with `--reset-state`, acts on that id. A symlink at `worktree/docs/design.md`
+pointing outside the tree at a file whose front matter says `review-id: other-artifact`
+therefore causes `docs/review-log/other-artifact.md` to be deleted, destroying another
+artifact's cycle history and its escalation counter, before the check that was supposed to
+refuse the file ever runs. The out-of-tree file is also read twice, up to
+`max_artifact_bytes` each time, with a TOCTOU window between the read that derives the id
+and the read that is hashed into state.
+
+**Decision:** the artifact is read exactly once, in the CLI, with the containment root
+already known, and the text and its digest are carried on `ReviewRequest`. `--reset-state`
+runs after validation, not before. A refusal is then a refusal for every consumer of the
+path, which is what F19 claimed.
+
+## DEC-F24 — Every model-chosen enum value passes one validator — CONFIRMED
+
+**Problem:** `ReviewPipeline` validates the first `classify` response against the oracle's
+known artifact classes, re-probes once, and raises a typed `LLMOutputError` if the second
+is still unknown. The *mode* re-probe then assigns `classify = reprobe` with no such check,
+and the next line does `next(c for c in ... if c.name == classify.artifact_class)` with no
+default. A model that returns a valid class on the first call and an invalid one on the
+mode re-probe raises `StopIteration` inside a coroutine, which Python converts to
+`RuntimeError`, which is not a `CreativeAgentError`, so the CLI's typed handler misses it
+and `main`'s bare `except Exception` reports **exit 5, "unexpected error"**. A malformed
+model response is exit 3 by the frozen exit-code contract.
+
+**Decision:** the validate-and-re-probe logic becomes one reusable method that both probes
+call, and the artifact-class lookup uses an explicit lookup that raises `LLMOutputError`
+rather than a bare `next()`. The general rule: a value the model chose is validated by one
+function, called everywhere that value can enter — not re-implemented at the first call
+site and omitted at the second.
+
+## DEC-F25 — One policy module for the rules two modules must agree on — CONFIRMED
+
+**Problem:** six single-source-of-truth violations, three of them load-bearing.
+`ALLOWED_FETCH_SCHEMES` (`harness/security.py`) and `_EVIDENCE_SCHEMES`
+(`harness/canonical.py`) are byte-identical frozensets expressing one policy, so loosening
+one reopens `file://` on exactly one of the two paths. `_RESOLVER_HOSTS` in `security.py`
+is a hard-coded domain list sixteen lines below a module docstring promising "never a
+hard-coded domain list", and it is why `identifier_authority_hosts` does not work end to
+end: the setting reaches the honesty checker, so a configured mirror can vouch for an
+identifier, while the fetch allowlist never sees it, so the hook denies the fetch that
+would produce the evidence. `DEFAULT_FETCH_TOOLS` and `DEFAULT_MAX_YAML_DEPTH` shadow
+`HarnessSettings` defaults, so a test constructing a checker directly exercises a policy
+production never runs. The URL regex and the diacritic fold each exist twice.
+
+**Decision:** `harness/policy.py` owns the rules more than one module must agree on —
+evidence schemes, the URL pattern, name folding — and the settings field is the only
+default for anything configurable. `ThreatGuard` takes `identifier_authority_hosts` and
+seeds the fetch allowlist from it, so one setting drives both the fetch allowlist and the
+evidence-authority check and F12's "a mirror is a settings change" becomes true end to end.
+
+Scheme sets stay in code rather than settings: "only http and https are retrieval evidence"
+is an invariant, not a knob. The defect was that the invariant was written twice.

@@ -24,7 +24,12 @@ from creative_agent.errors import (
     LLMTimeoutError,
     ReviewFailedError,
 )
-from creative_agent.harness.artifact import content_sha256, read_artifact, resolve_artifact_id
+from creative_agent.harness.artifact import (
+    content_sha256,
+    read_artifact,
+    resolve_artifact_id,
+    validate_artifact_path,
+)
 from creative_agent.harness.consistency import ConsistencyChecker
 from creative_agent.harness.decisions import DecisionGate
 from creative_agent.harness.gates import MeasurementGateChecker
@@ -46,7 +51,7 @@ from creative_agent.harness.sourcequality import SourceQualityChecker
 from creative_agent.harness.state import CycleEscalator
 from creative_agent.harness.verification import VerificationLogChecker
 from creative_agent.models.findings import Finding, FindingKey, Severity, normalize_slug
-from creative_agent.models.oracle import OracleTable
+from creative_agent.models.oracle import ArtifactClassRule, OracleTable
 from creative_agent.models.output import ReviewReport, Verdict
 from creative_agent.models.review import ReviewMode, ReviewRequest, ReviewResult
 from creative_agent.models.state import CycleRecord, HistoricalFinding
@@ -127,6 +132,11 @@ class ReviewPipeline:
             settings.max_prose_chars,
             blocked_host_suffixes=tuple(settings.blocked_host_suffixes),
             allow_internal_fetch_hosts=settings.allow_internal_fetch_hosts,
+            # One setting, both halves (DEC-F25): the registrars that may vouch for an
+            # identifier are exactly the hosts a review must be able to fetch to produce
+            # that evidence. Before this, naming a mirror let it vouch for an identifier
+            # the hook would then refuse to fetch.
+            identifier_authority_hosts=settings.identifier_authority_hosts,
         )
         self._assembler = PromptAssembler(settings.prompt_search_paths, agent.prompt_template_dir())
         self._renderer = OutputRenderer(oracle.protocol.unverified_marker)
@@ -410,13 +420,29 @@ class ReviewPipeline:
 
     async def _run(self, request: ReviewRequest, review_log: dict[str, object]) -> PipelineOutcome:
         state = self._state_store.load(request.artifact_id)
-        artifact_text = read_artifact(
-            request.artifact_path,
-            self._settings.max_artifact_bytes,
-            # A reviewed worktree is untrusted, and git carries symlinks: an artifact
-            # path that resolves outside the repository under review is refused.
-            containment_root=request.artifact_repo,
-        )
+        # One read per review when the caller already did it (DEC-F23): the CLI must read
+        # the artifact to derive its id from front matter, and re-reading here meant the
+        # id and the content hash written into state could come from two different
+        # versions of the file. A caller that supplies only a path still gets the read —
+        # and the same containment check, since a reviewed worktree is untrusted and git
+        # carries symlinks, so a path resolving outside the repository is refused.
+        artifact_text = request.artifact_text
+        if artifact_text is None:
+            artifact_text = read_artifact(
+                request.artifact_path,
+                self._settings.max_artifact_bytes,
+                containment_root=request.artifact_repo,
+            )
+        else:
+            # Read once, checked twice. The check must not travel with the read, or
+            # removing it from the CLI would remove it from the product: the pipeline is
+            # the layer that hands the text to the model, so it is the layer that must
+            # refuse a path it would not have read itself.
+            validate_artifact_path(
+                request.artifact_path,
+                self._settings.max_artifact_bytes,
+                containment_root=request.artifact_repo,
+            )
         fetch_domains = self._guard.fetch_domain_allowlist(artifact_text)
         rejected_hosts = self._guard.rejected_fetch_hosts(artifact_text)
         read_roots = self._guard.allowed_read_roots(
@@ -458,22 +484,7 @@ class ReviewPipeline:
 
         # Step 3: classify + fail-closed mode (with one re-probe).
         classify = await self._call(sweep, CallKind.CLASSIFY, ClassifyResult, base_context)
-        known_classes = {c.name for c in self._oracle.artifact_classes}
-        if classify.artifact_class not in known_classes:
-            classify = await self._call(
-                sweep,
-                CallKind.CLASSIFY,
-                ClassifyResult,
-                base_context,
-                repair_defects=[
-                    f"artifact_class must be one of {sorted(known_classes)}, "
-                    f"got {classify.artifact_class!r}"
-                ],
-            )
-            if classify.artifact_class not in known_classes:
-                raise LLMOutputError(
-                    f"classify returned unknown artifact class {classify.artifact_class!r}"
-                )
+        classify = await self._validated_class(sweep, classify, base_context)
         mode, mode_uncertain = self._resolve_mode(request, classify, artifact_text)
         if mode == "advisory" and mode_uncertain and request.mode == "auto":
             reprobe = await self._call(
@@ -489,12 +500,16 @@ class ReviewPipeline:
             )
             mode, mode_uncertain2 = self._resolve_mode(request, reprobe, artifact_text)
             mode_uncertain = mode == "advisory" and mode_uncertain2
-            classify = reprobe
+            # The same validator as the first probe. Assigning `reprobe` unchecked meant a
+            # model that answered validly once and invalidly on the re-probe reached the
+            # lookup below with an unknown class, where a bare `next()` raised
+            # StopIteration inside a coroutine — RuntimeError, not a CreativeAgentError, so
+            # the CLI's typed handler missed it and a malformed model response was reported
+            # as exit 5 "unexpected error" instead of exit 3 (DEC-F24).
+            classify = await self._validated_class(sweep, reprobe, base_context)
 
         class_context = {**base_context, "mode": mode, "artifact_class": classify.artifact_class}
-        class_rule = next(
-            c for c in self._oracle.artifact_classes if c.name == classify.artifact_class
-        )
+        class_rule = self._class_rule(classify.artifact_class)
 
         # Steps 4-5 (deterministic sweeps).
         deterministic: list[CandidateFinding] = [
@@ -673,18 +688,27 @@ class ReviewPipeline:
             ],
             what_survives=self._guard.launder_all(final_synthesis.what_survives),
             residual_risks=self._guard.launder_all(final_synthesis.residual_risks),
-            # DEC-F16 claimed these were laundered and they were not: only the
-            # renderer's pipe/newline escape ran, so a bidi override or a zero-width
-            # run reached the report and the length cap never applied.
-            scope_items=self._laundered_scope(sweep),
+            scope_items=self._scope_items(sweep),
             verification_log=self._all_entries(sweep),
             escalation=escalation,
         )
-        rendered = self._renderer.render(report)
+        # DEC-F22: launder the assembled report, not a list of fields. Twice now the field
+        # list has been the defect — DEC-F16 missed two fields and DEC-F19 missed two more,
+        # among them the verification log's `assertion` and the doctrine sweep's
+        # `na_reason`. This walks every string on the report and excludes the structural
+        # ids instead, so a prose field added tomorrow is covered tomorrow. The per-field
+        # laundering above is left in place deliberately: findings are laundered where they
+        # are built because their text also reaches review state and the audit bundle,
+        # neither of which passes through here.
+        report = self._guard.launder_model(report)
 
         if review_failed_reason is not None:
-            # Per spec: failed, regenerated up to budget, never softened or published.
+            # Checked before rendering: on this path the report is discarded, and building
+            # and rendering it first was work whose only effect was to suggest to the next
+            # reader that the rendered text is available to the error handler.
             raise ReviewFailedError(review_failed_reason)
+
+        rendered = self._renderer.render(report)
 
         # Step 13: write state + audit bundle.
         new_record = CycleRecord(
@@ -745,14 +769,47 @@ class ReviewPipeline:
             state_path=str(state_path),
         )
 
-    def _laundered_scope(self, sweep: _SweepState) -> list[ScopeItem]:
-        """Scope references are model prose and pass through ThreatGuard like the rest."""
-        if sweep.judgement is None:
-            return []
-        return [
-            item.model_copy(update={"reference": self._guard.launder_prose(item.reference)})
-            for item in sweep.judgement.scope
-        ]
+    async def _validated_class(
+        self,
+        sweep: _SweepState,
+        classify: ClassifyResult,
+        context: dict[str, object],
+    ) -> ClassifyResult:
+        """Return a classify result whose `artifact_class` is one the oracle defines.
+
+        One re-probe naming the permitted set, then a typed failure. Both classify probes
+        route through this: the first probe had the check inline and the mode re-probe had
+        none, which is the shape of defect DEC-F24 is about — a value the model chose,
+        validated at the call site that happened to be written first.
+        """
+        known = {c.name for c in self._oracle.artifact_classes}
+        if classify.artifact_class in known:
+            return classify
+        retried = await self._call(
+            sweep,
+            CallKind.CLASSIFY,
+            ClassifyResult,
+            context,
+            repair_defects=[
+                f"artifact_class must be one of {sorted(known)}, got {classify.artifact_class!r}"
+            ],
+        )
+        if retried.artifact_class not in known:
+            raise LLMOutputError(
+                f"classify returned unknown artifact class {retried.artifact_class!r}"
+            )
+        return retried
+
+    def _class_rule(self, artifact_class: str) -> ArtifactClassRule:
+        """The oracle rule for a class, as a typed failure rather than a StopIteration."""
+        for rule in self._oracle.artifact_classes:
+            if rule.name == artifact_class:
+                return rule
+        raise LLMOutputError(f"classify returned unknown artifact class {artifact_class!r}")
+
+    def _scope_items(self, sweep: _SweepState) -> list[ScopeItem]:
+        """Scope items as the judgement returned them; laundering is DEC-F22's boundary."""
+        return list(sweep.judgement.scope) if sweep.judgement is not None else []
 
     def _write_audit_bundle(self, request: ReviewRequest, cycle: int, sweep: _SweepState) -> None:
         bundle_dir = self._settings.review_log_dir / request.artifact_id / f"cycle-{cycle}"

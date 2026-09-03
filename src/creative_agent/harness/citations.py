@@ -10,7 +10,6 @@ failure is data, not an error: unverified rows are severity-capped by the freshn
 from __future__ import annotations
 
 import logging
-import unicodedata
 from urllib.parse import quote
 from xml.etree.ElementTree import Element
 
@@ -18,6 +17,7 @@ import httpx
 from defusedxml import ElementTree as SafeET
 
 from creative_agent.harness.logging import get_logger, log_event
+from creative_agent.harness.policy import fold_surname
 from creative_agent.harness.protocols import CitationResolver, Clock, ResolutionResult
 from creative_agent.models.oracle import FreshnessMeta, OracleTable, SourceRef
 
@@ -25,13 +25,9 @@ _ATOM = "{http://www.w3.org/2005/Atom}"
 _LOG = get_logger(__name__)
 
 
-def _fold_surname(name: str) -> str:
-    """Last token, diacritic-folded. Blank names fold to "" rather than raising."""
-    parts = name.strip().split()
-    if not parts:
-        return ""
-    decomposed = unicodedata.normalize("NFKD", parts[-1])
-    return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
+# Shared with the impersonation sweep in `verification` (DEC-F25): the author diff and the
+# sweep must fold identically, or a rebaseline clears a name the sweep still flags.
+_fold_surname = fold_surname
 
 
 class ArxivCitationResolver:

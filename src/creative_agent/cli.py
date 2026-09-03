@@ -272,7 +272,13 @@ def review(
         review_agent = build_registry().get(agent_name)
         oracle_id = oracle or review_agent.default_oracle()
         table = _loader(settings).load(oracle_id)
-        text = read_artifact(artifact, settings.max_artifact_bytes)
+        # The containment root is supplied here, not only in the pipeline (DEC-F23).
+        # DEC-F19 said a symlink out of the reviewed tree "is refused rather than read";
+        # this read happens twenty lines before the pipeline's, and without the root it
+        # read the out-of-tree file, took the artifact id from ITS front matter, and — with
+        # --reset-state — deleted that other artifact's cycle history and escalation
+        # counter before the check that was supposed to refuse the file ever ran.
+        text = read_artifact(artifact, settings.max_artifact_bytes, containment_root=artifact_repo)
         resolved_id = resolve_artifact_id(artifact, text, artifact_id)
         store = FileStateStore(settings.review_log_dir)
         if reset_state:
@@ -302,6 +308,9 @@ def review(
             mode=mode,
             artifact_repo=artifact_repo,
             offline=offline,
+            # Already read above, under the same containment root: handing it over is what
+            # makes this one read rather than two (DEC-F23).
+            artifact_text=text,
         )
         outcome = asyncio.run(pipeline.run(request))
     except CreativeAgentError as exc:

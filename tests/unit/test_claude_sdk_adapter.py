@@ -549,3 +549,148 @@ class TestGenerateIsTheRealEntryPoint:
         monkeypatch.setattr(builtins, "__import__", refuse)
         with pytest.raises(LLMTransportError):
             await adapter().generate(prompt())
+
+
+class TestTheSdkResponseChannelIsNotACapability:
+    """DEC-F20: deny-by-default denied `StructuredOutput` and broke every real review.
+
+    The defect these tests exist for was invisible to the entire suite because every
+    other test in this file hands the model's answer over out of band: `transport()`
+    yields `ResultMessage` objects directly, so the hook never runs and the SDK never
+    needs its own response channel. The first live end-to-end run failed with "Failed to
+    provide valid structured output after 5 attempts" — the harness could not receive an
+    answer to any of its six call kinds, on the default configuration.
+
+    So these tests drive the hook with the tool name the SDK actually uses, which is the
+    only thing that would have caught it short of a live call.
+    """
+
+    @staticmethod
+    def _hook(**settings_overrides: Any) -> Any:
+        options = adapter(**settings_overrides)._options(prompt())
+        (matcher,) = options.hooks["PreToolUse"]
+        (hook,) = matcher.hooks
+        return hook
+
+    @staticmethod
+    async def _decide(hook: Any, tool_name: str) -> str:
+        result = await hook({"tool_name": tool_name, "tool_input": {}, "cwd": "/"}, "t1", None)
+        decision = result.get("hookSpecificOutput", {}).get("permissionDecision")
+        return str(decision) if decision else "allow"
+
+    async def test_the_default_configuration_permits_the_structured_output_channel(self) -> None:
+        """The regression proper: this denied on the default settings and every test passed."""
+        assert await self._decide(self._hook(), "StructuredOutput") == "allow"
+
+    async def test_the_protocol_set_is_configuration_not_a_literal(self) -> None:
+        """An SDK that renames its response tool is a settings change, not a code change."""
+        hook = self._hook(protocol_tools=["SomeRenamedOutputTool"])
+        assert await self._decide(hook, "SomeRenamedOutputTool") == "allow"
+        assert await self._decide(hook, "StructuredOutput") == "deny"
+
+    async def test_protocol_tools_are_not_unscoped_tools(self) -> None:
+        """Emptying `unscoped_tools` is the documented multi-tenant hardening step.
+
+        If the response channel lived in that list, following the security advice would
+        break the harness — which is the reason DEC-F20 keeps them separate. Emptying it
+        must drop WebSearch and leave the protocol channel alone.
+        """
+        hook = self._hook(unscoped_tools=[])
+        assert await self._decide(hook, "WebSearch") == "deny"
+        assert await self._decide(hook, "StructuredOutput") == "allow"
+
+    async def test_other_sdk_internal_tools_stay_denied(self) -> None:
+        """Permitting the envelope must not permit everything the SDK might send.
+
+        `ToolSearch` was denied throughout the live run with no ill effect, which is the
+        evidence that this branch is narrow enough.
+        """
+        assert await self._decide(self._hook(), "ToolSearch") == "deny"
+
+    async def test_an_empty_protocol_set_denies_the_channel(self) -> None:
+        """States the cost of emptying it, so nobody empties it as a hardening step."""
+        assert await self._decide(self._hook(protocol_tools=[]), "StructuredOutput") == "deny"
+
+
+class TestGlobEscapesThatSurvivedTheFirstFix:
+    """DEC-F26/G2: `**/../../../etc/*` was allowed while `../../**/*` was denied.
+
+    `glob_pattern_root` cuts the literal prefix at the FIRST metacharacter, so a pattern
+    that opens with one has an empty prefix, and an empty prefix reads as
+    "relative to the base directory" — which is allowed. Every escape case in the
+    original parametrize put its traversal *before* the first metacharacter, so the check
+    passed by describing the shapes it already caught. Moving one character to the left
+    walked past the whole control.
+    """
+
+    @staticmethod
+    def _hook(roots: list[Path]) -> Any:
+        options = adapter()._options(prompt().model_copy(update={"allowed_read_roots": roots}))
+        (matcher,) = options.hooks["PreToolUse"]
+        (hook,) = matcher.hooks
+        return hook
+
+    @pytest.mark.parametrize(
+        "pattern",
+        [
+            "**/../../../etc/*",
+            "*/../../../etc/passwd",
+            "?/../*",
+            "[a]/../../../etc/*",
+            "**/../../**/*.pem",
+            "{a,b}/../../../etc/*",
+        ],
+    )
+    async def test_a_traversal_after_a_metacharacter_is_denied(
+        self, tmp_path: Path, pattern: str
+    ) -> None:
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {"tool_name": "Glob", "tool_input": {"pattern": pattern}, "cwd": str(tmp_path)},
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_an_ordinary_recursive_pattern_still_works(self, tmp_path: Path) -> None:
+        """The refusal must not be so broad that it denies the reviews we want.
+
+        A check that refuses everything is not a check; `**/*.md` under a read root is the
+        single most ordinary thing a review does.
+        """
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {"tool_name": "Glob", "tool_input": {"pattern": "**/*.md"}, "cwd": str(tmp_path)},
+            "t1",
+            None,
+        )
+        assert result == {}
+
+    async def test_a_relative_path_argument_roots_the_pattern_at_the_calls_cwd(
+        self, tmp_path: Path
+    ) -> None:
+        """P7: the glob base was passed through raw, so a RELATIVE `path` resolved against
+        this process's working directory rather than the call's `cwd`.
+
+        The path argument and its glob filter were then judged against two different
+        roots in the same call — the "resolving against the wrong one is a scoping bypass"
+        case the hook's own docstring warns about, applied to the pattern instead.
+        """
+        (tmp_path / "docs" / "sub").mkdir(parents=True)
+        hook = self._hook([tmp_path])
+        # `path` is judged against the call's cwd and lands inside the root. The glob
+        # filter must be judged against the same base: with the raw value, `"docs"` was
+        # resolved against this process's working directory instead, so `sub/*.md` was
+        # tested against `<repo>/docs/sub` — a directory in a different tree entirely —
+        # and the call was denied for a reason that has nothing to do with the call.
+        allowed = await hook(
+            {
+                "tool_name": "Grep",
+                "tool_input": {"pattern": "x", "path": "docs", "glob": "sub/*.md"},
+                "cwd": str(tmp_path),
+            },
+            "t1",
+            None,
+        )
+        assert allowed == {}, "the path argument and its glob filter were judged against "
+        "two different roots in the same call"

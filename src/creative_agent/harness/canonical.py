@@ -12,6 +12,8 @@ import re
 from collections.abc import Mapping
 from urllib.parse import urlparse
 
+from creative_agent.harness.policy import EVIDENCE_SCHEMES
+
 # Which hosts may *vouch* for an identifier (DEC-F12). Canonicalization is a substring
 # match over an arbitrary string, which is right for identity bucketing but wrong as proof
 # of retrieval: a fetch of `attacker.example/x?src=arxiv.org/abs/2401.12345` extracted the
@@ -23,8 +25,10 @@ DEFAULT_IDENTIFIER_AUTHORITIES: Mapping[str, tuple[str, ...]] = {
     "doi": ("doi.org",),
 }
 # Schemes a fetch may be made over. A `file://` or `ftp://` target is never retrieval
-# evidence for a scholarly identifier, whatever string it contains.
-_EVIDENCE_SCHEMES = frozenset({"http", "https"})
+# evidence for a scholarly identifier, whatever string it contains. Shared with the fetch
+# check in `security` (DEC-F25): these were two identical literals for one policy, so
+# loosening either one reopened `file://` on exactly one of the two paths.
+_EVIDENCE_SCHEMES = EVIDENCE_SCHEMES
 
 # Modern arXiv ids (2007+) are NNNN.NNNNN. Pre-2007 ids are archive/YYMMNNN with an
 # optional subject class (math/0211159, cs.LG/0102030) — a corpus spanning both eras

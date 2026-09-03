@@ -25,6 +25,13 @@ class ReviewRequest(SchemaModel):
     mode: ModeSelection = "auto"
     artifact_repo: Path | None = None
     offline: bool = False
+    # The artifact's text, when the caller has already read it (DEC-F23). The CLI must
+    # read it to derive the artifact id from front matter, and reading it a second time
+    # here left a TOCTOU window: the id and the hash written into state could come from
+    # two different versions of the file. Optional rather than required so a caller that
+    # only has a path — every test, and any embedder — keeps working unchanged; the
+    # pipeline reads it itself when this is None, with the same containment check.
+    artifact_text: str | None = None
 
 
 class ReviewResult(SchemaModel):

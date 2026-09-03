@@ -12,12 +12,16 @@ from collections import defaultdict
 from urllib.parse import urlparse
 
 from creative_agent.harness.canonical import canonicalize
+from creative_agent.harness.policy import URL_PATTERN
 from creative_agent.models.findings import SupportRef
 from creative_agent.models.oracle import SourceQualityConfig
 from creative_agent.models.sweeps import CandidateFinding
 
 _REF_TOKEN = r"\[\d{1,4}\]"  # noqa: S105 — a citation-marker regex, not a secret
-_URL = re.compile(r"https?://[^\s\"'<>\])]+", re.IGNORECASE)
+# Shared with the allowlist harvester (DEC-F25): the checker that judges a bibliography
+# and the harvester that decides what the session may fetch must agree on what a URL is,
+# or a citation is judged by one and unreachable by the other.
+_URL = URL_PATTERN
 
 
 class SourceQualityChecker:

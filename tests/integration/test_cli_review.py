@@ -8,6 +8,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from creative_agent import errors
 from creative_agent.cli import app
 from creative_agent.errors import ExitCode, ReviewFailedError
 from creative_agent.harness import pipeline as pipeline_module
@@ -245,3 +246,111 @@ class TestOfflineCeilingBanner:
         result = runner.invoke(app, ["review", str(env), "--offline", "--mode", "conformance"])
         assert self.NOTE in result.output
         assert "could not have failed on content" not in result.output
+
+
+class TestTheExitCodesAreObservedAtTheProcessBoundary:
+    """G8: every `RUN_ABORTED` assertion in the suite was a class-attribute check.
+
+    `ExitCode.RUN_ABORTED == 6` says what the enum holds, not what the process returns.
+    Nothing invoked the CLI and observed a 6, so any regression in `_fail`'s routing — or
+    one of these three errors escaping the `except CreativeAgentError` block — would
+    silently degrade a retryable abort into exit 5 "unexpected error". The distinction
+    between 5 and 6 is the entire content of DEC-F17's addition to a frozen contract: 6
+    means retry, 5 means something is broken.
+    """
+
+    @pytest.mark.parametrize(
+        "error_name",
+        ["BudgetExceededError", "LLMTimeoutError", "StateConflictError"],
+    )
+    def test_a_run_abort_exits_six(
+        self, env: Path, monkeypatch: pytest.MonkeyPatch, error_name: str
+    ) -> None:
+        error_type = getattr(errors, error_name)
+
+        async def abort(self: object, request: object) -> None:
+            raise error_type("stopped before a verdict")
+
+        monkeypatch.setattr(pipeline_module.ReviewPipeline, "run", abort)
+        result = runner.invoke(app, ["review", str(env), "--offline"])
+        assert result.exit_code == int(ExitCode.RUN_ABORTED), result.output
+
+    def test_a_review_failure_still_exits_three(
+        self, env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The neighbouring code, asserted alongside so the parametrize above cannot pass
+        by mapping everything to 6."""
+
+        async def failed(self: object, request: object) -> None:
+            raise ReviewFailedError("verification log incomplete")
+
+        monkeypatch.setattr(pipeline_module.ReviewPipeline, "run", failed)
+        result = runner.invoke(app, ["review", str(env), "--offline"])
+        assert result.exit_code == int(ExitCode.REVIEW_FAILED), result.output
+
+
+class TestTheArtifactPathIsCheckedBeforeItIsUsed:
+    """DEC-F23: the CLI read the artifact before the containment check existed for it.
+
+    `read_artifact`'s refusal was added to the pipeline's read. The CLI's read, twenty
+    lines earlier, had no containment root — and it is the read whose result decides the
+    artifact id, which `--reset-state` then acts on. So the file the check was meant to
+    refuse was read anyway, and its front matter chose which review-log entry to delete.
+    """
+
+    @staticmethod
+    def _worktree_with_escaping_symlink(tmp_path: Path) -> tuple[Path, Path]:
+        repo = tmp_path / "worktree"
+        (repo / "docs").mkdir(parents=True)
+        outside = tmp_path / "outside.md"
+        outside.write_text(
+            "---\nreview-id: someone-elses-artifact\n---\n\n# Not in the worktree\n",
+            encoding="utf-8",
+        )
+        artifact = repo / "docs" / "design.md"
+        artifact.symlink_to(outside)
+        return repo, artifact
+
+    def test_a_symlink_out_of_the_reviewed_repo_is_refused_by_the_cli(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CREATIVE_AGENT_REVIEW_LOG_DIR", str(tmp_path / "review-log"))
+        repo, artifact = self._worktree_with_escaping_symlink(tmp_path)
+        result = runner.invoke(
+            app, ["review", str(artifact), "--offline", "--artifact-repo", str(repo)]
+        )
+        assert result.exit_code == int(ExitCode.CONFIG_ERROR), result.output
+
+    def test_reset_state_cannot_delete_a_third_artifacts_history(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The data-loss case, stated as a test.
+
+        The out-of-tree file's front matter names a *different* artifact. Before the fix
+        the CLI read it, resolved that id, and `store.reset()` deleted that artifact's
+        cycle history and its escalation counter — the counter that drives the cycle-3
+        charter-review STOP — before the pipeline refused the same file.
+        """
+        review_log = tmp_path / "review-log"
+        monkeypatch.setenv("CREATIVE_AGENT_REVIEW_LOG_DIR", str(review_log))
+        repo, artifact = self._worktree_with_escaping_symlink(tmp_path)
+        review_log.mkdir(parents=True)
+        victim = review_log / "someone-elses-artifact.md"
+        victim.write_text(
+            "---\nschema_version: 1\nartifact_id: someone-elses-artifact\ncycle: 3\n"
+            "history: []\n---\n\nprior review\n",
+            encoding="utf-8",
+        )
+
+        runner.invoke(
+            app,
+            [
+                "review",
+                str(artifact),
+                "--offline",
+                "--artifact-repo",
+                str(repo),
+                "--reset-state",
+            ],
+        )
+        assert victim.exists(), "a refused artifact must not delete another artifact's state"
