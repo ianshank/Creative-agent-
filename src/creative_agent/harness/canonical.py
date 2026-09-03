@@ -12,6 +12,8 @@ import re
 from collections.abc import Mapping
 from urllib.parse import urlparse
 
+from creative_agent.harness.policy import EVIDENCE_SCHEMES, host_matches_suffix
+
 # Which hosts may *vouch* for an identifier (DEC-F12). Canonicalization is a substring
 # match over an arbitrary string, which is right for identity bucketing but wrong as proof
 # of retrieval: a fetch of `attacker.example/x?src=arxiv.org/abs/2401.12345` extracted the
@@ -23,8 +25,10 @@ DEFAULT_IDENTIFIER_AUTHORITIES: Mapping[str, tuple[str, ...]] = {
     "doi": ("doi.org",),
 }
 # Schemes a fetch may be made over. A `file://` or `ftp://` target is never retrieval
-# evidence for a scholarly identifier, whatever string it contains.
-_EVIDENCE_SCHEMES = frozenset({"http", "https"})
+# evidence for a scholarly identifier, whatever string it contains. Shared with the fetch
+# check in `security` (DEC-F25): these were two identical literals for one policy, so
+# loosening either one reopened `file://` on exactly one of the two paths.
+_EVIDENCE_SCHEMES = EVIDENCE_SCHEMES
 
 # Modern arXiv ids (2007+) are NNNN.NNNNN. Pre-2007 ids are archive/YYMMNNN with an
 # optional subject class (math/0211159, cs.LG/0102030) — a corpus spanning both eras
@@ -75,20 +79,11 @@ def all_identifiers(text: str) -> set[str]:
     return found
 
 
-def identifier_scheme(canonical_id: str | None) -> str | None:
-    """The registry an identifier belongs to: 'arxiv:2401.12345' -> 'arxiv'."""
-    if not canonical_id or ":" not in canonical_id:
-        return None
-    return canonical_id.split(":", 1)[0].lower()
-
-
-def _host_is_under(host: str, authority: str) -> bool:
-    """True for the authority itself or any subdomain of it.
-
-    Suffix matching is anchored on a dot so `notarxiv.org` cannot pass as `arxiv.org`,
-    while `export.arxiv.org` — the host the arXiv API actually serves from — does.
-    """
-    return host == authority or host.endswith(f".{authority}")
+# The same anchored suffix match the internal-host filter uses (DEC-F32): `notarxiv.org`
+# cannot pass as `arxiv.org` while `export.arxiv.org` — the host the arXiv API actually
+# serves from — does. It was written here and in `security` with different shapes, only one
+# of which handled a leading dot.
+_host_is_under = host_matches_suffix
 
 
 def fetched_identifier(

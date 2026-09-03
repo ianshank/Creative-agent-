@@ -35,8 +35,16 @@ def validate_artifact_id(candidate: str, *, source: str) -> str:
     return candidate
 
 
-def read_artifact(path: Path, max_bytes: int, *, containment_root: Path | None = None) -> str:
-    """Read an artifact, refusing anything that is not a bounded regular file.
+def validate_artifact_path(
+    path: Path, max_bytes: int, *, containment_root: Path | None = None
+) -> os.stat_result:
+    """Refuse an artifact path that is not a bounded regular file inside the reviewed tree.
+
+    Split out of `read_artifact` so a caller that already holds the text can still have
+    the path judged (DEC-F23). Reading once is right, but it must not mean *checking*
+    once: the CLI reads the artifact to derive its id and the pipeline reviews the text it
+    is handed, and if the check travelled with the read, then removing it from the CLI
+    would remove it altogether. It stays in both places, over one read.
 
     Three refusals, all of which the reviewed repository can trigger. The documented
     `--artifact-repo` flow reviews a checked-out worktree, and git carries symlinks, so
@@ -53,7 +61,7 @@ def read_artifact(path: Path, max_bytes: int, *, containment_root: Path | None =
       repository's own decision log is what `DecisionGate` reads, is a legitimate pattern
       and is not what this defends against. Symlinks that stay inside the tree are fine —
       refusing every symlink would break ordinary checkouts to no benefit.
-    - **Oversized**, as before, checked twice in case the file grows between the two calls.
+    - **Oversized**, by the size the filesystem reports.
     """
     try:
         info = path.stat()
@@ -81,6 +89,16 @@ def read_artifact(path: Path, max_bytes: int, *, containment_root: Path | None =
             raise ConfigError(f"cannot resolve artifact {path}: {exc}") from exc
     if info.st_size > max_bytes:
         raise ConfigError(f"artifact {path} exceeds {max_bytes} bytes ({info.st_size} bytes)")
+    return info
+
+
+def read_artifact(path: Path, max_bytes: int, *, containment_root: Path | None = None) -> str:
+    """Validate the path, then read it, re-checking the size against the bytes read.
+
+    `validate_artifact_path` checks the size the filesystem reports; the check after the
+    read catches a file that grew in between, which the reported size cannot.
+    """
+    validate_artifact_path(path, max_bytes, containment_root=containment_root)
     try:
         data = path.read_bytes()
     except OSError as exc:

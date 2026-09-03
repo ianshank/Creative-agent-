@@ -19,12 +19,18 @@ from pydantic import BaseModel, ValidationError
 
 from creative_agent.config import HarnessSettings
 from creative_agent.errors import (
-    BudgetExceededError,
     LLMOutputError,
     LLMTimeoutError,
     ReviewFailedError,
 )
-from creative_agent.harness.artifact import content_sha256, read_artifact, resolve_artifact_id
+from creative_agent.harness.artifact import (
+    content_sha256,
+    read_artifact,
+    resolve_artifact_id,
+    validate_artifact_path,
+)
+from creative_agent.harness.budget import RunBudget
+from creative_agent.harness.classification import ModeResolver
 from creative_agent.harness.consistency import ConsistencyChecker
 from creative_agent.harness.decisions import DecisionGate
 from creative_agent.harness.gates import MeasurementGateChecker
@@ -77,6 +83,10 @@ class _SweepState:
     judgement: JudgementSweepResult | None = None
     evidence: list[ToolEvidence] = field(default_factory=list)
     calls: list[dict[str, object]] = field(default_factory=list)
+    # The run's spend cap, carried with the sweep because it is per-run state like the
+    # rest of this dataclass. `calls` stays as the audit record written to the bundle;
+    # the budget no longer has to be re-derived from it on every call (DEC-F41).
+    budget: RunBudget = field(default_factory=lambda: RunBudget(None))
 
 
 @dataclass
@@ -107,6 +117,7 @@ class ReviewPipeline:
         self._settings = settings
         self._state_store = state_store
         self._clock = clock
+        self._modes = ModeResolver(oracle)
         self._severity_policy = SeverityPolicy(oracle)
         self._gate_checker = MeasurementGateChecker(oracle)
         self._sq_checker = SourceQualityChecker(oracle.source_quality)
@@ -127,60 +138,16 @@ class ReviewPipeline:
             settings.max_prose_chars,
             blocked_host_suffixes=tuple(settings.blocked_host_suffixes),
             allow_internal_fetch_hosts=settings.allow_internal_fetch_hosts,
+            # One setting, both halves (DEC-F25): the registrars that may vouch for an
+            # identifier are exactly the hosts a review must be able to fetch to produce
+            # that evidence. Before this, naming a mirror let it vouch for an identifier
+            # the hook would then refuse to fetch.
+            identifier_authority_hosts=settings.identifier_authority_hosts,
         )
         self._assembler = PromptAssembler(settings.prompt_search_paths, agent.prompt_template_dir())
         self._renderer = OutputRenderer(oracle.protocol.unverified_marker)
 
     # ---- LLM call helper -------------------------------------------------
-
-    @staticmethod
-    def _spent_usd(sweep: _SweepState) -> float:
-        """Total cost recorded across every provider call this run has made.
-
-        `cost_usd` was logged per call and stored per call and never summed against
-        anything, so `max_budget_usd` — which the SDK applies per *call* — permitted the
-        setting multiplied by the number of calls a review makes: 18 on the happy path,
-        and up to roughly 144 provider calls once the re-probe, the repair loop and the
-        schema-retry loop compound (DEC-F17).
-        """
-        total = 0.0
-        for call in sweep.calls:
-            cost = call.get("cost_usd")
-            # A backend that reports no cost contributes nothing rather than aborting the
-            # run: OfflineLLMClient and FakeLLMClient both leave it None by design.
-            if isinstance(cost, int | float):
-                total += float(cost)
-        return total
-
-    def _remaining_budget(self, sweep: _SweepState) -> float | None:
-        """What is left of `max_budget_usd` for this run, or None when uncapped."""
-        budget = self._settings.max_budget_usd
-        if budget is None:
-            return None
-        return max(budget - self._spent_usd(sweep), 0.0)
-
-    def _check_budget(self, sweep: _SweepState, *, kind: CallKind, ref: str) -> None:
-        budget = self._settings.max_budget_usd
-        if budget is None:
-            return
-        spent = self._spent_usd(sweep)
-        if spent < budget:
-            return
-        log_event(
-            _LOG,
-            logging.ERROR,
-            "llm.budget_exhausted",
-            kind=kind.value,
-            ref=ref,
-            spent_usd=round(spent, 6),
-            budget_usd=budget,
-            calls=len(sweep.calls),
-        )
-        raise BudgetExceededError(
-            f"review budget of ${budget:.2f} exhausted after {len(sweep.calls)} LLM calls "
-            f"(${spent:.4f} spent); stopped before the {kind.value} call. Nothing was "
-            "published. Raise max_budget_usd or narrow the review."
-        )
 
     async def _generate_within_timeout(
         self, prompt: AssembledPrompt, *, kind: CallKind, ref: str
@@ -232,14 +199,12 @@ class ReviewPipeline:
                 allowed_read_roots=context.get("read_roots", []),  # type: ignore[arg-type]
                 context={**context, "repair_defects": defects},
             )
-            prompt = prompt.model_copy(
-                update={"remaining_budget_usd": self._remaining_budget(sweep)}
-            )
+            prompt = prompt.model_copy(update={"remaining_budget_usd": sweep.budget.remaining()})
             # Budget is checked *inside* the attempt loop, before each provider call, so a
             # single logical call cannot burn several times the remaining budget: `_call`
             # retries up to max_regeneration_attempts + 1 times and every attempt reaches
             # the wire (DEC-F17).
-            self._check_budget(sweep, kind=kind, ref=ref)
+            sweep.budget.check(kind=kind.value, ref=ref)
             with timed_stage(
                 _LOG, "llm.call", kind=kind.value, ref=ref, attempt=attempt + 1
             ) as call_log:
@@ -251,6 +216,7 @@ class ReviewPipeline:
             sweep.calls.append(
                 {"kind": kind.value, "ref": ref, "model": raw.model, "cost_usd": raw.cost_usd}
             )
+            sweep.budget.record(raw.cost_usd)
             try:
                 return parse_payload(raw, model_type)
             except ValidationError as exc:
@@ -273,50 +239,6 @@ class ReviewPipeline:
 
     # ---- deterministic helpers ------------------------------------------
 
-    def _sections_present(self, text: str, classify: ClassifyResult) -> set[str]:
-        """Which required sections the artifact actually contains.
-
-        Determined from the document's own headings ONLY. The model also reports what it
-        saw, but a required-section obligation is a deterministic gate: honouring the
-        model's word would let the reviewer of an untrusted artifact clear a Blocker by
-        asserting it. Disagreement is logged, never obeyed.
-        """
-        headings = {m.group("title").strip().casefold() for m in _HEADING.finditer(text)}
-        declared = {
-            section for rule in self._oracle.artifact_classes for section in rule.requires_sections
-        }
-        present = {
-            section
-            for section in declared
-            if any(section.casefold() in heading for heading in headings)
-        }
-        unsupported = {n for n in classify.sections_present if n in declared} - present
-        if unsupported:
-            log_event(
-                _LOG,
-                logging.WARNING,
-                "sections.claim_unsupported",
-                claimed=sorted(unsupported),
-                found=sorted(present),
-            )
-        return present
-
-    def _resolve_mode(
-        self, request: ReviewRequest, classify: ClassifyResult, artifact_text: str
-    ) -> tuple[ReviewMode, bool]:
-        """Fail-closed mode rule (DEC-F6) + marker-based uncertainty flag."""
-        if request.mode != "auto":
-            return request.mode, False
-        folded = artifact_text.casefold()
-        markers_present = any(
-            marker.casefold() in folded for marker in self._oracle.conformance.markers
-        )
-        evidence = (classify.conformance_evidence or "").strip()
-        evidence_found = bool(evidence) and _squash(evidence) in _squash(artifact_text)
-        if classify.mode_recommendation == "conformance" and evidence_found:
-            return "conformance", False
-        return "advisory", markers_present
-
     def _candidate_to_finding(
         self,
         candidate: CandidateFinding,
@@ -325,12 +247,41 @@ class ReviewPipeline:
         origin: str = "llm",
     ) -> Finding:
         known_rows = {row.id for row in self._oracle.rows}
+        # `GatePolicy.all_gate_refs` exists precisely so gate references "can be
+        # cross-validated instead of being free-form strings" — its own comment — and until
+        # now it had zero call sites. Only `doctrine_row` supports were filtered, so a
+        # `gate_failure` support carried whatever `ref` the model wrote. That is a severity
+        # lever, not cosmetic: `SeverityPolicy` counts any `gate_failure` support as a
+        # blocker basis and drops the tier cap the moment one non-doctrine support exists,
+        # so naming a gate that does not exist promoted a Major to a Blocker and exit 2.
+        # The model writes this field and the artifact under review can steer the model,
+        # which is the threat model DEC-F9 assumes (DEC-F31).
+        known_gates = self._oracle.gate_policy.all_gate_refs()
         doctrine_refs = [r for r in candidate.doctrine_refs if r in known_rows]
         if not doctrine_refs and default_row:
             doctrine_refs = [default_row]
         supports = [
-            s for s in candidate.supports if s.kind != "doctrine_row" or s.ref in known_rows
+            s
+            for s in candidate.supports
+            if (s.kind != "doctrine_row" or s.ref in known_rows)
+            and (s.kind != "gate_failure" or s.ref in known_gates)
         ]
+        gate_refs = [g for g in candidate.gate_refs if g in known_gates]
+        dropped = (
+            len(candidate.supports) - len(supports) + len(candidate.gate_refs) - len(gate_refs)
+        )
+        if dropped:
+            # An unknown reference is the model inventing doctrine, and a reviewer reading
+            # only the report would never see that it was dropped. Counts, never the
+            # strings: the refs are model prose (DEC-F10).
+            log_event(
+                _LOG,
+                logging.WARNING,
+                "findings.unknown_refs_dropped",
+                origin=origin,
+                dropped=dropped,
+                anchor_slug=normalize_slug(candidate.anchor) or "finding",
+            )
         key_row = doctrine_refs[0] if doctrine_refs else self._oracle.protocol.placeholder_row_id
         return Finding(
             finding_id=f"F{index}",
@@ -339,7 +290,7 @@ class ReviewPipeline:
             original_severity=candidate.severity,
             summary=self._guard.launder_prose(candidate.summary),
             doctrine_refs=doctrine_refs,
-            gate_refs=candidate.gate_refs,
+            gate_refs=gate_refs,
             supports=supports,
             disposition_required=self._guard.launder_prose(candidate.disposition_required)
             if candidate.disposition_required
@@ -410,13 +361,29 @@ class ReviewPipeline:
 
     async def _run(self, request: ReviewRequest, review_log: dict[str, object]) -> PipelineOutcome:
         state = self._state_store.load(request.artifact_id)
-        artifact_text = read_artifact(
-            request.artifact_path,
-            self._settings.max_artifact_bytes,
-            # A reviewed worktree is untrusted, and git carries symlinks: an artifact
-            # path that resolves outside the repository under review is refused.
-            containment_root=request.artifact_repo,
-        )
+        # One read per review when the caller already did it (DEC-F23): the CLI must read
+        # the artifact to derive its id from front matter, and re-reading here meant the
+        # id and the content hash written into state could come from two different
+        # versions of the file. A caller that supplies only a path still gets the read —
+        # and the same containment check, since a reviewed worktree is untrusted and git
+        # carries symlinks, so a path resolving outside the repository is refused.
+        artifact_text = request.artifact_text
+        if artifact_text is None:
+            artifact_text = read_artifact(
+                request.artifact_path,
+                self._settings.max_artifact_bytes,
+                containment_root=request.artifact_repo,
+            )
+        else:
+            # Read once, checked twice. The check must not travel with the read, or
+            # removing it from the CLI would remove it from the product: the pipeline is
+            # the layer that hands the text to the model, so it is the layer that must
+            # refuse a path it would not have read itself.
+            validate_artifact_path(
+                request.artifact_path,
+                self._settings.max_artifact_bytes,
+                containment_root=request.artifact_repo,
+            )
         fetch_domains = self._guard.fetch_domain_allowlist(artifact_text)
         rejected_hosts = self._guard.rejected_fetch_hosts(artifact_text)
         read_roots = self._guard.allowed_read_roots(
@@ -454,27 +421,12 @@ class ReviewPipeline:
             **self._agent.build_context(request, self._oracle, state),
         }
 
-        sweep = _SweepState()
+        sweep = _SweepState(budget=RunBudget(self._settings.max_budget_usd))
 
         # Step 3: classify + fail-closed mode (with one re-probe).
         classify = await self._call(sweep, CallKind.CLASSIFY, ClassifyResult, base_context)
-        known_classes = {c.name for c in self._oracle.artifact_classes}
-        if classify.artifact_class not in known_classes:
-            classify = await self._call(
-                sweep,
-                CallKind.CLASSIFY,
-                ClassifyResult,
-                base_context,
-                repair_defects=[
-                    f"artifact_class must be one of {sorted(known_classes)}, "
-                    f"got {classify.artifact_class!r}"
-                ],
-            )
-            if classify.artifact_class not in known_classes:
-                raise LLMOutputError(
-                    f"classify returned unknown artifact class {classify.artifact_class!r}"
-                )
-        mode, mode_uncertain = self._resolve_mode(request, classify, artifact_text)
+        classify = await self._validated_class(sweep, classify, base_context)
+        mode, mode_uncertain = self._modes.resolve(request.mode, classify, artifact_text)
         if mode == "advisory" and mode_uncertain and request.mode == "auto":
             reprobe = await self._call(
                 sweep,
@@ -487,14 +439,18 @@ class ReviewPipeline:
                     "sentence exactly, or confirm the artifact does not claim conformance"
                 ],
             )
-            mode, mode_uncertain2 = self._resolve_mode(request, reprobe, artifact_text)
+            mode, mode_uncertain2 = self._modes.resolve(request.mode, reprobe, artifact_text)
             mode_uncertain = mode == "advisory" and mode_uncertain2
-            classify = reprobe
+            # The same validator as the first probe. Assigning `reprobe` unchecked meant a
+            # model that answered validly once and invalidly on the re-probe reached the
+            # lookup below with an unknown class, where a bare `next()` raised
+            # StopIteration inside a coroutine — RuntimeError, not a CreativeAgentError, so
+            # the CLI's typed handler missed it and a malformed model response was reported
+            # as exit 5 "unexpected error" instead of exit 3 (DEC-F24).
+            classify = await self._validated_class(sweep, reprobe, base_context)
 
         class_context = {**base_context, "mode": mode, "artifact_class": classify.artifact_class}
-        class_rule = next(
-            c for c in self._oracle.artifact_classes if c.name == classify.artifact_class
-        )
+        class_rule = self._modes.class_rule(classify.artifact_class)
 
         # Steps 4-5 (deterministic sweeps).
         deterministic: list[CandidateFinding] = [
@@ -527,7 +483,7 @@ class ReviewPipeline:
 
             # Step 7: claims + gates.
             claims_result = await self._call(sweep, CallKind.CLAIMS, ClaimsResult, class_context)
-            sections = self._sections_present(artifact_text, classify)
+            sections = self._modes.sections_present(artifact_text, classify)
             deterministic.extend(
                 self._gate_checker.findings_for(
                     claims_result.claims, classify.artifact_class, sections
@@ -654,7 +610,12 @@ class ReviewPipeline:
             )
 
         final_synthesis = sweep.synthesis
-        assert final_synthesis is not None
+        if final_synthesis is None:
+            # Unreachable on every path today — synthesis is assigned before this point —
+            # but an `assert` is the wrong guard for a None dereference: `python -O`
+            # removes it, and the lines below would then raise an AttributeError, which is
+            # not a CreativeAgentError and would therefore be reported as exit 5.
+            raise LLMOutputError("synthesis produced no result; nothing to publish")
         current_cycle = state.cycle + 1
         report = ReviewReport(
             artifact_id=request.artifact_id,
@@ -673,18 +634,27 @@ class ReviewPipeline:
             ],
             what_survives=self._guard.launder_all(final_synthesis.what_survives),
             residual_risks=self._guard.launder_all(final_synthesis.residual_risks),
-            # DEC-F16 claimed these were laundered and they were not: only the
-            # renderer's pipe/newline escape ran, so a bidi override or a zero-width
-            # run reached the report and the length cap never applied.
-            scope_items=self._laundered_scope(sweep),
+            scope_items=self._scope_items(sweep),
             verification_log=self._all_entries(sweep),
             escalation=escalation,
         )
-        rendered = self._renderer.render(report)
+        # DEC-F22: launder the assembled report, not a list of fields. Twice now the field
+        # list has been the defect — DEC-F16 missed two fields and DEC-F19 missed two more,
+        # among them the verification log's `assertion` and the doctrine sweep's
+        # `na_reason`. This walks every string on the report and excludes the structural
+        # ids instead, so a prose field added tomorrow is covered tomorrow. The per-field
+        # laundering above is left in place deliberately: findings are laundered where they
+        # are built because their text also reaches review state and the audit bundle,
+        # neither of which passes through here.
+        report = self._guard.launder_model(report)
 
         if review_failed_reason is not None:
-            # Per spec: failed, regenerated up to budget, never softened or published.
+            # Checked before rendering: on this path the report is discarded, and building
+            # and rendering it first was work whose only effect was to suggest to the next
+            # reader that the rendered text is available to the error handler.
             raise ReviewFailedError(review_failed_reason)
+
+        rendered = self._renderer.render(report)
 
         # Step 13: write state + audit bundle.
         new_record = CycleRecord(
@@ -745,14 +715,40 @@ class ReviewPipeline:
             state_path=str(state_path),
         )
 
-    def _laundered_scope(self, sweep: _SweepState) -> list[ScopeItem]:
-        """Scope references are model prose and pass through ThreatGuard like the rest."""
-        if sweep.judgement is None:
-            return []
-        return [
-            item.model_copy(update={"reference": self._guard.launder_prose(item.reference)})
-            for item in sweep.judgement.scope
-        ]
+    async def _validated_class(
+        self,
+        sweep: _SweepState,
+        classify: ClassifyResult,
+        context: dict[str, object],
+    ) -> ClassifyResult:
+        """Return a classify result whose `artifact_class` is one the oracle defines.
+
+        One re-probe naming the permitted set, then a typed failure. Both classify probes
+        route through this: the first probe had the check inline and the mode re-probe had
+        none, which is the shape of defect DEC-F24 is about — a value the model chose,
+        validated at the call site that happened to be written first.
+        """
+        known = self._modes.known_classes()
+        if classify.artifact_class in known:
+            return classify
+        retried = await self._call(
+            sweep,
+            CallKind.CLASSIFY,
+            ClassifyResult,
+            context,
+            repair_defects=[
+                f"artifact_class must be one of {sorted(known)}, got {classify.artifact_class!r}"
+            ],
+        )
+        if retried.artifact_class not in known:
+            raise LLMOutputError(
+                f"classify returned unknown artifact class {retried.artifact_class!r}"
+            )
+        return retried
+
+    def _scope_items(self, sweep: _SweepState) -> list[ScopeItem]:
+        """Scope items as the judgement returned them; laundering is DEC-F22's boundary."""
+        return list(sweep.judgement.scope) if sweep.judgement is not None else []
 
     def _write_audit_bundle(self, request: ReviewRequest, cycle: int, sweep: _SweepState) -> None:
         bundle_dir = self._settings.review_log_dir / request.artifact_id / f"cycle-{cycle}"
@@ -770,10 +766,6 @@ class ReviewPipeline:
             encoding="utf-8",
             newline="\n",
         )
-
-
-def _squash(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().casefold()
 
 
 def _mentions_row(defect: str, row_id: str) -> bool:

@@ -6,9 +6,10 @@ gate_policy and artifact_classes; nothing here fixes "4 gates" or "safety" in co
 
 from __future__ import annotations
 
+from creative_agent.errors import OracleValidationError
 from creative_agent.models.findings import SupportRef
 from creative_agent.models.gates import GateAssessment, MeasurementClaim
-from creative_agent.models.oracle import ArtifactClassRule, OracleTable
+from creative_agent.models.oracle import ArtifactClassRule, GateDefinition, OracleTable
 from creative_agent.models.sweeps import CandidateFinding
 
 
@@ -19,7 +20,26 @@ class MeasurementGateChecker:
         self._oracle = oracle
         self._policy = oracle.gate_policy
 
+    def _gate(self, name: str) -> GateDefinition:
+        """The gate definition by name, as a typed failure rather than a StopIteration.
+
+        A bare `next()` over oracle data raises StopIteration, which is not a
+        CreativeAgentError, so a data defect would surface as exit 5 "unexpected error"
+        rather than exit 4 — the misclassification DEC-F24 closed in the pipeline.
+        """
+        for gate in self._policy.gates:
+            if gate.name == name:
+                return gate
+        raise OracleValidationError(f"gate {name!r} is referenced but not declared")
+
     def _gate_description(self, name: str) -> str:
+        """The gate's description, falling back to its name.
+
+        Deliberately NOT `_gate`: this one is used to build a human-readable message for a
+        gate the model named, so an unknown name degrades to the name itself rather than
+        failing the review. `_gate` is for oracle-internal lookups, where an unknown name
+        is a data defect.
+        """
         for gate in self._policy.gates:
             if gate.name == name:
                 return gate.description
@@ -69,9 +89,18 @@ class MeasurementGateChecker:
         for assessment in self.assess(claims, artifact_class):
             if assessment.blueprint_blocker_gates:
                 for gate_name in assessment.blueprint_blocker_gates:
-                    definition = next(g for g in self._policy.gates if g.name == gate_name)
+                    definition = self._gate(gate_name)
                     severity = definition.blueprint_missing_severity
-                    assert severity is not None
+                    if severity is None:
+                        # Unreachable today: a gate only reaches `blueprint_blocker_gates`
+                        # by declaring this severity. An `assert` here was still wrong —
+                        # `python -O` strips it, and the next line would then hand `None`
+                        # to a Severity field, so the failure would surface as a pydantic
+                        # error about a model instead of a statement about the oracle.
+                        raise OracleValidationError(
+                            f"gate {gate_name!r} is a blueprint blocker gate but declares no "
+                            "blueprint_missing_severity"
+                        )
                     anchors = "; ".join(definition.anchors)
                     candidates.append(
                         CandidateFinding(

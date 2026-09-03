@@ -1,9 +1,9 @@
 {
   "_comment": "Kill-rate baseline for the enforcement core (severity.py, gates.py, verification.py, consistency.py). Checked in .github/workflows/mutation.yml via scripts/check_mutation_baseline.py — a fresh run's survived/no_tests/suspicious/timeout counts must not exceed these, and its `total` must not collapse or fall more than MAX_POPULATION_SHRINK_RATIO below the `total` here. Update this file only deliberately, with a reason below: a genuine equivalent mutant (document which one and why it cannot be killed) or a real change in the mutated population, never to quiet a regression.",
-  "_updated_reason": "Population grew 452 -> 470 because DEC-F12 added authority-bound evidence matching to verification.py (`_observed_identifiers`, `_observed_targets`, and the by-kind claim split in `check_tool_honesty`). All 470 killed on 2026-09-03 with zero survived/no_tests/suspicious/timeout. Recording the new total is what moves the population floor up with the code; leaving it at 452 would have let 18 mutants' worth of enforcement core be deleted without the guard noticing.",
+  "_updated_reason": "Population grew 470 -> 472: DEC-F25 replaced verification.py's private `_fold` with the shared `policy.fold_name` and DEC-F22 moved laundering to the report boundary, which changed what mutmut generates in the enforcement core. All 472 killed on 2026-09-03 with zero survived/no_tests/suspicious/timeout. Recording the new total is what moves the population floor up with the code — the point made when this went 452 -> 470, and the reason the floor is re-recorded rather than left alone every time the core changes shape. Note what mutation testing did NOT catch on this branch: the hook denying the SDK's own response channel (DEC-F20) is outside the mutated set and would not have been caught even inside it, because every test handed the model's answer over out of band. A 100% kill rate is a statement about the mutated modules under the existing tests, not about the product.",
   "updated": "2026-09-03",
-  "total": 470,
-  "killed": 470,
+  "total": 472,
+  "killed": 472,
   "survived": 0,
   "no_tests": 0,
   "suspicious": 0,

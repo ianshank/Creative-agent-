@@ -11,10 +11,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_origin
 
 import yaml
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -26,7 +26,16 @@ from creative_agent.errors import ConfigError
 from creative_agent.harness.canonical import DEFAULT_IDENTIFIER_AUTHORITIES
 from creative_agent.harness.security import DEFAULT_BLOCKED_HOST_SUFFIXES
 
-PermissionMode = Literal["default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions"]
+# `bypassPermissions` is deliberately absent. `harness/llm/claude_sdk.py`'s module
+# docstring has always said the adapter uses "headless permissions (permission_mode from
+# settings + restrictive allowed_tools — never bypassPermissions)", and the only thing
+# enforcing that was the default value: the mode was in this Literal, so a settings file
+# could select it and it reached `ClaudeAgentOptions` unmodified, turning the whole
+# DEC-F15 hook into advice. The test that claimed to check this asserted
+# `"bypass" not in options.permission_mode` on a fixture that set `dontAsk` — it
+# re-asserted its own input (DEC-F28). Removing the value from the type makes the
+# docstring true and the settings error a validation error at load time.
+PermissionMode = Literal["default", "acceptEdits", "plan", "dontAsk", "auto"]
 
 _CONFIG_ENV_VAR = "CREATIVE_AGENT_CONFIG"
 
@@ -101,6 +110,17 @@ class HarnessSettings(BaseSettings):
     # already refuses to credit WebSearch results as `fetched`. A multi-tenant deployment
     # should empty this list.
     unscoped_tools: list[str] = Field(default_factory=lambda: ["WebSearch"])
+
+    # Tools that are part of the SDK's own request/response protocol rather than a
+    # capability granted to the review (DEC-F20). `StructuredOutput` is how the SDK
+    # delivers a structured answer, so denying it does not harden the review — it stops
+    # the review from receiving any answer at all, which is exactly what deny-by-default
+    # did until the first live end-to-end run. Kept separate from `unscoped_tools` because
+    # the guidance for that list is "a multi-tenant deployment should empty it": emptying
+    # this one breaks the harness instead, so conflating the two would make the security
+    # advice self-defeating. Permitting the envelope grants nothing — the payload it
+    # carries is schema-validated on arrival and laundered before it reaches a report.
+    protocol_tools: list[str] = Field(default_factory=lambda: ["StructuredOutput"])
 
     # Which hosts may vouch for a scholarly identifier in the tool-honesty check
     # (DEC-F12). A fetch only credits an identifier when it came from that identifier's
@@ -181,22 +201,25 @@ class HarnessSettings(BaseSettings):
             return parsed
         return value
 
-    @field_validator(
-        "agent_tools",
-        "fetch_tool_names",
-        "unscoped_tools",
-        "oracle_search_paths",
-        "prompt_search_paths",
-        "blocked_host_suffixes",
-        mode="before",
-    )
+    @field_validator("*", mode="before")
     @classmethod
-    def _split_scalar_lists(cls, value: Any) -> Any:
-        """Accept `a,b` and `a:b` for list fields, not just JSON.
+    def _split_scalar_lists(cls, value: Any, info: ValidationInfo) -> Any:
+        """Accept `a,b` and `a:b` for every list field, not just JSON.
 
-        pydantic-settings only parses JSON for complex types, which made the documented
-        env syntax (`CREATIVE_AGENT_AGENT_TOOLS=Read,Grep`) fail with a parse error.
+        pydantic-settings only parses JSON for complex types, which made the documented env
+        syntax (`CREATIVE_AGENT_AGENT_TOOLS=Read,Grep`) fail with a parse error.
+
+        Applied to every list-annotated field rather than to a named six. The named form was
+        the same defect this codebase keeps finding elsewhere — a list of things to include,
+        which is wrong the moment someone adds the seventh. `protocol_tools` was that
+        seventh: DEC-F20 justified it as a list "so that an SDK that renames or adds a
+        protocol tool is a settings change", and the documented env shorthand rejected it
+        with a type error, so that was true of the YAML file and false of the environment.
+        Selecting by *shape* means the next list field works the day it is added.
         """
+        field = cls.model_fields.get(info.field_name or "")
+        if field is None or get_origin(field.annotation) is not list:
+            return value
         if isinstance(value, str):
             text = value.strip()
             if not text:

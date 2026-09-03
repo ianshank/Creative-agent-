@@ -217,6 +217,12 @@ class SourceQualityConfig(SchemaModel):
     bibliography_hygiene_severity: SeverityField
     vendor_domains: list[str] = Field(default_factory=list)
     vendor_page_note: str = Field(min_length=1)
+    # A severity, so it belongs to the doctrine table like every other severity in this
+    # config. It was a `severity="info"` literal at the call site in `sourcequality.py`,
+    # in a module whose docstring says "all thresholds and severities come from oracle
+    # data" and whose every sibling finding reads its severity from here. Defaulted rather
+    # than required so an existing v1 oracle file keeps loading unchanged.
+    vendor_page_severity: SeverityField = Severity.INFO
     load_bearing_requires_tiers: list[EvidenceTier] = Field(min_length=1)
     regime_breaks: list[str] = Field(default_factory=list)
 

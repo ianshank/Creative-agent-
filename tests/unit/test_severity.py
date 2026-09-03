@@ -208,11 +208,14 @@ class TestCapAll:
         ]
 
     def test_preserves_order_and_length(self) -> None:
+        """G19: the five findings used to be identical, so the order assertion could not
+        detect reordering — `[k, k, k, k, k] == [k, k, k, k, k]` holds under any
+        permutation. Distinct keys make the assertion mean what its name says."""
         policy = SeverityPolicy(make_oracle())
-        findings = [make_finding(key=make_key()) for _ in range(5)]
+        findings = [make_finding(key=make_key(slug=f"defect-{i}")) for i in range(5)]
         capped = policy.cap_all(findings, "conformance")
         assert len(capped) == 5
-        assert [c.key for c in capped] == [f.key for f in findings]
+        assert [c.key.slug for c in capped] == [f"defect-{i}" for i in range(5)]
 
     def test_empty_list_returns_empty_list(self) -> None:
         assert SeverityPolicy(make_oracle()).cap_all([], "conformance") == []

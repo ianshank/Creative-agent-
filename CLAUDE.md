@@ -12,6 +12,16 @@ targets, so anything green locally should be green in CI.
 - `make docker-test` — run the gate inside the container
 - `make help` — every target
 
+Two things `make gate` deliberately does not do, because both need a human to choose the
+input:
+
+- `uv run pytest -m live --no-cov` — the real SDK. Deselected by default; gated on a usable
+  credential, which an authenticated `claude` CLI satisfies (no API key needed). A *skip* is
+  not a pass. See `.claude/skills/live-verify`, and run a full end-to-end review too — the
+  live leg exercises one adapter call, not the pipeline.
+- `uv run python scripts/verify_guard.py --file <src> --find '<code>' --test '<selector>'` —
+  proves a test fails when the code it guards is reverted. See below.
+
 Underlying commands, if you need one in isolation: `uv run pytest`,
 `uv run ruff check .`, `uv run mypy`, `uv run lint-imports`,
 `uv run creative-agent oracles validate --all`, `uv run creative-agent assets validate`.
@@ -40,6 +50,33 @@ Underlying commands, if you need one in isolation: `uv run pytest`,
   executable and use `set -e`.
 - **Record the change:** user-visible changes get a `CHANGELOG.md` entry under
   Unreleased; deferred work goes in `docs/roadmap.md` rather than a TODO comment.
+- **A test must fail when its subject is reverted.** Before claiming a test enforces
+  anything, run `scripts/verify_guard.py` against it. This repository has shipped
+  green-but-hollow tests at every level — a renderer check that grepped for an escape
+  sequence, a glob parametrize listing only the shapes the code already caught, a budget
+  test watching a value the neighbouring statement computes, a permission assertion re-reading
+  its own fixture, an oracle invariant written to data that had just been hand-edited, and
+  five one-line deletions in `pipeline.py`/`cli.py` that each left the whole suite passing.
+  Coverage says a line executed; mutation testing says a mutant in the mutated set was
+  killed. Neither says the assertion would have noticed. Write the leaf test *and* an
+  integration assertion on the composed pipeline: the most common gap here is a well-tested
+  control whose caller never opts in.
+- **A shared rule lives in `harness/policy.py`; a decision with a truth table gets its own
+  module.** `policy` owns what two modules must agree on (evidence schemes, the URL pattern,
+  host parsing and suffix matching, name folding); `classification`, `budget` and `exitcodes`
+  exist because each holds a decision whose combinations deserve a table rather than an
+  end-to-end run. Extract for testability, never for line count.
+- **A gate must test the capability it needs, not a proxy for it.** The live leg skipped on
+  `ANTHROPIC_API_KEY` for a backend that does not require one, so it reported "cannot check"
+  in an environment where it works — and behind that silence sat a defect that broke every
+  review (DEC-F20/F21). A gate that is wrong in the safe direction is worse than no gate,
+  because it is counted.
+- **Coverage floors are a ratchet, and every module is under one.** Raise a floor whenever
+  the suite clears it; that needs no ceremony. Lowering one needs a decision-log entry
+  naming the coverage given up — with one qualification (DEC-F42): a floor may fall when
+  covered code *moves out* into a module that carries its own floor, which is a ratio
+  artefact rather than a regression. A module under no floor at all can regress to zero with
+  every gate green, so `TestEverySourceModuleIsUnderAFloor` fails on one.
 
 ## Reviewing artifacts in other repos (worktree workflow)
 
@@ -61,7 +98,12 @@ Review state and audit bundles stay in **this** repo under `docs/review-log/`. T
 - `.claude/skills/add-oracle/` — add a review corpus (data only, no code).
 - `.claude/skills/review-gate/` — run and interpret the full local quality gate.
 - `.claude/skills/oracle-rebaseline/` — re-verify doctrine sources (DOI/arXiv resolution
-  + mechanical author-list diff).
+  + mechanical author-list diff). `verified: true` means *this command ran*; a careful hand
+  reading goes in `notes` (DEC-F27).
+- `.claude/skills/guard-check/` — prove a test fails when the code it guards is reverted.
+- `.claude/skills/live-verify/` — the live test leg plus a real end-to-end review.
+- `.claude/agents/gap-auditor.md` — read-only audit for hollow tests and for claims that
+  outrun their code; reports findings marked PROVEN or REASONED.
 - `.claude/hooks/session-start.sh` — SessionStart: `uv sync` so a fresh container can run
   the suite immediately.
 - `.claude/hooks/validate-data.sh` — PostToolUse: re-validates oracle data after any

@@ -12,16 +12,18 @@ import os
 import re
 import textwrap
 import tomllib
+from collections import Counter
 from pathlib import Path, PurePosixPath
-from typing import ClassVar
+from typing import ClassVar, get_origin
 
 import pytest
 import yaml
 from mutmut.configuration import Config
+from pydantic import ValidationError
 from scripts.check_coverage_floors import APPROVED_OMITS, FLOORS
 
 from creative_agent.config import HarnessSettings
-from creative_agent.errors import ExitCode
+from creative_agent.errors import ConfigError, ExitCode
 
 PYPROJECT = Path(__file__).resolve().parents[2] / "pyproject.toml"
 
@@ -167,8 +169,21 @@ class TestDocumentationIsHonest:
         assert not missing, f"README references non-existent make targets: {sorted(missing)}"
 
     # Steps that prepare the environment rather than check anything.
-    SETUP_ACTIONS = ("actions/checkout", "astral-sh/setup-uv", "actions/upload-artifact")
-    SETUP_COMMANDS = ("uv python install", "make install")
+    SETUP_ACTIONS = (
+        "actions/checkout",
+        "astral-sh/setup-uv",
+        "actions/upload-artifact",
+        # Reports a failure after the fact; it runs no check of its own.
+        "actions/github-script",
+    )
+    SETUP_COMMANDS = (
+        "uv python install",
+        "make install",
+        # The weekly workflows sync directly rather than via `make install`; identical
+        # command, and requiring the target here would be style enforcement, not drift
+        # detection.
+        "uv sync",
+    )
     # CI checks that deliberately are not `make` targets, each with the reason it cannot
     # be one. Matched as substrings of the step's `run` command or `uses` action. A check
     # added to CI as a raw step is otherwise invisible to the scan below — it greppped
@@ -183,6 +198,18 @@ class TestDocumentationIsHonest:
             "builds and runs the container image; docker is not available in every "
             "environment `make gate` has to run in"
         ),
+        "make mutation": (
+            "weekly, and minutes per run; `make gate` must stay fast enough to run before "
+            "every push, so mutation testing has its own workflow and its own baseline file"
+        ),
+        "make live": (
+            "calls the real SDK, so it costs money and needs a credential; deselected from "
+            "the default suite by `addopts` and run weekly by live.yml"
+        ),
+        "ANTHROPIC_API_KEY": (
+            "live.yml's pre-flight, which FAILS the job when no credential is present so "
+            "an empty run cannot report success; a guard on a check, not a check"
+        ),
     }
 
     @classmethod
@@ -191,15 +218,25 @@ class TestDocumentationIsHonest:
         gate_line = next(line for line in makefile.splitlines() if line.startswith("gate:"))
         return set(gate_line.split(":")[1].split("##")[0].split())
 
+    # Every workflow that runs project checks, not just ci.yml. Reading one file was how
+    # `mutation.yml` came to restate the four steps of `make mutation` and `live.yml` to
+    # restate `make live`, both unnoticed, while CLAUDE.md and the Makefile header claimed
+    # "CI calls these targets rather than repeating the commands" (DEC-F37). A guard that
+    # inspects one of three files reports on one of three files.
+    CHECK_WORKFLOWS = ("ci.yml", "mutation.yml", "live.yml")
+
     @classmethod
     def _ci_steps(cls) -> list[tuple[str, str]]:
-        """(job name, what the step runs) for every step in ci.yml."""
-        workflow = yaml.safe_load((cls.ROOT / ".github/workflows/ci.yml").read_text("utf-8"))
-        return [
-            (job_name, str(step.get("run") or step.get("uses") or ""))
-            for job_name, job in workflow["jobs"].items()
-            for step in job.get("steps", [])
-        ]
+        """(job name, what the step runs) for every step in every check workflow."""
+        steps: list[tuple[str, str]] = []
+        for name in cls.CHECK_WORKFLOWS:
+            workflow = yaml.safe_load((cls.ROOT / ".github/workflows" / name).read_text("utf-8"))
+            steps.extend(
+                (f"{name}:{job_name}", str(step.get("run") or step.get("uses") or ""))
+                for job_name, job in workflow["jobs"].items()
+                for step in job.get("steps", [])
+            )
+        return steps
 
     @classmethod
     def _is_setup(cls, command: str) -> bool:
@@ -217,13 +254,19 @@ class TestDocumentationIsHonest:
         for job_name, command in self._ci_steps():
             if self._is_setup(command):
                 continue
+            if any(key in command for key in self.CHECKS_OUTSIDE_THE_GATE):
+                continue
             target = re.match(r"make ([a-z][\w-]*)", command)
             if target:
+                # A `make` target CI runs must either be part of `make gate` — so a
+                # contributor reproduces CI locally with one command — or be declared
+                # above with the reason it is not. The declared-exception check runs first
+                # so a deliberately-excluded target (`mutation`, `live`) is not reported as
+                # a hole in the gate.
                 assert target.group(1) in gate_deps, (
-                    f"job {job_name!r} runs `make {target.group(1)}`, which `make gate` omits"
+                    f"job {job_name!r} runs `make {target.group(1)}`, which `make gate` "
+                    "omits and CHECKS_OUTSIDE_THE_GATE does not declare"
                 )
-                continue
-            if any(key in command for key in self.CHECKS_OUTSIDE_THE_GATE):
                 continue
             unaccounted.append(f"{job_name}: {command.strip().splitlines()[0]}")
         assert not unaccounted, (
@@ -379,7 +422,14 @@ class TestCiWorkflowIsWired:
         """
         steps = self._workflow("live.yml")["jobs"]["live"]["steps"]
         commands = [str(step.get("run", "")) for step in steps]
-        pytest_at = next(i for i, run in enumerate(commands) if "pytest -m live" in run)
+        # Matches either the Makefile target or a raw pytest invocation, so the guard keeps
+        # working whichever way the workflow runs the tests. Anchoring it to one spelling
+        # is how a guard stops guarding after an unrelated refactor.
+        pytest_at = next(
+            i
+            for i, run in enumerate(commands)
+            if "pytest -m live" in run or re.search(r"\bmake live\b", run)
+        )
         guards = [
             run for run in commands[:pytest_at] if "ANTHROPIC_API_KEY" in run and "exit 1" in run
         ]
@@ -648,3 +698,215 @@ class TestPlatformSupportIsDeclaredHonestly:
                 if 'newline="\\n"' not in match.group(1):
                     offenders.append(f"{path.relative_to(self.ROOT)}: {match.group(1)[:60]}")
         assert offenders == [], f"write_text without newline=: {offenders}"
+
+
+class TestThePermissionModeDocstringIsEnforced:
+    """G11/DEC-F28: "never bypassPermissions" was a comment, not a control.
+
+    `claude_sdk.py`'s module docstring has always claimed the adapter uses restrictive
+    headless permissions and never `bypassPermissions`. The only thing enforcing that was
+    the default value — the mode was in the `PermissionMode` Literal, so a settings file
+    or an env var could select it and it reached `ClaudeAgentOptions` unmodified, which
+    would hand the session every tool the DEC-F15 hook exists to scope.
+
+    The test that claimed to check this asserted `"bypass" not in permission_mode` against
+    a fixture that had just set `dontAsk`: it re-asserted its own input and would have
+    passed against any implementation at all.
+    """
+
+    def test_bypass_permissions_is_refused_at_settings_load(self) -> None:
+        with pytest.raises(ValidationError):
+            HarnessSettings(permission_mode="bypassPermissions")  # type: ignore[arg-type]
+
+    def test_bypass_permissions_is_refused_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The env path is the one that matters: a deployment tunes settings there, and
+        `extra="ignore"` means a rejected *unknown* field is silent — so this has to be a
+        rejected *known* field, loudly."""
+        monkeypatch.setenv("CREATIVE_AGENT_PERMISSION_MODE", "bypassPermissions")
+        with pytest.raises(ValidationError):
+            HarnessSettings()
+
+    def test_the_restrictive_modes_still_load(self) -> None:
+        """A refusal that refused everything would be its own defect."""
+        for mode in ("default", "acceptEdits", "plan", "dontAsk", "auto"):
+            assert HarnessSettings(permission_mode=mode).permission_mode == mode  # type: ignore[arg-type]
+
+
+class TestTheSettingsLoaderRefusesBadConfigurationClearly:
+    """The composition root's error paths, which fell under no coverage floor at all.
+
+    `config.py` defines `protocol_tools`, `permission_mode`, the fetch allowlist and every
+    budget, and at 101 statements against a ~2700-statement total it could have regressed
+    to zero coverage with both `check_coverage_floors.py` and the global 90% gate still
+    green — the floors covered `harness/` and `models/` and simply had no prefix matching
+    it (DEC-F39).
+
+    These are all operator-facing: a wrong `CREATIVE_AGENT_CONFIG` or a mistyped env var is
+    the most likely way anyone meets this module, and a typed `ConfigError` naming the file
+    is the difference between a two-minute fix and a stack trace.
+    """
+
+    def test_an_unreadable_config_file_names_the_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CREATIVE_AGENT_CONFIG", str(tmp_path / "does-not-exist.yaml"))
+        with pytest.raises(ConfigError, match="cannot read"):
+            HarnessSettings()
+
+    def test_invalid_yaml_names_the_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bad = tmp_path / "settings.yaml"
+        bad.write_text("model: [unclosed\n", encoding="utf-8")
+        monkeypatch.setenv("CREATIVE_AGENT_CONFIG", str(bad))
+        with pytest.raises(ConfigError, match="invalid YAML"):
+            HarnessSettings()
+
+    def test_a_config_file_that_is_not_a_mapping_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        bad = tmp_path / "settings.yaml"
+        bad.write_text("- just\n- a\n- list\n", encoding="utf-8")
+        monkeypatch.setenv("CREATIVE_AGENT_CONFIG", str(bad))
+        with pytest.raises(ConfigError, match="must contain a mapping"):
+            HarnessSettings()
+
+    def test_an_empty_config_file_is_not_an_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A commented-out file is a legitimate way to say "all defaults"."""
+        empty = tmp_path / "settings.yaml"
+        empty.write_text("# nothing set\n", encoding="utf-8")
+        monkeypatch.setenv("CREATIVE_AGENT_CONFIG", str(empty))
+        assert HarnessSettings().model == "inherit"
+
+    def test_a_malformed_json_mapping_from_the_environment_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CREATIVE_AGENT_IDENTIFIER_AUTHORITY_HOSTS", "{not json")
+        with pytest.raises(ValidationError, match="invalid JSON mapping"):
+            HarnessSettings()
+
+    def test_a_json_array_where_a_mapping_is_documented_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CREATIVE_AGENT_IDENTIFIER_AUTHORITY_HOSTS", '["arxiv.org"]')
+        with pytest.raises(ValidationError, match="JSON object"):
+            HarnessSettings()
+
+    def test_an_empty_mapping_env_var_means_no_authorities(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CREATIVE_AGENT_IDENTIFIER_AUTHORITY_HOSTS", "  ")
+        assert HarnessSettings().identifier_authority_hosts == {}
+
+    def test_a_malformed_json_list_from_the_environment_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CREATIVE_AGENT_AGENT_TOOLS", "[not json")
+        with pytest.raises(ValidationError, match="invalid JSON list"):
+            HarnessSettings()
+
+    def test_an_empty_list_env_var_means_an_empty_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`CREATIVE_AGENT_UNSCOPED_TOOLS=` is the documented multi-tenant hardening step."""
+        monkeypatch.setenv("CREATIVE_AGENT_UNSCOPED_TOOLS", "")
+        assert HarnessSettings().unscoped_tools == []
+
+    @pytest.mark.parametrize(
+        "field_name",
+        sorted(
+            name
+            for name, field in HarnessSettings.model_fields.items()
+            if get_origin(field.annotation) is list
+        ),
+    )
+    def test_every_list_field_accepts_the_documented_comma_shorthand(
+        self, field_name: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Parametrized over the fields the model *has*, not a list someone maintains.
+
+        `protocol_tools` was added without the shorthand, so DEC-F20's "an SDK that renames
+        its protocol tool is a settings change" was true of the YAML file and false of the
+        environment. Selecting by shape means the next list field is covered the day it is
+        added rather than the day someone remembers to extend a parametrize list.
+        """
+        monkeypatch.setenv(f"CREATIVE_AGENT_{field_name.upper()}", "alpha,beta")
+        assert [str(v) for v in getattr(HarnessSettings(), field_name)] == ["alpha", "beta"]
+
+
+class TestEverySourceModuleIsUnderAFloor:
+    """A floor list with a hole in it is a floor list that permits silent regression.
+
+    `check_coverage_floors.py` already refuses a prefix that matches nothing — a renamed
+    directory would otherwise disable the gate quietly. This is the converse, and it is the
+    direction that was missing: a module matching *no* prefix is equally unguarded, just
+    from the other side. `config.py` was that module — the composition root, 101 statements
+    against a ~2700-statement total, so it could have gone to zero coverage with both this
+    script and the global 90% gate green (DEC-F39).
+    """
+
+    def test_no_source_module_falls_outside_every_floor(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        unfloored: list[str] = []
+        for path in sorted((root / "src" / "creative_agent").rglob("*.py")):
+            relative = path.relative_to(root).as_posix()
+            if path.name == "__init__.py":
+                continue
+            if any(relative.endswith(omit.lstrip("*/")) for omit in APPROVED_OMITS):
+                continue
+            if not relative.startswith(tuple(FLOORS)):
+                unfloored.append(relative)
+        assert not unfloored, (
+            "these modules match no coverage floor, so they can regress to zero while "
+            f"every gate stays green: {unfloored}"
+        )
+
+
+class TestNoTestIsSilentlyShadowed:
+    """A duplicate class or method name discards the earlier definition without a word.
+
+    This is not hypothetical here. A fix for a CI failure was appended as a second
+    `TestArtifactPathEdgeCases`, Python kept the later definition, and the corrected tests
+    never ran — the same CI job failed again on the same test name, and the fix looked
+    ineffective when it had simply been shadowed. Neither pytest nor ruff says anything:
+    the collected count is silently lower than the count someone wrote.
+
+    That is the branch's whole subject wearing a different hat — a test that does not run
+    is the limit case of a test that does not hold — so it gets a guard rather than a
+    resolution to be careful.
+    """
+
+    def test_no_test_module_defines_a_name_twice(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        shadowed: list[str] = []
+        for path in sorted(root.rglob("test_*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            top_level = [
+                node.name
+                for node in tree.body
+                if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+            ]
+            shadowed += [
+                f"{path.name}::{name}" for name, count in Counter(top_level).items() if count > 1
+            ]
+            for node in tree.body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                methods = [
+                    child.name
+                    for child in node.body
+                    if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef)
+                ]
+                shadowed += [
+                    f"{path.name}::{node.name}::{name}"
+                    for name, count in Counter(methods).items()
+                    if count > 1
+                ]
+        assert not shadowed, (
+            "these names are defined twice, so the earlier definition never runs and the "
+            f"suite silently collects fewer tests than were written: {shadowed}"
+        )

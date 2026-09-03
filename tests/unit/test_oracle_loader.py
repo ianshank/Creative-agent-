@@ -8,10 +8,17 @@ import pytest
 import yaml
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
+from pydantic import ValidationError
 
 from creative_agent.errors import ConfigError, CreativeAgentError, OracleValidationError
 from creative_agent.harness.oracle import OracleLoader
-from creative_agent.models.oracle import FreshnessMeta, OracleTable
+from creative_agent.models.oracle import (
+    DecisionLogGrammar,
+    FreshnessMeta,
+    GateDefinition,
+    GatePolicy,
+    OracleTable,
+)
 from tests.factories import make_oracle, make_row, make_source
 
 MAX_BYTES = 2_000_000
@@ -252,12 +259,71 @@ class TestShippedOracleStalenessInvariants:
                 continue
             assert row.is_stale(table.freshness), f"{row.id} is unverified but not stale"
 
-    def test_the_rebaselined_rows_carry_a_verification_date(self) -> None:
-        """D5, D8 and D11 were resolved by hand against the papers' own title pages."""
+    def test_every_verified_source_carries_a_verification_date(self) -> None:
+        """`verified: true` without `last_verified` is a claim with no timestamp.
+
+        This used to name D5, D8 and D11 as verified, which was the defect rather than the
+        invariant: those three were flipped by hand from a mirror reading, and the flag
+        asserts that the rebaseline resolver diffed the author list (DEC-F27). Stated as a
+        property of every source instead, it holds regardless of which rows are resolved
+        next, and it cannot be satisfied by editing the test to match the data.
+        """
+        for row in self._sutton().rows:
+            for source in row.sources:
+                assert not source.verified or source.last_verified, (
+                    f"{row.id}: a source claims verification with no last_verified date"
+                )
+
+    def test_a_hand_checked_source_is_not_marked_verified(self) -> None:
+        """DEC-F27: the flag is a severity lever, so it means what the resolver did.
+
+        `verified: true` suppresses the staleness cap, which is the only thing holding an
+        unresolved row at `unverified_row_cap`. D5 and D11 are tier AP and D8 is tier PR,
+        and both tiers may carry a Blocker — so hand-flipping the flag exempted three rows
+        from the cap on evidence nobody can re-run. A note recording a hand check is
+        useful; the flag is not the place for it.
+        """
         table = self._sutton()
-        for row_id in ("D5", "D8", "D11"):
-            row = table.row(row_id)
-            assert row.has_verified_source(), f"{row_id} lost its verified source"
-            assert any(s.verified and s.last_verified for s in row.sources), (
-                f"{row_id} claims verification with no last_verified date"
+        for row in table.rows:
+            for source in row.sources:
+                notes = (source.notes or "").lower()
+                if "by hand" in notes or "not machine-resolved" in notes:
+                    assert not source.verified, (
+                        f"{row.id}: a source whose own notes describe a hand check is "
+                        "marked verified; that flag means the resolver ran"
+                    )
+
+
+class TestTheSchemaGuardsProtectingTheDoctrineData:
+    """G20: two validator error paths were untested.
+
+    For a project whose thesis is "doctrine tables are data, never code", the schema
+    guards protecting that data are the wrong thing to leave unheld: they are the only
+    thing standing between a careless YAML edit and a review that misbehaves quietly.
+    """
+
+    def test_duplicate_gate_names_are_refused(self) -> None:
+        """Two gates with one name means one of them can never be cited or scored."""
+        with pytest.raises(ValidationError, match="duplicate"):
+            GatePolicy(
+                gates=[
+                    GateDefinition(name="observable", description="a"),
+                    GateDefinition(name="observable", description="b"),
+                ],
+                missing_any_severity="major",
+                quant_claim_requires=["dataset"],
+                hand_asserted_severity="major",
+            )
+
+    def test_a_decision_log_grammar_without_the_named_groups_is_refused(self) -> None:
+        """`entry_pattern` is read from oracle data and applied to another repository's
+        decision log. Without both named groups the gate silently matches nothing, which
+        reads as "no decisions required" rather than as a broken pattern."""
+        with pytest.raises(ValidationError):
+            DecisionLogGrammar(entry_pattern=r"^#+\s+(DEC-\w+)", confirmed_status="CONFIRMED")
+
+    def test_an_uncompilable_entry_pattern_is_refused(self) -> None:
+        with pytest.raises(ValidationError):
+            DecisionLogGrammar(
+                entry_pattern=r"(?P<id>DEC-[A-Z]+(?P<status>", confirmed_status="CONFIRMED"
             )

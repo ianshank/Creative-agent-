@@ -26,10 +26,18 @@ WORKDIR /app
 
 # Dependency layer first: source edits do not invalidate the resolved environment.
 COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --locked --no-install-project --no-dev
+# `--extra llm` is load-bearing, not belt and braces. `claude-agent-sdk` is an optional
+# extra and there is no `default-extras`, so a plain `uv sync` produced a runtime image
+# with no SDK at all: every review that was not `--offline` failed with LLMTransportError,
+# in an image whose own header says an API key is supplied at run time (DEC-F36).
+#
+# `--no-dev` is deliberately absent: `dev` here is an *extra*, not a PEP 735 dependency
+# group, so the flag referred to a group that does not exist and excluded nothing. A no-op
+# flag that reads as protection is worse than no flag.
+RUN uv sync --locked --no-install-project --extra llm
 
 COPY src ./src
-RUN uv sync --locked --no-dev
+RUN uv sync --locked --extra llm
 
 # --- test --------------------------------------------------------------------
 FROM base AS test

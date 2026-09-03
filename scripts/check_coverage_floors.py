@@ -22,15 +22,50 @@ from collections import defaultdict
 from pathlib import Path
 
 # target prefix -> (line floor %, branch floor %)
+#
+# A floor is a ratchet, not an aspiration: it is set just under what the suite currently
+# achieves, so a change that removes coverage fails rather than spending headroom someone
+# else earned. Leaving a floor far below actual coverage is the same defect as having no
+# floor — it permits a silent regression of everything in between, which is exactly how
+# `verification.py` came to have two branches (the two tool-honesty paths) that could be
+# deleted with the suite still green while its floor read a comfortable 95/90.
+#
+# Raising a floor is routine and needs no ceremony. LOWERING one needs a decision-log
+# entry saying which coverage was given up and why.
 FLOORS: dict[str, tuple[float, float]] = {
-    "src/creative_agent/harness": (90.0, 80.0),
-    "src/creative_agent/models": (95.0, 85.0),
-    "src/creative_agent/cli.py": (85.0, 70.0),
+    "src/creative_agent/harness": (96.0, 92.0),
+    "src/creative_agent/models": (99.0, 99.0),
+    "src/creative_agent/cli.py": (86.0, 88.0),
     # The enforcement core: a softened rule here is the worst silent failure the harness
     # can have, so these carry their own floors rather than hiding in the package average.
-    "src/creative_agent/harness/pipeline.py": (88.0, 75.0),
-    "src/creative_agent/harness/severity.py": (95.0, 90.0),
-    "src/creative_agent/harness/verification.py": (95.0, 90.0),
+    # 89, not 90, and it moved DOWN — see DEC-F42. Extracting `ModeResolver` and
+    # `RunBudget` moved ~100 fully-covered lines out of this module and into two modules
+    # that carry 100/100 floors of their own, so the branch ratio of what remains fell
+    # while total enforcement rose. The two branches still uncovered here are a defensive
+    # `raise` that no path reaches and the repair loop exhausting without a break.
+    "src/creative_agent/harness/pipeline.py": (99.0, 89.0),
+    "src/creative_agent/harness/severity.py": (100.0, 100.0),
+    "src/creative_agent/harness/verification.py": (100.0, 100.0),
+    # The security surface: every one of this branch's live defects was here.
+    "src/creative_agent/harness/security.py": (97.0, 96.0),
+    "src/creative_agent/harness/canonical.py": (100.0, 100.0),
+    "src/creative_agent/harness/artifact.py": (100.0, 100.0),
+    "src/creative_agent/harness/classification.py": (100.0, 100.0),
+    "src/creative_agent/harness/budget.py": (100.0, 100.0),
+    "src/creative_agent/harness/exitcodes.py": (100.0, 100.0),
+    "src/creative_agent/harness/policy.py": (100.0, 100.0),
+    "src/creative_agent/harness/asset_references.py": (100.0, 100.0),
+    "src/creative_agent/harness/filelock.py": (95.0, 85.0),
+    # The composition root. It is where `protocol_tools`, `permission_mode`, the fetch
+    # allowlist and every budget are defined, and it fell under NO floor: at 98 statements
+    # against a ~2700-statement total it could have regressed to zero coverage with both
+    # this script and the global 90% gate still green.
+    "src/creative_agent/config.py": (98.0, 90.0),
+    "src/creative_agent/errors.py": (100.0, 100.0),
+    # The one shipped agent plugin. The framework claim is that a new corpus is a YAML
+    # file and not new code, which makes this module the reference implementation of the
+    # plugin contract — the thing a second distribution would copy.
+    "src/creative_agent/agents": (100.0, 100.0),
 }
 
 # Modules deliberately outside the gate. Changing this set requires a decision-log entry

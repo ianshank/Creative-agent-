@@ -36,7 +36,19 @@ fetch_tool_names: [WebFetch, Read]
 # logged with the query's length, never its text. Empty this list for a multi-tenant
 # deployment; adding a tool to agent_tools without scoping it here means it is denied.
 unscoped_tools: [WebSearch]
-permission_mode: dontAsk  # default | acceptEdits | plan | dontAsk | auto | bypassPermissions
+
+# Tools that are part of the SDK's own request/response protocol rather than a capability
+# granted to the review (DEC-F20). `StructuredOutput` is how the SDK delivers a structured
+# answer, so denying it does not harden anything — it stops the harness receiving any
+# answer at all, which is what deny-by-default did until the first live run. Separate from
+# unscoped_tools on purpose: the advice for that list is "empty it for a multi-tenant
+# deployment", and emptying THIS one breaks the harness.
+protocol_tools: [StructuredOutput]
+
+# `bypassPermissions` is deliberately not offered: it is the absence of the tool sandbox,
+# not a tuning knob, and DEC-F28 removed it from the type. Setting it fails validation at
+# load time. This comment used to list it as valid.
+permission_mode: dontAsk  # default | acceptEdits | plan | dontAsk | auto
 
 # --- Identifier authorities (tool honesty, DEC-F12) --------------------------
 # Which hosts may vouch for a scholarly identifier. A `fetched=true` verification entry
@@ -44,10 +56,11 @@ permission_mode: dontAsk  # default | acceptEdits | plan | dontAsk | auto | bypa
 # http(s) from one of these hosts (or a subdomain of one), so a decoy URL that merely
 # mentions `arxiv.org/abs/<id>`, or a local Read of a file named after it, proves nothing.
 # Data rather than literals: an institutional mirror or a DOI proxy belongs here, not in a
-# code change. KNOWN LIMIT (DEC-F19): this reaches the honesty checker only. The fetch
-# allowlist the PreToolUse hook enforces is built separately, so a mirror named here is
-# accepted as evidence but its fetch is still denied at the call boundary. Configuring a
-# mirror is not yet a settings change end to end. From the environment this one takes JSON:
+# code change — and end to end since DEC-F25: `ThreatGuard` seeds the PreToolUse fetch
+# allowlist from this same setting, so a mirror named here is both fetchable and able to
+# vouch for an identifier. (Until then it reached the honesty checker only, so a configured
+# mirror was accepted as evidence for a fetch the hook denied.) From the environment this
+# one takes JSON:
 #   CREATIVE_AGENT_IDENTIFIER_AUTHORITY_HOSTS='{"arxiv": ["arxiv.org", "mirror.example"]}'
 identifier_authority_hosts:
   arxiv: [arxiv.org]

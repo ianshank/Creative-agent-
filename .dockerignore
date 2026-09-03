@@ -34,3 +34,11 @@ docs/review-log/*
 .idea
 .vscode
 .DS_Store
+
+# `Dockerfile` COPYs `.claude`, and a subagent worktree under it is a second full checkout
+# — including any local `config/settings.yaml` inside it, which the root-level rule above
+# does not reach. `.gitignore` already excludes it; these three keep the two files agreeing
+# about what is build output (DEC-F35).
+.claude/worktrees
+.diff_cover*
+.import_linter_cache

@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 from typer.testing import CliRunner
 
+from creative_agent import errors
 from creative_agent.cli import app
 from creative_agent.errors import ExitCode, ReviewFailedError
 from creative_agent.harness import pipeline as pipeline_module
+from creative_agent.models.findings import FindingKey
 from creative_agent.models.oracle import ArtifactClassRule, ProtocolConfig
+from creative_agent.models.state import EscalationEvent
 from tests.factories import make_oracle
 
 runner = CliRunner()
@@ -245,3 +250,204 @@ class TestOfflineCeilingBanner:
         result = runner.invoke(app, ["review", str(env), "--offline", "--mode", "conformance"])
         assert self.NOTE in result.output
         assert "could not have failed on content" not in result.output
+
+
+class TestTheExitCodesAreObservedAtTheProcessBoundary:
+    """G8: every `RUN_ABORTED` assertion in the suite was a class-attribute check.
+
+    `ExitCode.RUN_ABORTED == 6` says what the enum holds, not what the process returns.
+    Nothing invoked the CLI and observed a 6, so any regression in `_fail`'s routing — or
+    one of these three errors escaping the `except CreativeAgentError` block — would
+    silently degrade a retryable abort into exit 5 "unexpected error". The distinction
+    between 5 and 6 is the entire content of DEC-F17's addition to a frozen contract: 6
+    means retry, 5 means something is broken.
+    """
+
+    @pytest.mark.parametrize(
+        "error_name",
+        ["BudgetExceededError", "LLMTimeoutError", "StateConflictError"],
+    )
+    def test_a_run_abort_exits_six(
+        self, env: Path, monkeypatch: pytest.MonkeyPatch, error_name: str
+    ) -> None:
+        error_type = getattr(errors, error_name)
+
+        async def abort(self: object, request: object) -> None:
+            raise error_type("stopped before a verdict")
+
+        monkeypatch.setattr(pipeline_module.ReviewPipeline, "run", abort)
+        result = runner.invoke(app, ["review", str(env), "--offline"])
+        assert result.exit_code == int(ExitCode.RUN_ABORTED), result.output
+
+    def test_a_review_failure_still_exits_three(
+        self, env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The neighbouring code, asserted alongside so the parametrize above cannot pass
+        by mapping everything to 6."""
+
+        async def failed(self: object, request: object) -> None:
+            raise ReviewFailedError("verification log incomplete")
+
+        monkeypatch.setattr(pipeline_module.ReviewPipeline, "run", failed)
+        result = runner.invoke(app, ["review", str(env), "--offline"])
+        assert result.exit_code == int(ExitCode.REVIEW_FAILED), result.output
+
+
+class TestTheArtifactPathIsCheckedBeforeItIsUsed:
+    """DEC-F23: the CLI read the artifact before the containment check existed for it.
+
+    `read_artifact`'s refusal was added to the pipeline's read. The CLI's read, twenty
+    lines earlier, had no containment root — and it is the read whose result decides the
+    artifact id, which `--reset-state` then acts on. So the file the check was meant to
+    refuse was read anyway, and its front matter chose which review-log entry to delete.
+    """
+
+    @staticmethod
+    def _worktree_with_escaping_symlink(tmp_path: Path) -> tuple[Path, Path]:
+        repo = tmp_path / "worktree"
+        (repo / "docs").mkdir(parents=True)
+        outside = tmp_path / "outside.md"
+        outside.write_text(
+            "---\nreview-id: someone-elses-artifact\n---\n\n# Not in the worktree\n",
+            encoding="utf-8",
+        )
+        artifact = repo / "docs" / "design.md"
+        artifact.symlink_to(outside)
+        return repo, artifact
+
+    def test_a_symlink_out_of_the_reviewed_repo_is_refused_by_the_cli(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("CREATIVE_AGENT_REVIEW_LOG_DIR", str(tmp_path / "review-log"))
+        repo, artifact = self._worktree_with_escaping_symlink(tmp_path)
+        result = runner.invoke(
+            app, ["review", str(artifact), "--offline", "--artifact-repo", str(repo)]
+        )
+        assert result.exit_code == int(ExitCode.CONFIG_ERROR), result.output
+
+    def test_reset_state_cannot_delete_a_third_artifacts_history(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The data-loss case, stated as a test.
+
+        The out-of-tree file's front matter names a *different* artifact. Before the fix
+        the CLI read it, resolved that id, and `store.reset()` deleted that artifact's
+        cycle history and its escalation counter — the counter that drives the cycle-3
+        charter-review STOP — before the pipeline refused the same file.
+        """
+        review_log = tmp_path / "review-log"
+        monkeypatch.setenv("CREATIVE_AGENT_REVIEW_LOG_DIR", str(review_log))
+        repo, artifact = self._worktree_with_escaping_symlink(tmp_path)
+        review_log.mkdir(parents=True)
+        victim = review_log / "someone-elses-artifact.md"
+        victim.write_text(
+            "---\nschema_version: 1\nartifact_id: someone-elses-artifact\ncycle: 3\n"
+            "history: []\n---\n\nprior review\n",
+            encoding="utf-8",
+        )
+
+        runner.invoke(
+            app,
+            [
+                "review",
+                str(artifact),
+                "--offline",
+                "--artifact-repo",
+                str(repo),
+                "--reset-state",
+            ],
+        )
+        assert victim.exists(), "a refused artifact must not delete another artifact's state"
+
+
+class TestTheEscalationExitCodeIsMapped:
+    """G9: exit 2 was only ever reached through the *severity* half of the condition.
+
+    `if outcome.result.escalation is not None or Severity.BLOCKER in severities` — every
+    CLI test that observes exit 2 does so because a Blocker is present, so reducing the
+    condition to the Blocker check alone left the suite green. A cycle-3 charter-review
+    STOP would then render its block in the report and exit 0, and the hand-off to the
+    owner — the entire point of escalation — would never reach CI.
+    """
+
+    def test_a_charter_review_stop_exits_two_with_no_blocker_present(
+        self, env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_run = pipeline_module.ReviewPipeline.run
+
+        async def escalating(self: Any, request: Any) -> Any:
+            outcome = await real_run(self, request)
+            escalation = EscalationEvent(
+                key=FindingKey(row_id="D1", slug="recurring-defect"),
+                cycles=[1, 2, 3],
+                message="STOP — charter review triggered",
+            )
+            return replace(
+                outcome,
+                result=outcome.result.model_copy(update={"escalation": escalation}),
+            )
+
+        # The control: the SAME invocation without the escalation exits 0, so the 2 above
+        # cannot be coming from a Blocker in the artifact. Asserting the severities were
+        # below Blocker would be the weaker claim — and in an offline run, where every
+        # finding is Info-capped, it would be true no matter what the CLI did with the
+        # escalation, which is how the original gap survived.
+        baseline = runner.invoke(app, ["review", str(env), "--offline", "--reset-state"])
+        assert baseline.exit_code == 0, baseline.output
+
+        monkeypatch.setattr(pipeline_module.ReviewPipeline, "run", escalating)
+        result = runner.invoke(app, ["review", str(env), "--offline", "--reset-state"])
+        assert result.exit_code == int(ExitCode.BLOCKER_OR_STOP), result.output
+
+
+class TestAssetsCommandEnforcesBodyReferences:
+    """G6: the DEC-F29 checks were opt-in, and nothing held the opt-in.
+
+    Replacing the CLI's `collect(target, references=...)` with `collect(target)` left all
+    25 asset-reference tests green while `make assets` silently stopped checking every
+    asset body — because the end-to-end test built its own `ReferenceContext` instead of
+    going through the CLI. Third instance on this branch of "the leaf is tested, the
+    opt-in is not", and the parameter defaults to skipping the check.
+    """
+
+    @staticmethod
+    def _claude_tree(tmp_path: Path, body: str) -> Path:
+        claude = tmp_path / ".claude"
+        skill = claude / "skills" / "probe"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: probe\ndescription: >\n  A probe skill with a long enough "
+            "description to be trigger-worthy for the validator.\n---\n\n" + body,
+            encoding="utf-8",
+        )
+        (claude / "agents").mkdir()
+        (claude / "agents" / "probe-agent.md").write_text(
+            "---\nname: probe-agent\ndescription: >\n  A probe agent with a long enough "
+            "description to be trigger-worthy for the validator.\n---\n\nBody.\n",
+            encoding="utf-8",
+        )
+        hooks = claude / "hooks"
+        hooks.mkdir()
+        hook = hooks / "probe.sh"
+        hook.write_text("#!/usr/bin/env bash\nset -e\n", encoding="utf-8")
+        hook.chmod(0o755)
+        (claude / "settings.json").write_text("{}\n", encoding="utf-8")
+        return claude
+
+    def test_a_stale_path_reference_fails_the_cli(self, tmp_path: Path) -> None:
+        claude = self._claude_tree(tmp_path, "Run `scripts/does-not-exist.py` first.\n")
+        result = runner.invoke(app, ["assets", "validate", "--claude-dir", str(claude)])
+        assert result.exit_code != 0, result.output
+        assert "does-not-exist.py" in result.output
+
+    def test_an_unregistered_subcommand_fails_the_cli(self, tmp_path: Path) -> None:
+        claude = self._claude_tree(tmp_path, "Run `creative-agent verify-everything`.\n")
+        result = runner.invoke(app, ["assets", "validate", "--claude-dir", str(claude)])
+        assert result.exit_code != 0, result.output
+        assert "verify-everything" in result.output
+
+    def test_a_clean_asset_tree_passes(self, tmp_path: Path) -> None:
+        """The control: the failures above must come from the reference, not the fixture."""
+        claude = self._claude_tree(tmp_path, "Run `make gate` before pushing.\n")
+        result = runner.invoke(app, ["assets", "validate", "--claude-dir", str(claude)])
+        assert result.exit_code == 0, result.output

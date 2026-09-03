@@ -62,10 +62,6 @@ class MigrationChain:
                 )
 
     @property
-    def format_name(self) -> str:
-        return self._format_name
-
-    @property
     def current_version(self) -> int:
         return self._current_version
 

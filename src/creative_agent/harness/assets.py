@@ -25,6 +25,7 @@ from typing import Any
 
 import yaml
 
+from creative_agent.harness.asset_references import ReferenceContext, missing_references
 from creative_agent.harness.logging import get_logger, log_event
 
 _LOGGER = get_logger(__name__)
@@ -255,12 +256,35 @@ def _empty_inventory_defects(
     return defects
 
 
+def _reference_defects(
+    label: str, body: str, context: ReferenceContext | None
+) -> list[AssetDefect]:
+    """Body references that no longer resolve (DEC-F29).
+
+    Skipped entirely when no context is supplied, because resolving a repository path
+    against the wrong tree would report every reference as broken — a validator that fails
+    on everything is as useless as one that passes on everything, and louder.
+    """
+    if context is None:
+        return []
+    return [AssetDefect(label, message) for message in missing_references(body, context)]
+
+
 def collect(
-    claude_dir: Path, known_tools: frozenset[str] | None = None
+    claude_dir: Path,
+    known_tools: frozenset[str] | None = None,
+    *,
+    references: ReferenceContext | None = None,
 ) -> tuple[AssetInventory, list[AssetDefect]]:
     """Load and validate every asset under a `.claude` directory.
 
     An inventory that came back empty is itself a defect: see `_empty_inventory_defects`.
+
+    `references` enables the body-reference checks (DEC-F29): an asset whose instructions
+    name a deleted script, an undeclared `make` target, an unregistered subcommand or an
+    unwritten decision. It is optional so that every existing caller — and any consumer
+    validating a `.claude` tree outside a repository — keeps working exactly as before;
+    without it the shape checks run alone, as they did.
     """
     inventory = AssetInventory()
     defects: list[AssetDefect] = []
@@ -271,9 +295,10 @@ def collect(
     for path in agent_paths:
         defects.extend(validate_agent(path, known_tools))
         try:
-            meta, _ = parse_front_matter(path)
+            meta, body = parse_front_matter(path)
         except ValueError:
             continue
+        defects.extend(_reference_defects(path.name, body, references))
         inventory.agents[str(meta.get("name", path.stem))] = meta
 
     skill_paths = SKILL_ASSETS.files(claude_dir)
@@ -281,9 +306,10 @@ def collect(
     for path in skill_paths:
         defects.extend(validate_skill(path))
         try:
-            meta, _ = parse_front_matter(path)
+            meta, body = parse_front_matter(path)
         except ValueError:
             continue
+        defects.extend(_reference_defects(f"{path.parent.name}/SKILL.md", body, references))
         inventory.skills[str(meta.get("name", path.parent.name))] = meta
 
     hook_paths = HOOK_ASSETS.files(claude_dir)
