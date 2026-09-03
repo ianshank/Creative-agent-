@@ -273,3 +273,61 @@ class TestARevertThatDoesNotRunIsNotAKill:
             assert main(_revert_args(toy, "test_strong.py")) == EXIT_CANNOT_CHECK
         finally:
             original_restore({toy / "toy.py": SOURCE + "\n"})
+
+
+class TestARestoreThatFailsIsNotAWeakGuard:
+    """An `OSError` escaping the restore ends the process with exit code 1.
+
+    Which is `EXIT_GUARD_WEAK`. The two are the same integer, so a permissions failure or
+    a race during restore would reach a caller as "the behaviour was removed and your test
+    did not notice" — sending someone to rewrite a test that is fine, while a reverted
+    working tree sits underneath. That is the same confusion the exit-code split was
+    introduced to remove, arriving through the one code path that bypasses it.
+    """
+
+    def test_an_oserror_from_restore_is_reported_not_raised(
+        self, toy: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fake restores the content *and* raises, so only the error branch can answer.
+
+        Leaving the file reverted would let the content check answer CANNOT CHECK for the
+        other reason, and the test would pass with the handler deleted.
+        """
+        (toy / "test_strong.py").write_text(STRONG_TEST + "\n", encoding="utf-8")
+
+        real_restore = verify_guard.restore
+
+        def restore_then_fail(originals: dict[Path, str]) -> None:
+            real_restore(originals)
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr(verify_guard, "restore", restore_then_fail)
+
+        assert main(_revert_args(toy, "test_strong.py")) == EXIT_CANNOT_CHECK
+        assert (toy / "toy.py").read_text(encoding="utf-8") == SOURCE + "\n"
+
+    def test_restore_puts_back_every_file_it_can_before_reporting(self, tmp_path: Path) -> None:
+        """One unwritable file must not strand the others in their reverted state.
+
+        The failing entry is first, so an implementation that aborts on the first error
+        never reaches the second file — which is what this asserts.
+        """
+        blocked = tmp_path / "blocked"
+        blocked.mkdir()
+        good = tmp_path / "good.py"
+        good.write_text("reverted\n", encoding="utf-8")
+
+        with pytest.raises(OSError, match="could not restore"):
+            verify_guard.restore({blocked: "unwritable", good: "original\n"})
+
+        assert good.read_text(encoding="utf-8") == "original\n"
+
+    def test_a_file_that_cannot_be_read_back_counts_as_unrestored(self, tmp_path: Path) -> None:
+        """Verification must not assume success just because the read raised.
+
+        `read_text` on a vanished or unreadable path throws the same `OSError` class that
+        broke the restore, and letting it escape lands on exit 1 again.
+        """
+        failures = verify_guard.restore_failures({tmp_path / "gone.py": "original\n"})
+        assert len(failures) == 1
+        assert "cannot be read back" in failures[0]

@@ -189,8 +189,42 @@ def apply(guard: Guard) -> dict[Path, str]:
 
 
 def restore(originals: dict[Path, str]) -> None:
+    """Put every file back, attempting all of them before reporting a failure.
+
+    Best-effort across files deliberately: aborting on the first write error would leave
+    the remaining files reverted for a reason that has nothing to do with them, and the
+    operator would then have a partially reverted tree *and* an error naming only one
+    file. Every failure is collected into the raised message instead.
+    """
+    failed: list[str] = []
     for path, text in originals.items():
-        path.write_text(text, encoding="utf-8")
+        try:
+            path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            failed.append(f"{path} ({exc})")
+    if failed:
+        raise OSError("could not restore: " + ", ".join(failed))
+
+
+def restore_failures(originals: dict[Path, str]) -> list[str]:
+    """Every file that is not back to its original content, and why.
+
+    Reads defensively. Whatever broke a restore is likely to break the read that verifies
+    it, and an `OSError` escaping here would end the process with exit code 1 — which is
+    `EXIT_GUARD_WEAK`. A failed restore reported as a weak test is precisely the confusion
+    these exit codes exist to prevent, and it would arrive with a modified working tree
+    behind it.
+    """
+    failures: list[str] = []
+    for path, text in originals.items():
+        try:
+            restored = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            failures.append(f"{path} (cannot be read back: {exc})")
+            continue
+        if restored != text:
+            failures.append(f"{path} (content differs from the original)")
+    return failures
 
 
 def _describe(code: int) -> str:
@@ -218,18 +252,27 @@ def check(guard: Guard) -> int:
         print(f"  ERROR: cannot apply the revert: {exc}")
         return EXIT_CANNOT_CHECK
 
+    restore_error: OSError | None = None
     try:
         reverted = run_tests(guard.tests)
     finally:
         # Restore in `finally` so a KeyboardInterrupt mid-run cannot leave the tree
-        # reverted, but *verify* the restore outside it: a `return` inside `finally`
-        # discards the exception that sent us here, so the operator would be told the
-        # file was not restored and never learn why the run stopped.
-        restore(originals)
-    unrestored = [p for p, text in originals.items() if p.read_text(encoding="utf-8") != text]
-    if unrestored:
-        names = ", ".join(str(p) for p in unrestored)
-        print(f"  ERROR: not restored: {names}; check these before committing.")
+        # reverted — but neither `return` nor raise from inside it. A `return` discards
+        # the exception that sent us here; an escaping `OSError` ends the process with
+        # exit code 1, which every caller reads as EXIT_GUARD_WEAK. So the message is
+        # printed here, where it is seen even while another exception is propagating,
+        # and the verdict is decided below.
+        try:
+            restore(originals)
+        except OSError as exc:
+            restore_error = exc
+            print(f"  ERROR: {exc}")
+
+    unrestored = restore_failures(originals)
+    if restore_error is not None or unrestored:
+        for failure in unrestored:
+            print(f"  ERROR: not restored: {failure}")
+        print("  Check these files before committing; the tree may still be reverted.")
         return EXIT_CANNOT_CHECK
 
     if reverted == _PYTEST_OK:

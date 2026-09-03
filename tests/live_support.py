@@ -11,10 +11,13 @@ succeeds, the live leg reported "no API key" and skipped, and the roadmap record
 fail (DEC-F20). A gate that reports success while verifying nothing is worse than no gate,
 because it is counted.
 
-So the predicate below asks whether *some* usable credential path exists, and the failure
-direction is deliberate: if a credential is present but unusable, the test fails rather
-than skipping. A skip is a claim that the check could not be run; a failure is a claim
-that it ran and did not pass. Only the first is honest when no credential exists at all.
+The predicate below is still a proxy — `shutil.which` proves the CLI is installed, not that
+it holds a session, and nothing short of a real call can prove that. What changed is the
+direction it is wrong in. An unauthenticated `claude` on PATH makes the live tests **run and
+fail**, which is loud and true; the old predicate made a working environment **skip**, which
+is quiet and false. A skip claims the check could not be run; a failure claims it ran and
+did not pass. Only the first is honest when no credential path exists at all, and only a
+proxy that errs toward failing keeps that claim honest.
 """
 
 from __future__ import annotations
@@ -32,10 +35,16 @@ SKIP_REASON = (
 
 @lru_cache(maxsize=1)
 def sdk_credential_available() -> bool:
-    """True when some credential path the SDK can use is present.
+    """True when a credential path the SDK *could* use is present — not that it works.
 
-    Two, because the SDK accepts two. `ANTHROPIC_BASE_URL` alone is not one of them: a
-    proxy address says where to send a request, not what authorises it.
+    Two paths, because the SDK accepts two. `ANTHROPIC_BASE_URL` alone is not one of them:
+    a proxy address says where to send a request, not what authorises it.
+
+    `shutil.which` is explicitly a cheap proxy: it finds the executable, and an installed
+    but unauthenticated `claude` returns True here. That is the intended reading — the live
+    tests then run and fail with the SDK's own authentication error, which names the real
+    problem, rather than skipping and reporting "cannot check" about an environment that
+    was never checked.
 
     Deliberately not a probe call. Making the predicate itself an API call would mean a
     network blip reads as "cannot check" and skips — reintroducing the decorative gate

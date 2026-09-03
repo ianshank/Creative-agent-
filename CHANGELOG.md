@@ -39,6 +39,30 @@ still hold.
 It was found by running the `gap-auditor` agent — added in the same commit — against its own
 branch.
 
+A second defect of the same shape survived that fix, and was found in review. `restore()`
+ran inside a bare `finally`, so an `OSError` from it — a read-only mount, a permissions
+change, a race — escaped `main()`. An uncaught exception ends a Python process with exit
+code **1**, and `EXIT_GUARD_WEAK` *is* 1. A failed restore therefore reached any caller
+reading the exit code as "the behaviour was removed and your test did not notice", with a
+still-reverted working tree underneath it. Three changes, each with a guard verified against
+its revert:
+
+- The restore inside `finally` is caught and reported, and decides the verdict *after* the
+  block — a `return` inside `finally` would discard whatever exception sent us there.
+- `restore()` now attempts every file before raising, collecting the failures into one
+  message. Aborting on the first left the remaining files reverted for a reason unrelated
+  to them.
+- The read-back that verifies the restore catches its own `OSError`. Whatever broke the
+  write is likely to break the read, and letting that escape landed on exit 1 again.
+
+### Corrected
+
+`tests/live_support.py` overstated its own predicate. `shutil.which("claude")` proves the
+CLI is installed, not that it holds a session, and the docstring claimed the latter. The
+predicate is unchanged and still correct — an unauthenticated CLI makes the live tests *run
+and fail* rather than skip, which is the honest direction — but describing a proxy as a
+capability check is the exact error DEC-F21 exists to record.
+
 ### Two more defects in the enforcement path
 
 - **A fabricated gate reference lifted the severity cap.** `GatePolicy.all_gate_refs()`
