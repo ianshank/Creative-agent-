@@ -575,3 +575,95 @@ evidence-authority check and F12's "a mirror is a settings change" becomes true 
 
 Scheme sets stay in code rather than settings: "only http and https are retrieval evidence"
 is an invariant, not a knob. The defect was that the invariant was written twice.
+
+## DEC-F27 — `verified` means the resolver ran, never a careful reading — CONFIRMED, corrects part of DEC-F13
+
+**Problem:** the same commit that made the staleness cap fire for the first time exempted
+three rows from it by hand. D5, D8 and D11 were flipped `verified: false` → `true` with
+notes conceding what happened: arxiv.org is unreachable from this environment (the egress
+proxy returns 403 for `export.arxiv.org` and `api.crossref.org` alike), so the papers were
+read through a third-party mirror and the author lists diffed by eye. `freshness.
+rebaseline_count` was hand-bumped 0 → 1 alongside, though the command that owns that
+counter never ran.
+
+That flag is not bookkeeping. `verified: true` short-circuits `OracleRow.is_stale`, which
+suppresses `SeverityPolicy`'s staleness cap, which is the only thing holding an unresolved
+row at `unverified_row_cap: minor`. D5 and D11 are tier `AP` and D8 is tier `PR`, and
+`blocker_tiers: [PR, AP]` — so the hand edit restored full Blocker authority to three rows
+on evidence that cannot be re-run, produced by exactly the process (an LLM reading a paper
+and transcribing an author list) whose failure in v1 is the reason this oracle exists.
+
+**Decision:** `verified: true` asserts that the rebaseline resolver resolved the source and
+diffed its author list, producing a `ResolutionResult`. Nothing else sets it — not a
+careful hand check, not a mirror, not a reading that turned out to be right. The three
+rows are back to `verified: false` and `rebaseline_count` to 0; the hand readings are kept
+in `notes`, relabelled as leads, because they are genuinely useful to whoever runs the
+resolver next.
+
+The effect is to make the review stricter on the shipped corpus, which is the correct
+direction for an uncertainty of this kind: an unresolved row capped at Minor understates a
+real defect, while a fabricated author list published at Blocker is the failure this whole
+project is a reaction to.
+
+**The test was part of the defect.** `test_the_rebaselined_rows_carry_a_verification_date`
+named D5, D8 and D11 and asserted they stay verified — written to the data as it had just
+been edited, so it locked the hand edit in and would have failed the honest correction. It
+is now a property of every source (`verified` implies `last_verified`) plus a guard that
+refuses the flag on any source whose own notes describe a hand check. Both hold whatever
+the corpus does next, and neither can be satisfied by editing the test to match the data.
+
+**Unblocking it properly:** the resolver needs egress to `export.arxiv.org` and
+`api.crossref.org`, or `arxiv_api_url`/`crossref_api_url` pointed at a reachable mirror —
+both already settings. That is a run of an existing command, not new code.
+
+## DEC-F26 — A glob is refused by shape, not by its literal prefix — CONFIRMED, corrects DEC-F19
+
+**Problem:** `**/../../../etc/*` was allowed. `../../**/*` was denied. The two differ only
+in where the traversal sits relative to the first metacharacter, and `glob_pattern_root`
+cuts the literal prefix at that metacharacter — so a pattern that opens with one has an
+empty prefix, and an empty prefix reads as "relative to the base directory", which the
+caller has already approved. `*/../../../etc/passwd`, `?/../*` and `[a]/../../../etc/*`
+all walked out of the read roots the same way.
+
+DEC-F19 had already fixed one instance of this exact shape (`/etc*/*` versus `/etc/**/*`)
+by keeping the trailing separator. It fixed the instance and not the class, and the tests
+written alongside it enumerated the shapes the code already caught — traversal before the
+first metacharacter, every time.
+
+**Decision:** three refusals by shape, evaluated before any prefix logic and independent of
+where metacharacters fall: a `..` segment anywhere, a backslash anywhere, and a brace or
+bracket group containing a path separator or `~`. A review reads down from its roots and
+never up, so no legitimate pattern contains `..`; a backslash is a path separator on the
+platform this project now claims to support and an ordinary filename character on this
+one, so a pattern containing one is either an escape attempt or a mistake.
+
+**The generalisation, which is the point of a third entry on one function:** any rule that
+inspects only the longest literal prefix is defeated by moving a metacharacter one
+character to the left. Prefix analysis can decide where a pattern *starts*; it cannot
+decide where a pattern can *reach*. Reach is a question about shape.
+
+## DEC-F28 — `bypassPermissions` is not a configurable value — CONFIRMED
+
+**Problem:** `harness/llm/claude_sdk.py`'s module docstring says the adapter uses
+"headless permissions (permission_mode from settings + restrictive allowed_tools — never
+bypassPermissions)". `bypassPermissions` was a member of the `PermissionMode` Literal, so
+a settings file or a `CREATIVE_AGENT_PERMISSION_MODE` env var selected it, and it reached
+`ClaudeAgentOptions` unmodified — handing the session every tool the DEC-F15 hook exists to
+scope. The only thing enforcing the docstring was the default value.
+
+The test that claimed to check this asserted `"bypass" not in str(options.permission_mode)`
+against a fixture that set `dontAsk` eight lines above. It re-asserted its own input, and
+would have passed against an adapter that ignored the setting entirely.
+
+**Decision:** the value is removed from the type. An unusable configuration is a load-time
+`ValidationError` with the field named, not a runtime posture change nobody notices. This
+is the narrow case where a value belongs *out* of settings: the no-hard-coded-values rule
+exists so deployments can tune behaviour, and "disable the tool sandbox" is not a tuning
+knob — it is the absence of the control, and a deployment that needs it needs a different
+tool.
+
+**Pattern, shared with DEC-F27 and DEC-F26:** all three defects were guarded by a test that
+asserted its own fixture, or enumerated the cases the implementation already handled. A
+test written against the implementation confirms the implementation; only a test written
+against the *claim* can find the gap between them. Where these entries add a test, it is
+phrased as a property of every input rather than as a list of the inputs that work today.

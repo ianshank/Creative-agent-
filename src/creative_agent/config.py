@@ -26,7 +26,16 @@ from creative_agent.errors import ConfigError
 from creative_agent.harness.canonical import DEFAULT_IDENTIFIER_AUTHORITIES
 from creative_agent.harness.security import DEFAULT_BLOCKED_HOST_SUFFIXES
 
-PermissionMode = Literal["default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions"]
+# `bypassPermissions` is deliberately absent. `harness/llm/claude_sdk.py`'s module
+# docstring has always said the adapter uses "headless permissions (permission_mode from
+# settings + restrictive allowed_tools — never bypassPermissions)", and the only thing
+# enforcing that was the default value: the mode was in this Literal, so a settings file
+# could select it and it reached `ClaudeAgentOptions` unmodified, turning the whole
+# DEC-F15 hook into advice. The test that claimed to check this asserted
+# `"bypass" not in options.permission_mode` on a fixture that set `dontAsk` — it
+# re-asserted its own input (DEC-F28). Removing the value from the type makes the
+# docstring true and the settings error a validation error at load time.
+PermissionMode = Literal["default", "acceptEdits", "plan", "dontAsk", "auto"]
 
 _CONFIG_ENV_VAR = "CREATIVE_AGENT_CONFIG"
 

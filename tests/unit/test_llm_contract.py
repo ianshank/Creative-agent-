@@ -7,7 +7,6 @@ exceptions from the adapter.
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import pytest
@@ -20,6 +19,7 @@ from creative_agent.harness.llm.fake import FakeLLMClient, script_key
 from creative_agent.harness.llm.offline import OfflineLLMClient
 from creative_agent.harness.prompting import output_model_for
 from creative_agent.harness.protocols import LLMClient
+from tests.live_support import SKIP_REASON, sdk_credential_available
 from tests.unit.test_claude_sdk_adapter import ResultMessage, transport
 
 
@@ -107,12 +107,16 @@ class TestContractErrors:
 
 
 @pytest.mark.live()
+@pytest.mark.skipif(not sdk_credential_available(), reason=SKIP_REASON)
 class TestLiveSmoke:
-    """Weekly: one real SDK call (live.yml). Requires ANTHROPIC_API_KEY."""
+    """Weekly: real SDK calls (live.yml).
+
+    Gated on a usable credential rather than on `ANTHROPIC_API_KEY` specifically — the
+    SDK authenticates through the `claude` CLI too, and gating on the key alone skipped
+    this leg in environments where a live call works (DEC-F21).
+    """
 
     async def test_real_structured_output(self) -> None:
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            pytest.skip("no API key")
         adapter = ClaudeSDKAdapter(HarnessSettings(max_turns=2))
         prompt = AssembledPrompt(
             kind=CallKind.CLAIMS,
@@ -121,4 +125,26 @@ class TestLiveSmoke:
             output_schema=output_model_for(CallKind.CLAIMS).model_json_schema(),
         )
         result = await adapter.generate(prompt)
+        output_model_for(CallKind.CLAIMS).model_validate(result.payload)
+
+    async def test_the_hook_does_not_deny_the_sdks_own_response_channel(self) -> None:
+        """The live regression for DEC-F20, stated as its own test.
+
+        `test_real_structured_output` above would also have caught it — the adapter builds
+        the same hook — which is the point worth recording: the gate existed, aimed at
+        exactly this, and never ran, because it skipped on a credential form the SDK does
+        not require. This test names the defect so a future reader knows what the live leg
+        is for, rather than inferring it from a smoke test.
+
+        A default-settings adapter is used deliberately. The defect was in the defaults.
+        """
+        adapter = ClaudeSDKAdapter(HarnessSettings(max_turns=2))
+        prompt = AssembledPrompt(
+            kind=CallKind.CLAIMS,
+            system="Extract measurable claims. Reply only via structured output.",
+            user="The controller runs at 50 Hz on one core.",
+            output_schema=output_model_for(CallKind.CLAIMS).model_json_schema(),
+        )
+        result = await adapter.generate(prompt)
+        assert result.kind is CallKind.CLAIMS
         output_model_for(CallKind.CLAIMS).model_validate(result.payload)

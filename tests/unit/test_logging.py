@@ -10,6 +10,7 @@ import pytest
 
 from creative_agent.harness.logging import (
     LOGGER_NAMESPACE,
+    JsonFormatter,
     configure_logging,
     get_logger,
     log_event,
@@ -112,3 +113,34 @@ class TestTimedStage:
         with timed_stage(get_logger("t"), "llm.call"):
             pass
         assert stream.getvalue() == ""
+
+
+class TestForeignRecordsCannotLeakArbitraryFields:
+    """G17: `_record_context`'s fallback serialises `record.__dict__` for any record
+    lacking the harness context key.
+
+    DEC-F10 forbids logging prompt or artifact text. This is the branch that decides what
+    a *foreign* log record — a dependency's, or a `logger.info(..., extra={...})` call
+    that did not go through `log_event` — puts into the JSON line, and it was covered by
+    nothing. A library that stuffs a response body into `extra` would have it serialised
+    into the harness's own structured log.
+    """
+
+    def test_a_foreign_extra_is_serialised_but_reserved_fields_are_not(self) -> None:
+        logger = logging.getLogger("creative_agent.test.foreign")
+        record = logger.makeRecord(
+            "creative_agent.test.foreign",
+            logging.INFO,
+            __file__,
+            1,
+            "plain message",
+            None,
+            None,
+            extra={"tenant": "acme"},
+        )
+        payload = json.loads(JsonFormatter().format(record))
+        assert payload["message"] == "plain message"
+        assert payload["tenant"] == "acme"
+        # The reserved LogRecord attributes must not be dumped alongside: `args`, `msg`
+        # and `pathname` are noise at best and a second copy of the message at worst.
+        assert not {"args", "msg", "pathname", "exc_info"} & set(payload)

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -12,7 +14,9 @@ from creative_agent import errors
 from creative_agent.cli import app
 from creative_agent.errors import ExitCode, ReviewFailedError
 from creative_agent.harness import pipeline as pipeline_module
+from creative_agent.models.findings import FindingKey
 from creative_agent.models.oracle import ArtifactClassRule, ProtocolConfig
+from creative_agent.models.state import EscalationEvent
 from tests.factories import make_oracle
 
 runner = CliRunner()
@@ -354,3 +358,43 @@ class TestTheArtifactPathIsCheckedBeforeItIsUsed:
             ],
         )
         assert victim.exists(), "a refused artifact must not delete another artifact's state"
+
+
+class TestTheEscalationExitCodeIsMapped:
+    """G9: exit 2 was only ever reached through the *severity* half of the condition.
+
+    `if outcome.result.escalation is not None or Severity.BLOCKER in severities` — every
+    CLI test that observes exit 2 does so because a Blocker is present, so reducing the
+    condition to the Blocker check alone left the suite green. A cycle-3 charter-review
+    STOP would then render its block in the report and exit 0, and the hand-off to the
+    owner — the entire point of escalation — would never reach CI.
+    """
+
+    def test_a_charter_review_stop_exits_two_with_no_blocker_present(
+        self, env: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_run = pipeline_module.ReviewPipeline.run
+
+        async def escalating(self: Any, request: Any) -> Any:
+            outcome = await real_run(self, request)
+            escalation = EscalationEvent(
+                key=FindingKey(row_id="D1", slug="recurring-defect"),
+                cycles=[1, 2, 3],
+                message="STOP — charter review triggered",
+            )
+            return replace(
+                outcome,
+                result=outcome.result.model_copy(update={"escalation": escalation}),
+            )
+
+        # The control: the SAME invocation without the escalation exits 0, so the 2 above
+        # cannot be coming from a Blocker in the artifact. Asserting the severities were
+        # below Blocker would be the weaker claim — and in an offline run, where every
+        # finding is Info-capped, it would be true no matter what the CLI did with the
+        # escalation, which is how the original gap survived.
+        baseline = runner.invoke(app, ["review", str(env), "--offline", "--reset-state"])
+        assert baseline.exit_code == 0, baseline.output
+
+        monkeypatch.setattr(pipeline_module.ReviewPipeline, "run", escalating)
+        result = runner.invoke(app, ["review", str(env), "--offline", "--reset-state"])
+        assert result.exit_code == int(ExitCode.BLOCKER_OR_STOP), result.output

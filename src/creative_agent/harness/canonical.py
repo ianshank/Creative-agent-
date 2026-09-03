@@ -79,13 +79,6 @@ def all_identifiers(text: str) -> set[str]:
     return found
 
 
-def identifier_scheme(canonical_id: str | None) -> str | None:
-    """The registry an identifier belongs to: 'arxiv:2401.12345' -> 'arxiv'."""
-    if not canonical_id or ":" not in canonical_id:
-        return None
-    return canonical_id.split(":", 1)[0].lower()
-
-
 def _host_is_under(host: str, authority: str) -> bool:
     """True for the authority itself or any subdomain of it.
 

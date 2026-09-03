@@ -97,7 +97,7 @@ class SourceQualityChecker:
             return []
         return [
             CandidateFinding(
-                severity="info",
+                severity=self._config.vendor_page_severity,
                 summary=(
                     f"Vendor page(s) cited ({', '.join(urls[:5])}"
                     + (", …" if len(urls) > 5 else "")

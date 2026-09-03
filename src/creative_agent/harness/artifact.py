@@ -93,13 +93,12 @@ def validate_artifact_path(
 
 
 def read_artifact(path: Path, max_bytes: int, *, containment_root: Path | None = None) -> str:
-    """Validate the path, then read it, re-checking the size after the read.
+    """Validate the path, then read it, re-checking the size against the bytes read.
 
-    The second size check catches a file that grew between the `stat` and the read.
+    `validate_artifact_path` checks the size the filesystem reports; the check after the
+    read catches a file that grew in between, which the reported size cannot.
     """
-    info = validate_artifact_path(path, max_bytes, containment_root=containment_root)
-    if info.st_size > max_bytes:
-        raise ConfigError(f"artifact {path} exceeds {max_bytes} bytes ({info.st_size} bytes)")
+    validate_artifact_path(path, max_bytes, containment_root=containment_root)
     try:
         data = path.read_bytes()
     except OSError as exc:

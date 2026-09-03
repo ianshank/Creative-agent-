@@ -379,3 +379,81 @@ class TestArtifactPathIsUntrusted:
         target.write_text("x" * 500, encoding="utf-8")
         with pytest.raises(ConfigError, match="exceeds"):
             read_artifact(target, 100)
+
+
+class TestArtifactPathEdgeCases:
+    """G18: the containment check's error branch is attacker-reachable.
+
+    `except (OSError, RuntimeError, ValueError)` around `path.resolve()` looks defensive
+    until you notice that the reviewed worktree is untrusted and git carries symlinks: a
+    symlink loop inside it makes `resolve()` raise `OSError(ELOOP)`, so this is a path a
+    reviewed repository can choose, not a theoretical one.
+    """
+
+    def test_a_symlink_loop_at_the_artifact_is_a_typed_config_error(self, tmp_path: Path) -> None:
+        """The loop fails at `stat()` with ELOOP, before resolution is even attempted."""
+        repo = tmp_path / "worktree"
+        (repo / "docs").mkdir(parents=True)
+        first = repo / "docs" / "design.md"
+        second = repo / "docs" / "other.md"
+        first.symlink_to(second)
+        second.symlink_to(first)
+        with pytest.raises(ConfigError, match="cannot read artifact"):
+            read_artifact(first, 10_000, containment_root=repo)
+
+    def test_an_unresolvable_containment_root_is_a_typed_config_error(self, tmp_path: Path) -> None:
+        """The other branch, which the loop-at-the-artifact case never reaches.
+
+        `Path.resolve()` raises `RuntimeError` — not `OSError` — on a symlink loop, and
+        `containment_root` is resolved separately from the artifact. A regular artifact
+        under a looping repo root therefore takes the `except (OSError, RuntimeError,
+        ValueError)` path, which is why that tuple has three members. Both are shapes a
+        checked-out worktree can have, since git carries symlinks.
+        """
+        repo = tmp_path / "repo"
+        other = tmp_path / "repo2"
+        repo.symlink_to(other)
+        other.symlink_to(repo)
+        artifact = tmp_path / "design.md"
+        artifact.write_text("# Design\n", encoding="utf-8")
+        with pytest.raises(ConfigError, match="cannot resolve artifact"):
+            read_artifact(artifact, 10_000, containment_root=repo)
+
+    def test_a_character_device_is_refused_before_it_is_read(self, tmp_path: Path) -> None:
+        """`stat().st_size` reports 0 for /dev/zero, so the size cap passed and the read
+        then never terminated — an out-of-memory from a one-line symlink."""
+        device = tmp_path / "design.md"
+        device.symlink_to(Path("/dev/zero"))
+        with pytest.raises(ConfigError, match="not a regular file"):
+            read_artifact(device, 10_000)
+
+    def test_a_file_that_grows_after_the_stat_is_still_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The size cap is checked twice because the first check is a claim about the
+        filesystem's metadata and the second is a fact about the bytes in hand.
+
+        The window between them is real: the artifact lives in a repository the reviewer
+        does not control, and a 20 MB cap that can be stepped over by growing the file
+        after `stat` is not a cap. Simulated rather than raced, because a test that has to
+        win a race to fail is a test that reports flake.
+        """
+        artifact = tmp_path / "design.md"
+        artifact.write_text("small", encoding="utf-8")
+        monkeypatch.setattr(Path, "read_bytes", lambda self: b"x" * 5_000)
+        with pytest.raises(ConfigError, match="exceeds"):
+            read_artifact(artifact, 100)
+
+    def test_a_read_failure_after_a_successful_stat_is_a_typed_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Permissions can change, and a removable volume can go away, between the two."""
+        artifact = tmp_path / "design.md"
+        artifact.write_text("content", encoding="utf-8")
+
+        def vanished(self: Path) -> bytes:
+            raise OSError(5, "Input/output error")
+
+        monkeypatch.setattr(Path, "read_bytes", vanished)
+        with pytest.raises(ConfigError, match="cannot read artifact"):
+            read_artifact(artifact, 100_000)

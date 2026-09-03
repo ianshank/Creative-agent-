@@ -18,6 +18,7 @@ from typing import ClassVar
 import pytest
 import yaml
 from mutmut.configuration import Config
+from pydantic import ValidationError
 from scripts.check_coverage_floors import APPROVED_OMITS, FLOORS
 
 from creative_agent.config import HarnessSettings
@@ -648,3 +649,37 @@ class TestPlatformSupportIsDeclaredHonestly:
                 if 'newline="\\n"' not in match.group(1):
                     offenders.append(f"{path.relative_to(self.ROOT)}: {match.group(1)[:60]}")
         assert offenders == [], f"write_text without newline=: {offenders}"
+
+
+class TestThePermissionModeDocstringIsEnforced:
+    """G11/DEC-F28: "never bypassPermissions" was a comment, not a control.
+
+    `claude_sdk.py`'s module docstring has always claimed the adapter uses restrictive
+    headless permissions and never `bypassPermissions`. The only thing enforcing that was
+    the default value — the mode was in the `PermissionMode` Literal, so a settings file
+    or an env var could select it and it reached `ClaudeAgentOptions` unmodified, which
+    would hand the session every tool the DEC-F15 hook exists to scope.
+
+    The test that claimed to check this asserted `"bypass" not in permission_mode` against
+    a fixture that had just set `dontAsk`: it re-asserted its own input and would have
+    passed against any implementation at all.
+    """
+
+    def test_bypass_permissions_is_refused_at_settings_load(self) -> None:
+        with pytest.raises(ValidationError):
+            HarnessSettings(permission_mode="bypassPermissions")  # type: ignore[arg-type]
+
+    def test_bypass_permissions_is_refused_from_the_environment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The env path is the one that matters: a deployment tunes settings there, and
+        `extra="ignore"` means a rejected *unknown* field is silent — so this has to be a
+        rejected *known* field, loudly."""
+        monkeypatch.setenv("CREATIVE_AGENT_PERMISSION_MODE", "bypassPermissions")
+        with pytest.raises(ValidationError):
+            HarnessSettings()
+
+    def test_the_restrictive_modes_still_load(self) -> None:
+        """A refusal that refused everything would be its own defect."""
+        for mode in ("default", "acceptEdits", "plan", "dontAsk", "auto"):
+            assert HarnessSettings(permission_mode=mode).permission_mode == mode  # type: ignore[arg-type]

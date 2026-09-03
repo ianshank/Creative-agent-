@@ -1,13 +1,17 @@
 """FileStateStore round-trip, corruption handling, BC fixture; CycleEscalator matrix."""
 
+import multiprocessing
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from creative_agent.errors import StateConflictError, StateCorruptError
+from creative_agent.harness.filelock import exclusive_lock
 from creative_agent.harness.state import CycleEscalator, FileStateStore
 from creative_agent.models.findings import Severity
 from creative_agent.models.review import ReviewResult
@@ -278,3 +282,80 @@ class TestResetIsLocked:
         monkeypatch.setattr(FileStateStore, "_locked", watched)
         store.reset("a")
         assert entered == ["a"], "reset unlinked without taking the write lock"
+
+
+class TestEveryCorruptionBranchIsReachable:
+    """G12: only one of `FileStateStore.load`'s four corruption branches was tested.
+
+    The tested one is "no front matter at all". The three untested ones matter more for
+    the case that actually happens: a partially-flushed write is far more likely to be an
+    unparseable YAML fragment than a file with no `---` delimiters. That branch is also
+    the one `_assert_no_conflict` catches to turn a concurrent partial write into a
+    `StateConflictError`, so it is load-bearing for DEC-F14 as well as for a plain
+    corruption report. The fourth is where a future migration step lands (DEC-F18).
+    """
+
+    @staticmethod
+    def _store_with(tmp_path: Path, front_matter: str) -> tuple[FileStateStore, str]:
+        store = FileStateStore(tmp_path)
+        path = store.path_for("design")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(front_matter, encoding="utf-8")
+        return store, "design"
+
+    def test_unparseable_yaml_is_a_typed_corruption_error(self, tmp_path: Path) -> None:
+        store, artifact = self._store_with(tmp_path, "---\na: [unclosed\n---\n\nbody\n")
+        with pytest.raises(StateCorruptError):
+            store.load(artifact)
+
+    def test_front_matter_that_is_not_a_mapping_is_a_typed_error(self, tmp_path: Path) -> None:
+        store, artifact = self._store_with(tmp_path, "---\njust-a-string\n---\n\nbody\n")
+        with pytest.raises(StateCorruptError):
+            store.load(artifact)
+
+    def test_valid_yaml_that_is_not_valid_state_is_a_typed_error(self, tmp_path: Path) -> None:
+        """Parses as YAML, fails the model. This is the branch a migration step lands on."""
+        store, artifact = self._store_with(
+            tmp_path,
+            "---\nschema_version: 1\nartifact_id: design\ncycle: not-an-int\n---\n\nbody\n",
+        )
+        with pytest.raises(StateCorruptError):
+            store.load(artifact)
+
+
+class TestTheLockActuallyExcludes:
+    """G13: `exclusive_lock` was only ever taken sequentially, three times, in one process.
+
+    That passes with no locking at all. `TestPlatformBackendSelection` proves the right
+    primitive is *called*, which is a different claim from "a second writer waits". With
+    the wiring test in `test_pipeline.py` this is the other half of DEC-F14: one shows the
+    pipeline arms the conflict check, this shows the lock underneath it excludes.
+    """
+
+    def test_a_second_process_waits_for_the_first_to_release(self, tmp_path: Path) -> None:
+        lock_path = tmp_path / "state.lock"
+        started = multiprocessing.Event()
+        hold_seconds = 0.5
+
+        process = multiprocessing.Process(
+            target=_hold_lock, args=(str(lock_path), started, hold_seconds)
+        )
+        process.start()
+        try:
+            assert started.wait(timeout=10), "the child never acquired the lock"
+            began = time.monotonic()
+            with exclusive_lock(lock_path):
+                waited = time.monotonic() - began
+        finally:
+            process.join(timeout=10)
+        assert waited > hold_seconds / 2, (
+            f"acquired the lock after {waited:.3f}s while another process held it for "
+            f"{hold_seconds}s; the lock is not excluding"
+        )
+
+
+def _hold_lock(lock_path: str, started: Any, hold_seconds: float) -> None:
+    """Module-level so it is picklable by `multiprocessing` on spawn-based platforms."""
+    with exclusive_lock(Path(lock_path)):
+        started.set()
+        time.sleep(hold_seconds)

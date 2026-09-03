@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import unicodedata
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,7 @@ from creative_agent.errors import (
     ExitCode,
     LLMOutputError,
     LLMTimeoutError,
+    LLMTransportError,
     ReviewFailedError,
     StateConflictError,
 )
@@ -908,3 +910,74 @@ class TestAModelChosenEnumIsValidatedEverywhereItEnters:
         pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(scripts))
         outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
         assert outcome.report.cycle == 1
+
+
+class TestARetryingCallCannotOutspendTheBudget:
+    """G5: the budget test asserted a value a *different* statement computes.
+
+    `test_the_budget_check_runs_inside_the_retry_loop` watched
+    `prompt.remaining_budget_usd`, which is recomputed at the top of every attempt — one
+    line above the `_check_budget` call whose placement the test's own docstring claims to
+    guard. Hoisting `_check_budget` out of the attempt loop left the whole suite green,
+    because the remainder recompute stayed inside it and the strictly-decreasing assertion
+    still held.
+
+    The load-bearing assertion has to be the abort, and the call count that proves the
+    abort happened mid-retry rather than after it.
+    """
+
+    async def test_the_abort_happens_between_attempts_not_after_them(self, tmp_path: Path) -> None:
+        # Three attempts of one logical row call at $1.00 each against a $2.00 budget. If
+        # the check sits outside the loop, all three reach the wire on one pre-call check
+        # and the run spends $3.00 of a $2.00 budget.
+        malformed = {"row_id": "D1"}
+        scripts = base_scripts(
+            cost_usd=1.0,
+            rows={"D1": [malformed, malformed, row_payload("D1")]},
+        )
+        fake = FakeLLMClient(scripts)
+        pipeline, _ = build_pipeline(tmp_path, fake, max_budget_usd=2.0, max_regen=2)
+        with pytest.raises(BudgetExceededError):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        spent = sum(1 for call in fake.calls if call.kind is CallKind.ROW and call.ref == "D1")
+        assert spent <= 2, (
+            f"one logical call reached the wire {spent} times against a 2-call budget; "
+            "the budget check is outside the retry loop"
+        )
+
+
+class TestObservabilityThatWouldMatterInAnIncident:
+    """Two log events and one test-double branch that no test exercised.
+
+    Logging is only worth what it tells you at 3am, and an event nothing produces in the
+    suite is an event nobody has ever read. `security.fetch_hosts_rejected` is the one
+    that says an artifact tried to point the session at an internal address — the SSRF
+    signal — and the pipeline's use of it was untested even though `ThreatGuard`'s half
+    was not.
+    """
+
+    async def test_an_internal_host_in_the_artifact_is_logged_as_rejected(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        artifact = CONFORMANT_ARTIFACT + "\n\nSee http://169.254.169.254/latest/meta-data/\n"
+        pipeline, _ = build_pipeline(tmp_path, FakeLLMClient(base_scripts()))
+        with caplog.at_level(logging.INFO, logger="creative_agent.harness.pipeline"):
+            await pipeline.run(request_for(tmp_path, artifact))
+        events = [r for r in caplog.records if "fetch_hosts_rejected" in r.getMessage()]
+        assert events, "an artifact pointing at the cloud-metadata address logged nothing"
+
+    async def test_a_scripted_transport_failure_surfaces_as_a_typed_error(
+        self, tmp_path: Path
+    ) -> None:
+        """`FakeLLMClient` can script an exception, and nothing scripted one.
+
+        A test double with an untested branch is a double that may not behave like the
+        thing it stands in for — and this is the branch that stands in for the provider
+        failing, which is the case the retry and abort paths exist for.
+        """
+        scripts = base_scripts()
+        scripts[script_key(CallKind.CLASSIFY)] = [LLMTransportError("provider unreachable")]
+        pipeline, store = build_pipeline(tmp_path, FakeLLMClient(scripts))
+        with pytest.raises(LLMTransportError, match="provider unreachable"):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert store.load("design").cycle == 0
