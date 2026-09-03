@@ -7,6 +7,7 @@ real SDK so this mock cannot silently fossilize.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -156,7 +157,10 @@ class TestPreToolUseWebFetchEnforcement:
         pytest.importorskip("claude_agent_sdk")
         options = adapter()._options(assembled_prompt)
         (matcher,) = options.hooks["PreToolUse"]
-        assert matcher.matcher == "WebFetch|Read|Grep|Glob"
+        # No matcher at all: the hook denies by default (DEC-F15), so it has to see every
+        # tool call. A name-based matcher meant an unrecognised tool was never inspected,
+        # which is the opposite of fail-closed.
+        assert matcher.matcher is None
         (hook,) = matcher.hooks
         return hook
 
@@ -182,11 +186,17 @@ class TestPreToolUseWebFetchEnforcement:
         )
         assert result == {}
 
-    async def test_ignores_tools_outside_its_scope(self) -> None:
-        """The hook only judges WebFetch/Read/Grep/Glob; other tools pass through."""
+    async def test_an_unrecognised_tool_is_denied_not_passed_through(self) -> None:
+        """Deny-by-default (DEC-F15).
+
+        This previously asserted the opposite — that a tool outside the four scoped names
+        "passes through" — which enshrined the fail-open behaviour as intended. Anything
+        the threat model does not scope and the operator has not listed in
+        `unscoped_tools` is refused.
+        """
         hook = self._wired_hook(prompt().model_copy(update={"fetch_domain_allowlist": []}))
-        result = await hook({"tool_name": "TodoWrite", "tool_input": {}}, "t1", None)
-        assert result == {}
+        result = await hook({"tool_name": "Bash", "tool_input": {"command": "id"}}, "t1", None)
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
 
     async def test_empty_allowlist_denies_every_host(self) -> None:
         hook = self._wired_hook(prompt().model_copy(update={"fetch_domain_allowlist": []}))
@@ -311,3 +321,160 @@ class TestTargetExtraction:
     )
     def test_targets(self, tool_input: dict[str, Any], expected: str) -> None:
         assert _target_from_input(tool_input) == expected
+
+
+class TestPreToolUseClosedHoles:
+    """The three ways the DEC-F11 hook could still be walked past (DEC-F15).
+
+    Each of these was allowed before: a `Glob` pattern was never looked at, an unnamed
+    tool was never inspected, and a present-but-empty path silently degraded to the cwd
+    check. They are grouped here because they share one root cause — the hook judged the
+    call's *name* and one argument, rather than every argument that can carry a target.
+    """
+
+    @staticmethod
+    def _hook(roots: list[Path]) -> Any:
+        pytest.importorskip("claude_agent_sdk")
+        options = adapter()._options(prompt().model_copy(update={"allowed_read_roots": roots}))
+        (matcher,) = options.hooks["PreToolUse"]
+        (hook,) = matcher.hooks
+        return hook
+
+    @pytest.mark.parametrize(
+        "pattern",
+        ["/etc/**/*", "/home/someone/**/*.pem", "../../**/*", "../outside/*.md"],
+    )
+    async def test_a_glob_pattern_that_escapes_the_roots_is_denied(
+        self, tmp_path: Path, pattern: str
+    ) -> None:
+        """`Glob` takes a required pattern and an OPTIONAL path.
+
+        With `path` absent the old check validated the session cwd — which is inside a
+        root — and ignored the pattern entirely, so an absolute or traversing pattern
+        enumerated whatever it liked. DEC-F11b claimed Glob was covered; it was not.
+        """
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {"tool_name": "Glob", "tool_input": {"pattern": pattern}, "cwd": str(tmp_path)},
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    @pytest.mark.parametrize("pattern", ["*.md", "**/*.py", "sub/*.txt"])
+    async def test_a_relative_glob_pattern_inside_the_roots_is_allowed(
+        self, tmp_path: Path, pattern: str
+    ) -> None:
+        """The fix must not break the searches a reviewer legitimately needs."""
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {"tool_name": "Glob", "tool_input": {"pattern": pattern}, "cwd": str(tmp_path)},
+            "t1",
+            None,
+        )
+        assert result == {}
+
+    async def test_greps_regex_pattern_is_not_treated_as_a_path(self, tmp_path: Path) -> None:
+        """Grep's `pattern` is a regular expression; only its `glob` filters paths.
+
+        Scoping the regex would deny ordinary searches — a search for `/etc/passwd` as a
+        *string in the artifact* is exactly what a reviewer should be able to run.
+        """
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {
+                "tool_name": "Grep",
+                "tool_input": {"pattern": "/etc/passwd", "path": str(tmp_path)},
+                "cwd": str(tmp_path),
+            },
+            "t1",
+            None,
+        )
+        assert result == {}
+
+    async def test_greps_glob_filter_is_scoped(self, tmp_path: Path) -> None:
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {
+                "tool_name": "Grep",
+                "tool_input": {"pattern": "secret", "glob": "/etc/**"},
+                "cwd": str(tmp_path),
+            },
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_an_empty_path_is_denied_rather_than_falling_back_to_cwd(
+        self, tmp_path: Path
+    ) -> None:
+        """`tool_input.get(key)` was a truthiness test, so `{"file_path": ""}` passed."""
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {"tool_name": "Read", "tool_input": {"file_path": ""}, "cwd": str(tmp_path)},
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_a_null_tool_input_does_not_raise_inside_the_hook(self, tmp_path: Path) -> None:
+        """Whether the SDK treats a hook exception as allow or deny is not ours to assume.
+
+        A null `tool_input` used to raise an AttributeError inside the hook. It is now
+        normalised to an empty mapping and judged on its merits, which for Read — whose
+        `file_path` is required — means denial.
+        """
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {"tool_name": "Read", "tool_input": None, "cwd": str(tmp_path)}, "t1", None
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_grep_without_a_path_falls_back_to_the_cwd_check(self, tmp_path: Path) -> None:
+        """Grep's path is genuinely optional, unlike Read's file_path."""
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {"tool_name": "Grep", "tool_input": {"pattern": "x"}, "cwd": str(tmp_path)},
+            "t1",
+            None,
+        )
+        assert result == {}
+
+    async def test_grep_without_a_path_is_denied_when_the_cwd_is_outside_the_roots(
+        self, tmp_path: Path
+    ) -> None:
+        hook = self._hook([tmp_path / "allowed"])
+        result = await hook(
+            {"tool_name": "Grep", "tool_input": {"pattern": "x"}, "cwd": str(tmp_path)},
+            "t1",
+            None,
+        )
+        assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_websearch_is_allowed_because_settings_list_it_as_unscoped(
+        self, tmp_path: Path
+    ) -> None:
+        hook = self._hook([tmp_path])
+        result = await hook(
+            {"tool_name": "WebSearch", "tool_input": {"query": "reward hypothesis"}}, "t1", None
+        )
+        assert result == {}
+
+    async def test_the_websearch_query_is_counted_but_never_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """DEC-F10 forbids logging prompt or artifact text; the outbound channel still
+        has to be greppable, so the event carries the query's size and not the query."""
+        hook = self._hook([tmp_path])
+        secret = "a-very-distinctive-search-string"
+        with caplog.at_level(logging.INFO, logger="creative_agent"):
+            await hook({"tool_name": "WebSearch", "tool_input": {"query": secret}}, "t1", None)
+        events = [
+            getattr(r, "context", {})
+            for r in caplog.records
+            if r.getMessage() == "security.websearch_issued"
+        ]
+        assert events, "the outbound search was not recorded at all"
+        assert events[0]["query_chars"] == len(secret)
+        assert secret not in str(events[0])
+        assert secret not in " ".join(r.getMessage() for r in caplog.records)

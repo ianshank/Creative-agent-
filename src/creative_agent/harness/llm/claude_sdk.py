@@ -21,18 +21,48 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from creative_agent.config import HarnessSettings
 from creative_agent.errors import LLMOutputError, LLMTransportError
 from creative_agent.harness.llm.base import AssembledPrompt, RawLLMResult, ToolEvidence
 from creative_agent.harness.logging import get_logger, log_event
-from creative_agent.harness.security import is_fetch_allowed, is_path_within_roots
+from creative_agent.harness.security import (
+    is_fetch_allowed,
+    is_glob_within_roots,
+    is_path_within_roots,
+)
 
 _LOG = get_logger(__name__)
 _TARGET_KEYS = ("url", "file_path", "path", "pattern", "query")
-# Read requires file_path; Grep/Glob take an optional path (default: cwd, from input_data).
-_READ_PATH_KEYS = ("file_path", "path")
+
+
+# Per-tool argument shapes. Keeping these as data rather than an `in (...)` chain is what
+# makes the Grep/Glob distinction survivable: Glob's `pattern` is a *path* glob, while
+# Grep's `pattern` is a regular expression and its `glob` is the path filter. Treating
+# Grep's regex as a path would deny legitimate searches; ignoring Glob's pattern let
+# `/etc/**/*` through (DEC-F15).
+@dataclass(frozen=True)
+class _ToolScope:
+    """How one path-bearing tool's arguments map onto the read-root check."""
+
+    path_keys: tuple[str, ...]
+    # Read's file_path is required, so its absence is a malformed call. Grep's and Glob's
+    # path is genuinely optional and defaults to the session working directory.
+    path_required: bool
+    # Path-shaped glob arguments. Glob's `pattern` is a path glob; Grep's `pattern` is a
+    # regular expression and only its `glob` filters paths. Scoping Grep's regex would
+    # deny a legitimate search for a path-looking string inside the artifact.
+    glob_keys: tuple[str, ...] = ()
+
+
+_TOOL_SCOPES: dict[str, _ToolScope] = {
+    "Read": _ToolScope(path_keys=("file_path",), path_required=True),
+    "Grep": _ToolScope(path_keys=("path",), path_required=False, glob_keys=("glob",)),
+    "Glob": _ToolScope(path_keys=("path",), path_required=False, glob_keys=("pattern",)),
+}
 
 
 def _deny(reason: str) -> dict[str, Any]:
@@ -45,50 +75,124 @@ def _deny(reason: str) -> dict[str, Any]:
     }
 
 
-def _pre_tool_use_hook(prompt: AssembledPrompt) -> Any:
+def _path_scope_violation(
+    tool_name: str, tool_input: dict[str, Any], cwd: str, roots: list[Path]
+) -> str | None:
+    """Why a path-scoped tool call is out of scope, or None when it is allowed.
+
+    Split out of the hook so the decision reads as one linear rule per argument, and so
+    the hook body stays the thin glue DEC-F11 requires of this module — the module is the
+    one file DEC-F8 excludes from the coverage gate.
+    """
+    scope = _TOOL_SCOPES[tool_name]
+    for key in scope.path_keys:
+        if key not in tool_input:
+            continue
+        value = tool_input[key]
+        # Present-but-empty is a malformed call, not a request for the cwd. The old
+        # truthiness test silently degraded `{"file_path": ""}` to the cwd check.
+        if not isinstance(value, str) or not value.strip():
+            return f"{tool_name} {key} is empty or not a string"
+        if not is_path_within_roots(value, roots, cwd=cwd):
+            return f"{tool_name} {key} is outside this review's read roots"
+        break
+    else:
+        if scope.path_required:
+            return f"{tool_name} requires {scope.path_keys[0]} and the call supplied none"
+        # An optional path is absent: the tool searches the session working directory.
+        if not is_path_within_roots(cwd, roots, cwd=cwd):
+            return (
+                f"{tool_name} would search the session working directory, which is "
+                "outside this review's read roots"
+            )
+
+    base = str(tool_input.get(scope.path_keys[0], "") or cwd)
+    for key in scope.glob_keys:
+        pattern = tool_input.get(key)
+        if (
+            isinstance(pattern, str)
+            and pattern
+            and not is_glob_within_roots(pattern, roots, cwd=base)
+        ):
+            return f"{tool_name} {key} pattern would search outside this review's read roots"
+    return None
+
+
+def _pre_tool_use_hook(prompt: AssembledPrompt, unscoped_tools: frozenset[str]) -> Any:
     """Builds a PreToolUse hook closed over this call's computed scopes.
+
+    Deny-by-default (DEC-F15). A tool is allowed only if it is explicitly handled here or
+    named in `HarnessSettings.unscoped_tools`; the previous version returned allow for
+    anything it did not recognise, and its matcher only fired for four tool names, so
+    nothing else was ever inspected.
 
     WebFetch (DEC-F11a) is checked against the exact allowlist computed for this review —
     not a fresh internal-host check, which would permit any public host rather than only
     the oracle- and artifact-derived set the model was told about in the system prompt.
-    Read/Grep/Glob (DEC-F11b) are checked against the computed read roots; Grep/Glob's
-    `path` argument is optional and defaults to the session's cwd when absent. A relative
-    `path`/`file_path` is resolved against the tool call's own reported `cwd`, not this
-    process's — the two can differ, and resolving against the wrong one is a scoping
-    bypass, not just a wrong answer.
+    Read/Grep/Glob (DEC-F11b) are checked against the computed read roots, *including*
+    their glob patterns: `Glob` takes a required `pattern` and an optional `path`, so with
+    `path` absent the old check validated the session cwd and ignored where the pattern
+    actually pointed. A relative path is resolved against the tool call's own reported
+    `cwd`, not this process's — the two can differ, and resolving against the wrong one is
+    a scoping bypass, not just a wrong answer.
     """
+
+    def _refuse(tool_name: str, reason: str) -> dict[str, Any]:
+        log_event(
+            _LOG,
+            logging.WARNING,
+            "security.pretooluse_denied",
+            call_kind=prompt.kind.value,
+            tool_name=tool_name,
+            reason=reason,
+        )
+        return _deny(reason)
 
     async def hook(
         input_data: dict[str, Any], tool_use_id: str | None, context: Any
     ) -> dict[str, Any]:
-        tool_name = input_data.get("tool_name")
-        tool_input = input_data.get("tool_input", {})
+        tool_name = str(input_data.get("tool_name") or "")
+        raw_input = input_data.get("tool_input")
+        # A null or non-mapping tool_input used to raise inside the hook. Whether the SDK
+        # treats a hook exception as allow or deny is not something to depend on, so a
+        # malformed call is normalised to an empty mapping and then judged on its merits —
+        # which, for a path-scoped tool, means denial for a missing target.
+        tool_input: dict[str, Any] = raw_input if isinstance(raw_input, dict) else {}
+
         if tool_name == "WebFetch":
             url = str(tool_input.get("url", ""))
             if is_fetch_allowed(url, prompt.fetch_domain_allowlist):
                 return {}
-            log_event(
-                _LOG,
-                logging.WARNING,
-                "security.pretooluse_denied",
-                call_kind=prompt.kind.value,
-                tool_name=tool_name,
+            return _refuse(
+                tool_name,
+                "WebFetch scheme must be http/https and the host must be in this "
+                "review's computed allowlist",
             )
-            return _deny("WebFetch host is not in this review's computed allowlist")
-        if tool_name in ("Read", "Grep", "Glob"):
-            cwd = str(input_data.get("cwd", ""))
-            target = next((tool_input[k] for k in _READ_PATH_KEYS if tool_input.get(k)), cwd)
-            if is_path_within_roots(str(target), prompt.allowed_read_roots, cwd=cwd):
-                return {}
-            log_event(
-                _LOG,
-                logging.WARNING,
-                "security.pretooluse_denied",
-                call_kind=prompt.kind.value,
-                tool_name=tool_name,
+
+        if tool_name in _TOOL_SCOPES:
+            reason = _path_scope_violation(
+                tool_name, tool_input, str(input_data.get("cwd", "")), prompt.allowed_read_roots
             )
-            return _deny(f"{tool_name} path is outside this review's allowed read roots")
-        return {}
+            return _refuse(tool_name, reason) if reason else {}
+
+        if tool_name in unscoped_tools:
+            if tool_name == "WebSearch":
+                # DEC-F15's accepted residual risk, made observable. The query itself is
+                # never logged — DEC-F10 forbids logging prompt or artifact text — but its
+                # presence and size are, so an unexpected outbound channel is greppable.
+                log_event(
+                    _LOG,
+                    logging.INFO,
+                    "security.websearch_issued",
+                    call_kind=prompt.kind.value,
+                    query_chars=len(str(tool_input.get("query", ""))),
+                )
+            return {}
+
+        return _refuse(
+            tool_name or "<unnamed>",
+            "tool is not scoped by this review's threat model and is not listed in unscoped_tools",
+        )
 
     return hook
 
@@ -121,10 +225,13 @@ class ClaudeSDKAdapter:
             "permission_mode": self._settings.permission_mode,
             "max_turns": self._settings.max_turns,
             "output_format": {"type": "json_schema", "schema": prompt.output_schema},
+            # No matcher: the hook must see *every* tool call, because it denies by
+            # default (DEC-F15). A name-based matcher meant an unrecognised tool was never
+            # inspected at all, which is the opposite of fail-closed.
             "hooks": {
                 "PreToolUse": [
                     HookMatcher(
-                        matcher="WebFetch|Read|Grep|Glob", hooks=[_pre_tool_use_hook(prompt)]
+                        hooks=[_pre_tool_use_hook(prompt, frozenset(self._settings.unscoped_tools))]
                     )
                 ]
             },

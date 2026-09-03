@@ -141,9 +141,8 @@ class TestPlatformBackendSelection:
         """Silently skipping the lock would trade a loud failure for a lost update."""
         monkeypatch.setattr(filelock, "_FCNTL", None)
         monkeypatch.setattr(filelock, "_MSVCRT", None)
-        with pytest.raises(FileLockUnavailableError):
-            with exclusive_lock(tmp_path / ".artifact.lock"):
-                pass
+        with pytest.raises(FileLockUnavailableError), exclusive_lock(tmp_path / ".artifact.lock"):
+            pass
 
 
 def test_open_exclusive_nofollow_replaces_a_planted_symlink(tmp_path: Path) -> None:

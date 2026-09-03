@@ -23,6 +23,7 @@ from pydantic_settings import (
 )
 
 from creative_agent.errors import ConfigError
+from creative_agent.harness.canonical import DEFAULT_IDENTIFIER_AUTHORITIES
 from creative_agent.harness.security import DEFAULT_BLOCKED_HOST_SUFFIXES
 
 PermissionMode = Literal["default", "acceptEdits", "plan", "dontAsk", "auto", "bypassPermissions"]
@@ -92,6 +93,26 @@ class HarnessSettings(BaseSettings):
     fetch_tool_names: list[str] = Field(default_factory=lambda: ["WebFetch", "Read"])
     permission_mode: PermissionMode = "dontAsk"
 
+    # Tools the PreToolUse hook allows without a target check, because they carry no path
+    # or host to scope (DEC-F15). Everything not handled explicitly and not named here is
+    # denied: the hook used to allow any tool it did not recognise. WebSearch is here with
+    # its residual risk accepted and documented — its query is unconstrained, so an
+    # artifact that can steer the model's search terms has an outbound channel; DEC-F9
+    # already refuses to credit WebSearch results as `fetched`. A multi-tenant deployment
+    # should empty this list.
+    unscoped_tools: list[str] = Field(default_factory=lambda: ["WebSearch"])
+
+    # Which hosts may vouch for a scholarly identifier in the tool-honesty check
+    # (DEC-F12). A fetch only credits an identifier when it came from that identifier's
+    # own registrar, so a decoy URL mentioning `arxiv.org/abs/<id>` proves nothing. Data
+    # rather than literals: an institutional mirror or a DOI proxy belongs here, not in a
+    # code change. Accepts JSON from the environment.
+    identifier_authority_hosts: dict[str, list[str]] = Field(
+        default_factory=lambda: {
+            scheme: list(hosts) for scheme, hosts in DEFAULT_IDENTIFIER_AUTHORITIES.items()
+        }
+    )
+
     # Data search paths. Packaged resources are the fallback; earlier entries win.
     oracle_search_paths: list[Path] = Field(default_factory=lambda: [Path("data/oracles")])
     prompt_search_paths: list[Path] = Field(default_factory=lambda: [Path("data/prompts")])
@@ -129,9 +150,33 @@ class HarnessSettings(BaseSettings):
     )
     allow_internal_fetch_hosts: bool = False
 
+    @field_validator("identifier_authority_hosts", mode="before")
+    @classmethod
+    def _parse_mapping(cls, value: Any) -> Any:
+        """Accept a JSON object from the environment for the one mapping-valued setting.
+
+        `enable_decoding=False` hands every env value to the validators as a raw string
+        (see `_split_scalar_lists`), so without this the documented
+        `CREATIVE_AGENT_IDENTIFIER_AUTHORITY_HOSTS='{"arxiv": ["mirror.example"]}'` form
+        would fail to parse.
+        """
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSON mapping: {exc}") from exc
+            if not isinstance(parsed, dict):
+                raise ValueError("expected a JSON object mapping identifier scheme to hosts")
+            return parsed
+        return value
+
     @field_validator(
         "agent_tools",
         "fetch_tool_names",
+        "unscoped_tools",
         "oracle_search_paths",
         "prompt_search_paths",
         "blocked_host_suffixes",
