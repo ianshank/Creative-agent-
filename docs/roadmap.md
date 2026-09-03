@@ -33,10 +33,19 @@ forged Blocker row reaching the published report through the one field the rende
 missed. Those corrections are DEC-F19; the entries they correct were left standing, because
 what was believed at the time is part of the record.
 
-What remains: **0.1** and **0.2** (both owner-blocked), the parts of **3.1** that need
-network egress, the review-time citation check in **3.3**, **4.2's** full Windows support,
-the end-to-end half of configurable identifier authorities (see DEC-F19), and all of
-**Tranche 5**.
+A third pass then ran the harness against the real Claude Agent SDK for the first time and
+audited the branch for tests that do not hold. The live run failed immediately: the
+deny-by-default hook denied the SDK's own response channel, so **every review failed on the
+default configuration** while 721 tests, a 95% coverage gate and a 470/470 mutation run were
+green (DEC-F20). The audit then proved five one-line deletions in `pipeline.py` and `cli.py`
+that each left the whole suite passing, and a live `Glob` escape one character away from a
+pattern the tests already refused. Those are DEC-F20 through DEC-F28.
+
+What remains: **0.1** and **0.2**, the parts of **3.1** that need network egress, the
+review-time citation check in **3.3**, **4.2's** full Windows support, and all of
+**Tranche 5**. The end-to-end half of configurable identifier authorities is **done** —
+DEC-F25 wired `identifier_authority_hosts` into `ThreatGuard`, so naming a mirror now makes
+it both fetchable and able to vouch for an identifier.
 
 ---
 
@@ -61,10 +70,24 @@ costs are already visible:
 Fix in Settings → General, retarget the open Dependabot pull requests, reconcile the two
 branches, and add branch protection on `main` requiring CI in the same pass.
 
-### 0.2 Add `ANTHROPIC_API_KEY` to repository secrets — **blocked on the owner**
+### 0.2 Add `ANTHROPIC_API_KEY` to repository secrets — **blocked on the owner, for CI only**
 
-Nothing has ever run against the real Claude Agent SDK. See 2.2 for what the weekly
-workflow does in the meantime, which is worse than not running at all.
+This item's premise was wrong, and the error was expensive. "Nothing has ever run against
+the real Claude Agent SDK" was true, but "because no API key is available" was not: the SDK
+spawns the `claude` CLI and inherits whatever session it holds, so an authenticated CLI is
+a usable credential. The live tests gated on `ANTHROPIC_API_KEY` specifically, skipped
+themselves in an environment where a live call demonstrably works, and DEC-F19 recorded the
+resulting silence as a fact about the world. Behind that skip sat DEC-F20 — a defect that
+made every real review fail.
+
+Both live tests now pass against the real SDK, and a full `creative-agent review` completes
+end to end: 37 findings across the doctrine sweep, a coherent verdict, exit 0 under advisory
+mode. The gating predicate is a capability check now (DEC-F21).
+
+What is still owner-blocked is narrower than it was: a **CI runner** has no authenticated
+`claude` session, so the weekly `live.yml` job needs the secret. `live.yml` keeps failing
+fast without one, which is correct there. Locally, run
+`.claude/skills/live-verify` — no secret required.
 
 ---
 
@@ -122,10 +145,20 @@ at the composition root. `canonicalize` is deliberately unchanged: it is right f
 bucketing, and the defect was trusting its output as proof of retrieval. Decoy-URL and
 local-`Read` cases are now tests rather than a blessing.
 
-**Still open, the configuration half.** `identifier_authority_hosts` reaches the honesty
-checker but not `ThreatGuard.fetch_domain_allowlist`, so naming a mirror makes the checker
-accept a fetch the `PreToolUse` hook will still deny. "A mirror is a settings change" is not
-yet true end to end (DEC-F19 records this rather than half-fixing it).
+**Done, including the configuration half — DEC-F25.** `ThreatGuard` takes
+`identifier_authority_hosts` and seeds the fetch allowlist by flattening it, replacing a
+private `_RESOLVER_HOSTS = ("arxiv.org", "doi.org")` tuple that sat sixteen lines below a
+module docstring promising "never a hard-coded domain list". One setting now drives both the
+fetch allowlist and the evidence-authority check, so "a mirror is a settings change" is true
+end to end.
+
+**Corrected again by DEC-F27.** The rows this tranche marked verified were flipped by hand
+from a mirror reading, not resolved by the rebaseline command — which is the flag's whole
+meaning, since it suppresses the staleness cap on tiers that may carry a Blocker. They are
+back to `verified: false` and the readings are `notes`. Resolving them properly needs egress
+to `export.arxiv.org` and `api.crossref.org` (both 403 from this environment's proxy), or
+`arxiv_api_url`/`crossref_api_url` pointed at a reachable mirror — a run of an existing
+command, not new code.
 
 ### 1.2 The staleness severity cap never fires
 

@@ -16,7 +16,78 @@ only; everything added since changes harness behaviour, published severities and
 exit-code contract. The exit-code table gains code `6` — see the frozen-contract entry under
 **Added** before pinning a CI consumer to this revision.
 
+### The defect that broke every review, and why nothing caught it
+
+The `PreToolUse` hook denied `StructuredOutput` — the tool the Claude Agent SDK invokes to
+deliver a structured response — because deny-by-default (DEC-F15) denies anything not
+explicitly scoped. The harness could therefore not receive an answer to any of its six call
+kinds. Every review, on the default configuration, failed with `Failed to provide valid
+structured output after 5 attempts` and exit 5.
+
+It was found by running `creative-agent review` against the real SDK for the first time.
+Until then: 721 tests passing, 95% branch coverage with per-module floors, 470/470 mutants
+killed, a full CI matrix green across three Python versions and a container build.
+
+Three gates should have caught it and none could.
+
+- Every mocked test hands the model's answer over out of band. `transport()` yields
+  `ResultMessage` objects directly, so **no hook ever runs** in any unit test. The shared
+  `LLMClient` contract suite inherits that transport, so its "sdk-mocked" leg inherits the
+  blind spot.
+- `harness/llm/claude_sdk.py` is the one module DEC-F8 excludes from the coverage gate.
+- The live test that *would* have caught it — it builds the same hook — skipped itself,
+  because it gated on `ANTHROPIC_API_KEY` and the SDK does not need one. It authenticates
+  through the `claude` CLI and inherits whatever session that holds. **The predicate tested
+  a proxy for the capability rather than the capability**, and was wrong in the direction
+  that reports success. DEC-F19 then recorded "deny-by-default has no live verification,
+  because that needs the API key Tranche 0 is blocked on" as a fact about the world. That
+  premise was false, and this defect was what it hid.
+
+Both live tests now run and pass against the real SDK, and a full end-to-end review
+completes: 37 findings across the doctrine sweep with a coherent verdict. Reverting the fix
+turns the live leg red, so the gate now catches the defect it exists for. DEC-F20, DEC-F21.
+
+The general rule, which is the part worth keeping: **a skip predicate must test the
+capability the test needs.** A proxy that is wrong in the safe direction turns a gate into
+decoration, and a decorative gate is worse than no gate, because it is counted.
+
 ### Changed
+
+- **`bypassPermissions` is no longer a settable `permission_mode`.** The adapter's module
+  docstring has always said it uses restrictive headless permissions and never that mode; the
+  only thing enforcing it was the default value, since the mode was in the `PermissionMode`
+  Literal and reached `ClaudeAgentOptions` unmodified — turning the whole DEC-F15 hook into
+  advice. A settings file selecting it now fails validation at load time with the field
+  named. The no-hard-coded-values rule exists so deployments can tune behaviour; "disable the
+  tool sandbox" is not tuning, it is the absence of the control. DEC-F28.
+
+- **Three oracle sources are back to `verified: false`, and the shipped corpus is stricter
+  for it.** The same commit that made the staleness cap fire for the first time exempted D5,
+  D8 and D11 from it by hand: arxiv.org is unreachable from the review environment, so the
+  papers were read through a third-party mirror and the author lists diffed by eye, and
+  `freshness.rebaseline_count` was hand-bumped though the command that owns it never ran.
+  That flag is a severity lever — it suppresses the cap, D5 and D11 are tier `AP` and D8 is
+  tier `PR`, and both tiers may carry a Blocker — so the edit restored full Blocker authority
+  to three rows on evidence nobody can re-run, produced by the same process (a model reading
+  a paper and transcribing an author list) whose failure in v1 is the reason this oracle
+  exists. `verified: true` now means the rebaseline resolver resolved the source and diffed
+  it; the hand readings stay in `notes` as leads for whoever runs it next. This publishes
+  *lower* severities for those rows, which is the correct direction: an unresolved row capped
+  at Minor understates a real defect, while a fabricated author list at Blocker is the
+  failure this project is a reaction to. DEC-F27.
+
+- **The vendor-page severity comes from oracle data.** `severity="info"` was a literal at a
+  call site in `sourcequality.py`, whose own docstring says all thresholds and severities
+  come from oracle data and whose every sibling finding reads its severity from the config.
+  Now `source_quality.vendor_page_severity`, defaulted so an existing v1 file keeps loading.
+
+- **Coverage floors are ratcheted to just under actual, and four modules were added.** A
+  floor far below actual coverage permits the silent regression of everything in between,
+  which is precisely how `verification.py` came to have two tool-honesty branches that could
+  be deleted with the suite still green while its floor read a comfortable 95/90.
+  `verification.py`, `canonical.py` and `artifact.py` are now held at 100% lines and
+  branches; `security.py`, `filelock.py` and the package floors rise with them. Raising a
+  floor needs no ceremony; lowering one needs a decision-log entry.
 
 - **An unverified doctrine row is now capped from the first review.** The grace budget
   `freshness.max_rebaselines_without_verification` defaults to `0` rather than `2`, and the
@@ -89,6 +160,42 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
   SHA, which `tests/unit/test_project_config.py` asserts.
 
 ### Added
+
+- **`scripts/verify_guard.py`, and a skill and an agent around it.** The recurring failure on
+  this branch is mechanical, so it should be a command rather than a discipline: the tool runs
+  the named tests (they must pass), applies a revert that removes the guarded behaviour, runs
+  them again (they must now *fail*), and restores the file byte for byte. Exit 2 for "could
+  not check" is deliberately distinct from exit 1 for "the guard is weak", because reporting a
+  red baseline as a weak test would send someone rewriting a test whose only problem is that
+  the tree is broken — the same class of error the tool exists to catch. It is tested against
+  a toy package in both directions, and was run against the real fixes on this branch.
+
+  The reason it exists, in one table — every one of these was green in CI:
+
+  | What the test claimed | Why it passed anyway |
+  |---|---|
+  | Model prose cannot forge a findings row | It grepped for an escape sequence, not a row count |
+  | Globs cannot escape the read roots | Every case put its traversal before the first metacharacter |
+  | The budget check runs inside the retry loop | It watched a value the neighbouring statement computes |
+  | The adapter never uses `bypassPermissions` | It re-read a fixture that had just set `dontAsk` |
+  | Three oracle rows are verified | Written against data that had just been hand-edited |
+  | A concurrent write cannot erase cycle history | The store was tested; the pipeline's opt-in was not |
+
+  The last is the general shape and the most common: the leaf behaviour is tested and the
+  wiring that switches it on is not. Five separate one-line deletions in `pipeline.py` and
+  `cli.py` each left the whole suite passing.
+
+- **`.claude/skills/guard-check`** (prove a test guards what it names),
+  **`.claude/skills/live-verify`** (the live leg plus a real end-to-end review, with what a
+  passing run looks like and how to clean up after it), and **`.claude/agents/gap-auditor`**
+  (read-only; reports findings marked PROVEN or REASONED and never blurs the two).
+
+- **`HarnessSettings.protocol_tools`**, defaulting to `["StructuredOutput"]`: the tools that
+  are part of the SDK's own request/response protocol rather than a capability granted to the
+  review. Deliberately separate from `unscoped_tools`, whose documented hardening step is "a
+  multi-tenant deployment should empty it" — emptying this one breaks the harness instead, so
+  conflating them would make the security advice self-defeating. DEC-F20.
+
 
 - **Exit code `6`, `RUN_ABORTED` — a frozen-contract change.** The exception-to-exit-code
   table is a machine-facing contract in the same sense as the durable format versions above:
@@ -243,6 +350,76 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
   gate repairs under **Fixed**.)
 
 ### Fixed
+
+- **`Glob` scoping was escapable, and this is the third entry on one function.**
+  `**/../../../etc/*` was ALLOWED while `../../**/*` was denied. `glob_pattern_root` cuts the
+  literal prefix at the *first* metacharacter, so a pattern opening with one has an empty
+  prefix, and an empty prefix reads as "relative to the base directory" — which the caller
+  has already approved. `*/../../../etc/passwd`, `?/../*` and `[a]/../../../etc/*` all walked
+  out of the read roots the same way. DEC-F19 had already fixed one instance of exactly this
+  shape (`/etc*/*` versus `/etc/**/*`); it fixed the instance and not the class, and the
+  tests written alongside it enumerated traversal-before-the-first-metacharacter every time.
+  Now three refusals by *shape*, evaluated before any prefix logic: a `..` segment anywhere, a
+  backslash anywhere, and a brace or bracket group carrying a separator or `~`. The
+  generalisation is the point: any rule inspecting only the longest literal prefix is defeated
+  by moving a metacharacter one character to the left. Prefix analysis decides where a pattern
+  starts; it cannot decide where a pattern can reach. DEC-F26.
+
+- **The glob base was resolved against the wrong working directory.** `_path_scope_violation`
+  passed the tool call's `path` argument to the glob check raw, so a *relative* `path`
+  resolved against this process's working directory rather than the call's reported `cwd` —
+  judging one call's two arguments against two different roots, which is the "resolving
+  against the wrong one is a scoping bypass, not just a wrong answer" case the hook's own
+  docstring warns about, applied to the pattern instead of the path.
+
+- **Two model prose fields still reached the report unlaundered, so laundering became a
+  boundary.** DEC-F16 said "every LLM prose field" and missed two; DEC-F19 added those two and
+  missed two more — `VerificationEntry.assertion` and `RowDisposition.na_reason`, which are
+  the verification log and the doctrine sweep, the two tables a reviewer actually reads. Both
+  reached the renderer through `_md_escape` alone: pipe and newline escaping, no `Cf` strip,
+  no length cap. A bidi override in `na_reason` renders a doctrine verdict as the reverse of
+  what review state records, so the published report and the audit trail disagree while both
+  look correct. Three rounds of "add the field we forgot" is the evidence that enumerating
+  fields to *include* is the defect, so the pipeline now launders the assembled `ReviewReport`
+  and enumerates the structural ids to *exclude* — a list that fails safe, since forgetting to
+  exclude something launders a value that did not need it, while forgetting to include
+  something published attacker-controlled text. DEC-F22.
+
+- **`--reset-state` could delete a third artifact's cycle history.** DEC-F19 added a
+  containment check to `read_artifact` and said a symlink out of the reviewed tree "is refused
+  rather than read". The CLI reads the artifact twenty lines before the pipeline does, without
+  a containment root, to derive the artifact id from front matter — and then acts on that id.
+  A symlink at `worktree/docs/design.md` pointing outside the tree at a file whose front
+  matter says `review-id: other-artifact` therefore deleted `docs/review-log/other-artifact.md`,
+  destroying that artifact's history and the escalation counter driving the cycle-3
+  charter-review STOP, before the check meant to refuse the file ever ran. The artifact is now
+  read once, in the CLI, with the root known — and validated in *both* places, because a check
+  that travels with the read disappears when one caller stops reading. DEC-F23.
+
+- **A malformed model response could exit 5 instead of 3.** The classify mode re-probe
+  assigned an unvalidated `artifact_class` — the first probe validates and re-probes, the
+  second did neither — and the next line looked the class up with a bare `next()`.
+  StopIteration inside a coroutine becomes `RuntimeError`, which is not a
+  `CreativeAgentError`, so the CLI's typed handler missed it and `main`'s bare `except`
+  reported "unexpected error" against a frozen exit-code contract. Both probes now route
+  through one validator. DEC-F24.
+
+- **Six single-source-of-truth violations, three of them load-bearing.**
+  `ALLOWED_FETCH_SCHEMES` and `_EVIDENCE_SCHEMES` were byte-identical frozensets expressing
+  one policy in two modules, so loosening one reopened `file://arxiv.org/...` on exactly one
+  of the two paths. `_RESOLVER_HOSTS` was a hard-coded domain list sixteen lines below a
+  module docstring promising "never a hard-coded domain list" — and it was why
+  `identifier_authority_hosts` did not work end to end: the setting reached the honesty
+  checker, so a configured mirror could vouch for an identifier, while the fetch allowlist
+  never saw it, so the hook denied the fetch that would have produced the evidence. The URL
+  regex and the diacritic fold each existed twice. `harness/policy.py` now owns what more than
+  one module must agree on, and `ThreatGuard` takes the authority hosts, which closes the
+  "known and accepted, not fixed" item DEC-F19 recorded. DEC-F25.
+
+- **A report was assembled and rendered on the path that discards it**, which is not only
+  waste: computing it invites the next reader to assume the rendered text is available to the
+  error handler, and it is not.
+
 
 - **The staleness severity cap never fired.** `OracleRow.is_stale` returned
   `freshness.rebaseline_count >= freshness.max_rebaselines_without_verification`, and the
