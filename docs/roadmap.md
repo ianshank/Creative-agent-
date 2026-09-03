@@ -41,9 +41,18 @@ green (DEC-F20). The audit then proved five one-line deletions in `pipeline.py` 
 that each left the whole suite passing, and a live `Glob` escape one character away from a
 pattern the tests already refused. Those are DEC-F20 through DEC-F28.
 
+A fourth pass pointed the `gap-auditor` agent — added in that same pass — at its own branch,
+and it found that `scripts/verify_guard.py`, the instrument every preceding claim rests on,
+reported "GUARD HOLDS" for a revert that merely broke the syntax. Alongside it: a fabricated
+gate reference that lifted the severity cap and published a Blocker, an unguarded `urlparse`
+that ended offline reviews with exit 5, a coverage gate made non-deterministic by this
+branch's own new test, and exit code 1 enforced by nothing. DEC-F29 through DEC-F42.
+
 What remains: **0.1** and **0.2**, the parts of **3.1** that need network egress, the
 review-time citation check in **3.3**, **4.2's** full Windows support, and all of
-**Tranche 5**. The end-to-end half of configurable identifier authorities is **done** —
+**Tranche 5**. Two items are newly *out* of the backlog: `pipeline.py`'s decomposition
+(DEC-F40/F41 took it from 880 lines to 781, extracting the two decisions that had no unit
+seam) and the deterministic validation of `.claude` assets (DEC-F29). The end-to-end half of configurable identifier authorities is **done** —
 DEC-F25 wired `identifier_authority_hosts` into `ThreatGuard`, so naming a mirror now makes
 it both fetchable and able to vouch for an identifier.
 

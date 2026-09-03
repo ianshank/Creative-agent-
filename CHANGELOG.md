@@ -16,6 +16,55 @@ only; everything added since changes harness behaviour, published severities and
 exit-code contract. The exit-code table gains code `6` — see the frozen-contract entry under
 **Added** before pinning a CI consumer to this revision.
 
+### The instrument was wrong too
+
+`scripts/verify_guard.py` — the tool this branch introduced to prove a test fails when the
+code it guards is reverted — returned `pytest_exit_code == 0`. So *any* nonzero exit read as
+"the named tests failed", and therefore as "the guard holds". pytest exits nonzero for
+collection errors (2), internal errors (3), usage errors (4) and no-tests-collected (5), and
+none of those is a test expressing an opinion.
+
+Demonstrated against the tool's own fixtures: a revert that deletes an `if` header leaves an
+`IndentationError`, and the canonical **weak** test — the one that asserts its own input,
+which the tool's test suite elsewhere requires be reported weak — was certified as a holding
+guard.
+
+That is the direction that matters. A tool that under-reports gets ignored; a tool that
+hands out false reassurance gets believed, and this one is what `CLAUDE.md`, the
+`guard-check` skill and the `gap-auditor` agent all now rest on. It distinguishes the exit
+codes now and reports **CANNOT CHECK** for a revert that does not produce a running suite.
+Every guard claimed earlier on this branch was re-verified with the corrected tool; all four
+still hold.
+
+It was found by running the `gap-auditor` agent — added in the same commit — against its own
+branch.
+
+### Two more defects in the enforcement path
+
+- **A fabricated gate reference lifted the severity cap.** `GatePolicy.all_gate_refs()`
+  existed so support refs "can be cross-validated instead of being free-form strings" — its
+  own comment — and had **zero call sites**. `_candidate_to_finding` filtered `doctrine_row`
+  supports and let `gate_failure` through with any `ref` the model wrote. `SeverityPolicy`
+  counts any `gate_failure` as a blocker basis and drops the tier cap as soon as one
+  non-doctrine support exists, so on a row the cap holds at Major, a made-up gate name
+  published a **Blocker** and exit 2. The model writes that field and the artifact under
+  review can steer the model. DEC-F31.
+
+- **`http://[::1]/health` in a document ended an offline review with exit 5.**
+  `URL_PATTERN` excludes `]`, so the match is the unbalanced `http://[::1`, and `urlparse`
+  raises `ValueError`. Three copies of that call existed and two were guarded; the unguarded
+  one is in the *deterministic* sweep, so it needed no LLM and no cooperation from anyone.
+  Reproduced end to end. DEC-F32.
+
+### The coverage gate was non-deterministic
+
+`cli.py` measured 88%, 72% and 69% across identical runs, so the floors failed on a
+different module each time. The cause was this branch's own new test: it spawns a subprocess
+pytest, which inherited pytest-cov's instrumentation and corrupted the parent's data file. A
+gate that fails at random is a gate that gets switched off — which is this whole branch's
+subject, arriving through the tooling written to address it. The child's environment is
+scrubbed now, and five consecutive runs agree.
+
 ### The defect that broke every review, and why nothing caught it
 
 The `PreToolUse` hook denied `StructuredOutput` — the tool the Claude Agent SDK invokes to
@@ -52,6 +101,35 @@ capability the test needs.** A proxy that is wrong in the safe direction turns a
 decoration, and a decorative gate is worse than no gate, because it is counted.
 
 ### Changed
+
+- **`bypassPermissions` is no longer offered in the example config either.** DEC-F28
+  removed it from the type; `config/settings.example.yaml` went on listing it as a valid
+  `permission_mode`, so an operator following the documented surface got a load-time
+  validation error with no hint that the documentation was the defect. The same file
+  omitted `protocol_tools` entirely while claiming to list every field, and still carried a
+  DEC-F19 "KNOWN LIMIT" note that DEC-F25 had fixed.
+
+- **Every list setting accepts the documented `a,b` environment shorthand.** The validator
+  named six fields explicitly, so `protocol_tools` — the seventh, added by DEC-F20 — rejected
+  it with a type error. DEC-F20's rationale was that a renamed SDK protocol tool should be
+  "a settings change"; that was true of the YAML file and false of the environment. The
+  validator now selects by annotation, so the next list field works the day it is added.
+
+- **`ruff` enforces two conventions the repository had disabled.** `S101` and `PLR2004`
+  were global ignores justified with comments about tests, and `T20` was never selected.
+  `PLR2004` is the lint for magic values in comparisons — CLAUDE.md's headline rule — and
+  `T20` is "never `print`". Both scoped correctly now; enabling them found five real
+  violations in `src/`, including two bare `assert`s guarding `None` dereferences that
+  `python -O` would strip, turning each guard into the error it was written to prevent.
+  DEC-F33.
+
+- **Coverage floors cover every module, and two more were added.** `config.py` — the
+  composition root, where `protocol_tools`, `permission_mode`, the fetch allowlist and every
+  budget live — matched no floor at all, so it could have regressed to zero coverage with
+  both the floor script and the global 90% gate green. It was at 79% branch; it is at 95%
+  now, and a test walks `src/` and fails on any unfloored module, which immediately found a
+  second one. DEC-F39.
+
 
 - **`bypassPermissions` is no longer a settable `permission_mode`.** The adapter's module
   docstring has always said it uses restrictive headless permissions and never that mode; the
@@ -160,6 +238,24 @@ decoration, and a decorative gate is worse than no gate, because it is counted.
   SHA, which `tests/unit/test_project_config.py` asserts.
 
 ### Added
+
+- **`creative-agent assets validate` now checks what an asset's body *says*.** Front-matter
+  validation — filename matches `name`, description long enough to trigger, hook executable
+  — says nothing about the part an agent actually follows. A skill could name a renamed
+  script, an undeclared `make` target, an unregistered subcommand or an unwritten decision
+  and pass every gate, failing silently mid-session in someone else's context. Four checks
+  resolve those references against the repository, and the subcommand list is read from the
+  live Typer app rather than a constant, so renaming a command fails every asset that
+  invokes it by construction. DEC-F29.
+
+- **`harness/exitcodes.py`, `harness/classification.py`, `harness/budget.py`,
+  `harness/policy.py`.** Each extraction is justified by a behaviour that had no seam, never
+  by line count: the outcome→exit-code contract (exit 1 was enforced by nothing), the
+  fail-closed mode rule (twelve combinations reachable only through a full pipeline run),
+  the run budget's overshoot bound (asserted by watching a value the neighbouring statement
+  computes), and the host/URL helpers whose third unguarded copy crashed reviews.
+  `pipeline.py` is 781 lines, from 880. DEC-F38, DEC-F40, DEC-F41, DEC-F32.
+
 
 - **`scripts/verify_guard.py`, and a skill and an agent around it.** The recurring failure on
   this branch is mechanical, so it should be a command rather than a discipline: the tool runs
@@ -350,6 +446,46 @@ decoration, and a decorative gate is worse than no gate, because it is counted.
   gate repairs under **Fixed**.)
 
 ### Fixed
+
+- **A `git checkout` of an uncommitted file during debugging.** Recorded because it is the
+  second process error of this kind on the branch: `git checkout src/creative_agent/cli.py`,
+  run as a "restore" step while diagnosing a test, silently discarded four uncommitted
+  changes to that file. They were reconstructed and verified before committing. The lesson
+  is the same as the earlier `git add -A` one — a convenience command that operates on a
+  whole file is the wrong tool while a file is mid-edit.
+
+- **The runtime container image had no SDK.** `claude-agent-sdk` is an optional extra with
+  no `default-extras`, so `uv sync` installed none and every review in that image that was
+  not `--offline` failed with `LLMTransportError` — in an image whose own header says an API
+  key is supplied at run time. Verified independently by syncing into a scratch environment
+  and importing. `--no-dev` was a no-op in the same command, since `dev` is an extra rather
+  than a PEP 735 group. DEC-F36.
+
+- **`.gitleaks.toml` allowlisted the trees its own header calls risky.** `tests/fixtures/`
+  and `tests/golden/` were path-allowlisted wholesale, which disables *every* rule including
+  the upstream defaults, for the directory where recorded SDK transcripts live — precisely
+  where a real key gets pasted. Narrow regexes replace the path entries.
+
+- **`.dockerignore` and `.gitignore` disagreed about build output.** The Dockerfile `COPY`s
+  `.claude`, and `.claude/worktrees/` — a subagent's full second checkout, potentially with
+  a local `config/settings.yaml` inside it — was excluded from git and not from the image.
+  DEC-F35.
+
+- **Two weekly workflows restated commands the Makefile defines**, while CLAUDE.md and the
+  Makefile header both claim CI calls the targets. The drift guard that exists to catch
+  exactly this read only `ci.yml`, so a guard covering one of three workflows reported on one
+  of three workflows. DEC-F37.
+
+- **Laundering skipped `dict` and `tuple`.** DEC-F22 promised coverage of "any model output
+  model"; it was true of `str`, `BaseModel` and `list`. No report field is dict-typed today
+  and `models/gates.py` already has one on a model the LLM writes — which is the point: the
+  guarantee is what the next person relies on when they add one.
+
+- **Two asset-reference checks scanned raw prose**, so "please make sure the gate is green"
+  reported a missing `make` target named `sure`. The shipped assets passed only because
+  every such phrase happened to sit in front matter. A checker whose first false positive is
+  an ordinary English sentence gets ignored.
+
 
 - **`Glob` scoping was escapable, and this is the third entry on one function.**
   `**/../../../etc/*` was ALLOWED while `../../**/*` was denied. `glob_pattern_root` cuts the

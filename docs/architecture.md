@@ -3,7 +3,7 @@
 C4-model documentation for the `creative-agent` harness: an agent framework for
 doctrine-driven review agents, shipping with `sutton-review`.
 
-Related: [decision-log.md](decision-log.md) (framework decisions DEC-F1..F28),
+Related: [decision-log.md](decision-log.md) (framework decisions DEC-F1..F42),
 [../README.md](../README.md), [../CLAUDE.md](../CLAUDE.md).
 
 ---
@@ -82,7 +82,7 @@ flowchart TB
 
     subgraph repo["creative-agent distribution"]
         cli["CLI / composition root<br/>typer — src/creative_agent/cli.py<br/>review, oracles, agents, decisions, state<br/>builds every collaborator, maps errors to exit codes"]
-        harness["Harness library<br/>src/creative_agent/harness/<br/>pipeline + deterministic checkers + seams"]
+        harness["Harness library<br/>src/creative_agent/harness/<br/>pipeline + deterministic checkers + seams<br/>policy, classification, budget, exitcodes:<br/>rules more than one module must agree on"]
         models["Schemas<br/>src/creative_agent/models/<br/>pydantic v2, extra=forbid,<br/>every durable format versioned"]
         agents["Agent plugins<br/>src/creative_agent/agents/<br/>sutton_review: default oracle,<br/>template dir, extra prompt context"]
         oracledata["Oracle data files<br/>data/oracles/*.yaml<br/>rows, tiers, severity caps, gates,<br/>markers, traps, thresholds"]
@@ -91,8 +91,8 @@ flowchart TB
     end
 
     subgraph claudeassets[".claude assets — Claude Code integration"]
-        subagent["agents/sutton-review.md<br/>thin delegator, relays the report unmodified"]
-        skills["skills/<br/>add-oracle, review-gate, oracle-rebaseline"]
+        subagent["agents/<br/>sutton-review: thin delegator, relays the report unmodified<br/>gap-auditor: read-only audit for tests that do not hold"]
+        skills["skills/<br/>add-oracle, review-gate, oracle-rebaseline,<br/>inspect-state, guard-check, live-verify"]
         hooks["hooks/<br/>SessionStart: uv sync<br/>PostToolUse: re-validate oracle data<br/>and .claude assets on edit"]
     end
 
@@ -336,7 +336,7 @@ must abort rather than publish (DEC-F14, DEC-F17).
 
 ## 6. Key architectural decisions
 
-Full text and rationale: [decision-log.md](decision-log.md). All twenty-eight are `CONFIRMED`.
+Full text and rationale: [decision-log.md](decision-log.md). All forty-one are `CONFIRMED`.
 F12 through F18 came out of a peer review that re-verified every claim the earlier entries
 made against the code; four of them correct a control this document previously described as
 holding when it did not, and F14 supersedes part of F4 while F15 and F16 extend F11 and F9.
@@ -344,7 +344,10 @@ F19 is what happened when that work was itself attacked: four of the new entries
 more than their code delivered, including a forged Blocker row that reached the published
 report through the one table cell the renderer pass missed. F20 through F28 are what
 happened when the harness was finally run against the real SDK and the branch was audited
-for tests that do not hold — F20 is a defect that broke every review while every gate was
+for tests that do not hold; F29 through F42 are what happened when the `gap-auditor` agent
+built in F29's own commit was pointed at its own branch — it found that
+`scripts/verify_guard.py`, the instrument the preceding entries rest on, reported
+"GUARD HOLDS" for a revert that merely broke the syntax — F20 is a defect that broke every review while every gate was
 green, and F22, F23 and F26 are third or fourth corrections to controls F16, F19 and F11
 each claimed to have closed.
 
@@ -378,6 +381,15 @@ each claimed to have closed.
 | [DEC-F26](decision-log.md#dec-f26--a-glob-is-refused-by-shape-not-by-its-literal-prefix--confirmed-corrects-dec-f19) | `..`, backslashes and separator-bearing groups are refused by shape, before any prefix logic | `**/../../../etc/*` was allowed while `../../**/*` was denied. Prefix analysis decides where a pattern starts, never where it can reach. |
 | [DEC-F27](decision-log.md#dec-f27--verified-means-the-resolver-ran-never-a-careful-reading--confirmed-corrects-part-of-dec-f13) | `verified: true` means the rebaseline resolver diffed the author list; nothing else sets it | Three rows were hand-flipped from a mirror reading, exempting them from the staleness cap on evidence nobody can re-run — the v1 defect class re-entered through the flag meant to prevent it. |
 | [DEC-F28](decision-log.md#dec-f28--bypasspermissions-is-not-a-configurable-value--confirmed) | `bypassPermissions` is removed from the `PermissionMode` type | The docstring said the adapter never used it and only the default value enforced that. "Disable the tool sandbox" is not a tuning knob. |
+| [DEC-F29](decision-log.md#dec-f29--an-assets-instructions-are-validated-not-just-its-front-matter--confirmed) | `assets validate` resolves an asset's body references — paths, `make` targets, subcommands, decision ids | Front-matter validation says nothing about the part an agent follows; three assets shipped whose only check was that their filename matched their `name`. |
+| [DEC-F31](decision-log.md#dec-f31--gate-references-are-validated-against-the-gate-policy--confirmed) | `supports` and `gate_refs` are filtered against `GatePolicy.all_gate_refs()` | That method existed so refs "can be cross-validated instead of being free-form strings" and had zero call sites, so a made-up gate name lifted the tier cap and published a Blocker. |
+| [DEC-F32](decision-log.md#dec-f32--one-guarded-host-parser-one-anchored-suffix-match--confirmed-extends-dec-f25) | `policy.host_of` and `policy.host_matches_suffix` are the only ways a module parses or compares a host | Three copies of one `urlparse` call, two guarded: `http://[::1]/health` in a document ended an offline review with exit 5. |
+| [DEC-F33](decision-log.md#dec-f33--the-lints-the-repository-disabled-were-its-own-conventions--confirmed) | `S101`/`PLR2004` are per-file test ignores; `T20` is selected | `PLR2004` is the lint for "no hard-coded thresholds" — the repository had globally disabled enforcement of its own first rule, and `T20` for "never print" was never selected. |
+| [DEC-F34](decision-log.md#dec-f34--a-typed-failure-is-reported-twice-to-two-different-readers--confirmed) | Typed failures go to stderr *and* the structured log | The container image logs as JSON and nobody reads its stderr, so every typed failure — including three silent security refusals — produced no telemetry at all. |
+| [DEC-F38](decision-log.md#dec-f38--the-outcomeexit-code-mapping-is-a-function-with-a-table--confirmed) | `harness/exitcodes.py::exit_code_for` owns the outcome→code mapping | Exit 1 was enforced by nothing; the first fix was a CLI test the guard checker reported *weak*. |
+| [DEC-F39](decision-log.md#dec-f39--every-source-module-falls-under-some-coverage-floor--confirmed) | Every source module must match a coverage floor, tested | `config.py` — the composition root — matched none, so it could regress to zero with every gate green. |
+| [DEC-F40](decision-log.md#dec-f40--classification-and-the-fail-closed-mode-rule-get-a-seam--confirmed) | `harness/classification.py::ModeResolver` owns the fail-closed mode rule | Twelve meaningful combinations of the decision that removes the advisory severity ceiling, reachable only through a full pipeline run and enumerated nowhere. |
+| [DEC-F41](decision-log.md#dec-f41--the-run-budget-is-a-component-and-its-bound-is-a-table--confirmed-extracting-dec-f17) | `harness/budget.py::RunBudget` accumulates spend; the bound is a table | The guarantee was asserted by watching a value the neighbouring statement computes, so hoisting the check out of the retry loop left every test green. |
 
 ---
 

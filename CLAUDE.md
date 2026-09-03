@@ -61,13 +61,22 @@ Underlying commands, if you need one in isolation: `uv run pytest`,
   killed. Neither says the assertion would have noticed. Write the leaf test *and* an
   integration assertion on the composed pipeline: the most common gap here is a well-tested
   control whose caller never opts in.
+- **A shared rule lives in `harness/policy.py`; a decision with a truth table gets its own
+  module.** `policy` owns what two modules must agree on (evidence schemes, the URL pattern,
+  host parsing and suffix matching, name folding); `classification`, `budget` and `exitcodes`
+  exist because each holds a decision whose combinations deserve a table rather than an
+  end-to-end run. Extract for testability, never for line count.
 - **A gate must test the capability it needs, not a proxy for it.** The live leg skipped on
   `ANTHROPIC_API_KEY` for a backend that does not require one, so it reported "cannot check"
   in an environment where it works — and behind that silence sat a defect that broke every
   review (DEC-F20/F21). A gate that is wrong in the safe direction is worse than no gate,
   because it is counted.
-- **Coverage floors are a ratchet.** Raise one whenever the suite clears it; that needs no
-  ceremony. Lowering one needs a decision-log entry naming the coverage given up.
+- **Coverage floors are a ratchet, and every module is under one.** Raise a floor whenever
+  the suite clears it; that needs no ceremony. Lowering one needs a decision-log entry
+  naming the coverage given up — with one qualification (DEC-F42): a floor may fall when
+  covered code *moves out* into a module that carries its own floor, which is a ratio
+  artefact rather than a regression. A module under no floor at all can regress to zero with
+  every gate green, so `TestEverySourceModuleIsUnderAFloor` fails on one.
 
 ## Reviewing artifacts in other repos (worktree workflow)
 

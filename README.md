@@ -151,7 +151,7 @@ governing decision is logged).
 | Document | What it covers |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | C4 views, review sequence, extension points, trust boundaries |
-| [`docs/decision-log.md`](docs/decision-log.md) | Framework decisions DEC-F1..F28 and their rationale |
+| [`docs/decision-log.md`](docs/decision-log.md) | Framework decisions DEC-F1..F42 and their rationale |
 | [`docs/roadmap.md`](docs/roadmap.md) | What is deliberately not built yet, and what unblocks it |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history, including the durable-format versions |
 | [`CLAUDE.md`](CLAUDE.md) | Conventions for working in this repo |
