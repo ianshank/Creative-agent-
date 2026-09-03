@@ -10,6 +10,18 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Ian Shank" }]
+# POSIX is the tested platform. `review` and `state show` need advisory file locking, and
+# `assets validate` reads the execute bit; both are handled portably (harness/filelock.py,
+# harness/assets.py) but no Windows CI leg exists, so the classifier states what is
+# actually verified rather than what might work. See docs/roadmap.md 4.2.
+classifiers = [
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "pydantic>=2.7,<3",
     "pydantic-settings>=2.2,<3",

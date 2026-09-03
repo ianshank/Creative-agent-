@@ -183,6 +183,8 @@ def oracles_rebaseline(
             allow_unicode=True,
         ),
         encoding="utf-8",
+        # LF regardless of platform: this file is committed and diffed.
+        newline="\n",
     )
     typer.echo(f"wrote {target} (rebaseline_count={updated.freshness.rebaseline_count})")
     if any("MISMATCH" in line for line in report):
@@ -311,7 +313,11 @@ def review(
     if offline:
         typer.echo(_offline_ceiling_banner(mode), err=True)
     if output_json is not None:
-        output_json.write_text(outcome.report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        output_json.write_text(
+            outcome.report.model_dump_json(indent=2) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     severities = [Severity.parse(f.severity) for f in outcome.result.findings]
     if outcome.result.escalation is not None or Severity.BLOCKER in severities:
         raise typer.Exit(code=int(ExitCode.BLOCKER_OR_STOP))

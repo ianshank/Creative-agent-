@@ -605,3 +605,46 @@ class TestContainerTestStageCanActuallyRunTheSuite:
             """
         )
         assert self._dependencies_in_source(source) == {".gitignore"}
+
+
+class TestPlatformSupportIsDeclaredHonestly:
+    """The project silently claimed portability it has never tested (roadmap 4.2).
+
+    README, the architecture doc and `pyproject.toml` carried no platform statement and no
+    Operating System classifier, while `harness/state.py` imported `fcntl` at module scope
+    and `harness/assets.py` checked an execute bit Windows never sets. Both are handled
+    portably now, but no Windows CI leg exists, so the metadata states what is verified.
+    """
+
+    ROOT: ClassVar[Path] = PYPROJECT.parent
+
+    def _pyproject(self) -> dict:
+        return tomllib.loads((self.ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    def test_the_operating_system_classifier_is_present(self) -> None:
+        classifiers = self._pyproject()["project"]["classifiers"]
+        assert any(c.startswith("Operating System :: POSIX") for c in classifiers)
+
+    def test_no_module_in_src_imports_fcntl_at_module_scope_outside_filelock(self) -> None:
+        """A single POSIX-only import made `review` and `state show` unimportable.
+
+        Locking is now behind `harness/filelock.py`, which binds both platform backends
+        defensively. A new bare `import fcntl` anywhere else would reintroduce the break.
+        """
+        offenders = [
+            path.relative_to(self.ROOT)
+            for path in (self.ROOT / "src").rglob("*.py")
+            if path.name != "filelock.py"
+            and re.search(r"^import fcntl\b", path.read_text(encoding="utf-8"), re.MULTILINE)
+        ]
+        assert offenders == []
+
+    def test_every_text_write_in_src_pins_lf_newlines(self) -> None:
+        """A CRLF-writing checkout would fail the golden tests for a spurious reason."""
+        offenders: list[str] = []
+        for path in (self.ROOT / "src").rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            for match in re.finditer(r"\.write_text\((.*?)\)\n", source, re.DOTALL):
+                if 'newline="\\n"' not in match.group(1):
+                    offenders.append(f"{path.relative_to(self.ROOT)}: {match.group(1)[:60]}")
+        assert offenders == [], f"write_text without newline=: {offenders}"

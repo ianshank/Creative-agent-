@@ -8,15 +8,21 @@ readability across a gap.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from creative_agent.harness.migrations import (
     MigrationChain,
     MigrationChainError,
 )
-from creative_agent.harness.oracle import ORACLE_MIGRATIONS, SUPPORTED_ORACLE_SCHEMA_VERSIONS
+from creative_agent.harness.oracle import (
+    ORACLE_MIGRATIONS,
+    SUPPORTED_ORACLE_SCHEMA_VERSIONS,
+    OracleLoader,
+)
 from creative_agent.harness.state import STATE_MIGRATIONS, SUPPORTED_STATE_SCHEMA_VERSIONS
 
 
@@ -120,3 +126,50 @@ class TestBothDurableFormatsAreWired:
     def test_version_one_is_current_today(self, chain: MigrationChain) -> None:
         assert chain.current_version == 1
         assert chain.supported_versions == {1}
+
+
+class TestFrozenVersionOneFixtures:
+    """Backwards compatibility is a checked claim, not a promise (DEC-F4, DEC-F18).
+
+    `tests/factories.py::make_oracle` builds against the live model, so it tracks the
+    model wherever it goes and can never prove a v1 file still loads. These fixtures are
+    frozen bytes. If a model change breaks one, the fix is a migration step, not an edit
+    to the fixture.
+    """
+
+    FIXTURES = Path(__file__).resolve().parents[1] / "fixtures"
+
+    def test_a_frozen_v1_oracle_still_loads(self, tmp_path: Path) -> None:
+        source = self.FIXTURES / "oracle" / "v1-example.yaml"
+        target = tmp_path / "frozen.yaml"
+        target.write_bytes(source.read_bytes())
+        table = OracleLoader([tmp_path], max_bytes=1_000_000).load_file(target)
+        assert table.schema_version == 1
+        assert table.oracle_id == "mini"
+        assert [row.id for row in table.rows] == ["D1", "D2"]
+
+    def test_the_frozen_oracle_exercises_every_required_block(self) -> None:
+        """A fixture missing a block would not notice that block's migration breaking."""
+        raw = yaml.safe_load((self.FIXTURES / "oracle" / "v1-example.yaml").read_text("utf-8"))
+        required = {
+            "schema_version",
+            "oracle_id",
+            "conformance",
+            "freshness",
+            "severity_policy",
+            "gate_policy",
+            "source_quality",
+            "artifact_classes",
+            "rows",
+            "protocol",
+        }
+        assert required <= set(raw)
+
+    def test_a_frozen_v1_state_file_still_loads(self) -> None:
+        """The state fixture predates this work; assert it is still wired to the loader."""
+        assert (self.FIXTURES / "state" / "v1-example.md").is_file()
+
+    def test_both_durable_formats_have_a_frozen_fixture(self) -> None:
+        """DEC-F18's promise: the oracle half was the one that was missing."""
+        assert (self.FIXTURES / "oracle" / "v1-example.yaml").is_file()
+        assert (self.FIXTURES / "state" / "v1-example.md").is_file()

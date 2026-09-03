@@ -183,11 +183,18 @@ def validate_skill(path: Path) -> list[AssetDefect]:
     return defects
 
 
+# os.name is 'posix' on Linux and macOS, 'nt' on Windows.
+_EXECUTE_BIT_IS_MEANINGFUL = os.name == "posix"
+
+
 def validate_hook(path: Path) -> list[AssetDefect]:
     """Validate one hook script: executable, shebang, and fail-safe shell options."""
     defects: list[AssetDefect] = []
-    mode = path.stat().st_mode
-    if not mode & stat.S_IXUSR:
+    # The execute bit is a POSIX concept. Windows never sets it, so checking it there
+    # would flag every hook in a clean checkout and make `assets validate` exit 1 for a
+    # reason that has nothing to do with the assets — a second, independent Windows break
+    # alongside the fcntl import (docs/roadmap.md 4.2).
+    if _EXECUTE_BIT_IS_MEANINGFUL and not path.stat().st_mode & stat.S_IXUSR:
         defects.append(AssetDefect(path.name, "not executable: the hook will not run (chmod +x)"))
     text = path.read_text(encoding="utf-8")
     if not text.startswith("#!"):

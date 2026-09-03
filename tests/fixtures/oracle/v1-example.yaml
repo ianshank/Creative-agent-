@@ -1,0 +1,145 @@
+# FROZEN v1 ORACLE FIXTURE — DO NOT REGENERATE (DEC-F18)
+#
+# This file is the schema_version 1 oracle format, captured on 2026-09-03. Every future
+# oracle schema version must keep loading it, through the migration chain in
+# `harness/migrations.py` if necessary. That is the whole point: `models/base.SchemaModel`
+# sets `extra="forbid"`, so a migration step must emit exactly the field set of the version
+# it upgrades TO, which means each step needs a frozen copy of the version it upgrades FROM
+# to be worth anything.
+#
+# `tests/factories.py::make_oracle` builds against the LIVE model and tracks it, so it can
+# never serve this purpose — it would silently follow the model wherever it goes. If a
+# model change breaks this file, that is the test doing its job: add a migration step,
+# do not edit this fixture.
+schema_version: 1
+oracle_id: mini
+name: mini oracle
+version: '1.0'
+description: synthetic oracle for engine tests
+conformance:
+  markers:
+  - Mini Program
+  advisory_severity_cap: 0
+freshness:
+  last_rebaselined: '2026-01-01'
+  rebaseline_count: 0
+  max_rebaselines_without_verification: 0
+severity_policy:
+  tier_caps:
+  - tiers:
+    - T
+    - E
+    max_solo_severity: 2
+    reason: T/E cap
+  unverified_row_cap: 1
+  blocker_requires_any_of:
+  - tier_pr_or_ap_row
+  - gate_failure
+  - safety_failure
+  - internal_contradiction
+  blocker_tiers:
+  - PR
+  - AP
+gate_policy:
+  gates:
+  - name: observable
+    description: what is sensed
+    anchors: []
+  - name: compute_budget
+    description: flops per step
+    anchors: []
+    blueprint_missing_severity: 3
+  - name: falsifier
+    description: what would refute
+    anchors: []
+  missing_any_severity: 2
+  quant_claim_requires:
+  - dataset
+  - baseline
+  hand_asserted_severity: 2
+  pseudo_gates:
+  - source_quality
+  - provenance
+  - decision
+source_quality:
+  cluster_citation_min_refs: 4
+  cluster_citation_severity: 2
+  bibliography_hygiene_severity: 1
+  vendor_domains:
+  - vendor.example
+  vendor_page_note: Vendor pages are not evidence.
+  load_bearing_requires_tiers:
+  - PR
+  - AP
+  regime_breaks:
+  - supervised -> reinforcement learning
+artifact_classes:
+- name: architecture_design
+  requires_gates: []
+  requires_sections: []
+  missing_section_severity: 3
+  missing_section_support: safety_failure
+  source_quality_only: false
+- name: deployment_blueprint
+  requires_gates:
+  - compute_budget
+  requires_sections:
+  - safety
+  missing_section_severity: 3
+  missing_section_support: safety_failure
+  source_quality_only: false
+- name: research_synthesis
+  requires_gates: []
+  requires_sections: []
+  missing_section_severity: 3
+  missing_section_support: safety_failure
+  source_quality_only: true
+required_decisions: []
+decision_traps: []
+protocol:
+  escalation_cycle: 3
+  unverified_marker: '[Unverified — flagged for human check]'
+  usage_gates: []
+  missing_decision_severity: 2
+  placeholder_row_id: '-'
+attribution:
+  impersonation_patterns:
+  - \b{name}\s+would\s+(?:say|argue|call|reject|think|insist)
+  - \b{name}\s+believes?\b
+  - \baccording\s+to\s+{name}\b(?![^.]{{0,80}}\((?:1[0-9]|20|21)\d\d\))
+decision_log_grammar:
+  entry_pattern: ^#{1,6}\s+(?P<id>DEC-[A-Za-z0-9]+)\b.*?\b(?P<status>CONFIRMED|DEFERRED|PENDING)\b
+  confirmed_status: CONFIRMED
+consistency:
+  prose_symbols: []
+  max_symbol_length: 20
+  max_definition_length: 120
+rows:
+- id: D1
+  principle: A principle
+  sources:
+  - citation: Doe, A Paper, Journal 2020
+    authors:
+    - Jane Doe
+    arxiv_id: '2001.00001'
+    tier: PR
+    verified: true
+    last_verified: '2026-01-01'
+  tier: PR
+  check: A licensed check
+  failure_mode: A failure mode
+  disclosed_gap: false
+- id: D2
+  principle: A principle
+  sources:
+  - citation: Doe, A Paper, Journal 2020
+    authors:
+    - Jane Doe
+    arxiv_id: '2001.00001'
+    tier: E
+    verified: true
+    last_verified: '2026-01-01'
+  tier: E
+  check: A licensed check
+  failure_mode: A failure mode
+  disclosed_gap: false

@@ -728,12 +728,18 @@ class ReviewPipeline:
     def _write_audit_bundle(self, request: ReviewRequest, cycle: int, sweep: _SweepState) -> None:
         bundle_dir = self._settings.review_log_dir / request.artifact_id / f"cycle-{cycle}"
         bundle_dir.mkdir(parents=True, exist_ok=True)
+        # newline="\n" on every write: the audit bundle and the report are compared
+        # byte-for-byte by the golden tests, and a Windows checkout would otherwise
+        # emit CRLF and fail them for a reason that has nothing to do with content.
         (bundle_dir / "calls.json").write_text(
-            json.dumps(sweep.calls, indent=2, default=str) + "\n", encoding="utf-8"
+            json.dumps(sweep.calls, indent=2, default=str) + "\n",
+            encoding="utf-8",
+            newline="\n",
         )
         (bundle_dir / "tool-evidence.json").write_text(
             json.dumps([e.model_dump() for e in sweep.evidence], indent=2) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
 
 
