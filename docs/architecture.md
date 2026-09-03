@@ -3,7 +3,7 @@
 C4-model documentation for the `creative-agent` harness: an agent framework for
 doctrine-driven review agents, shipping with `sutton-review`.
 
-Related: [decision-log.md](decision-log.md) (framework decisions DEC-F1..F11),
+Related: [decision-log.md](decision-log.md) (framework decisions DEC-F1..F18),
 [../README.md](../README.md), [../CLAUDE.md](../CLAUDE.md).
 
 ---
@@ -64,7 +64,13 @@ flowchart TD
 
 Exit codes are the machine-facing contract (`errors.ExitCode`): `0` clean or Info-only,
 `1` findings at Major or above, `2` Blocker or charter-review STOP, `3` review failed
-(incomplete verification log), `4` config/oracle error, `5` unexpected error.
+(incomplete verification log), `4` config/oracle error, `5` unexpected error, `6` run
+aborted. `6` is deliberately distinct from `3`: `3` says the review ran and its verification
+log could not be completed, which is a statement about the artifact, while `6` says the run
+stopped before producing a verdict — budget exhaustion, a call timeout, or a concurrent
+write to the same artifact's state — so nothing was published and a retry is meaningful
+(DEC-F17). The table is frozen: an addition is deliberate, versioned and recorded here, in
+`README.md`, in the decision log and in a tripwire test.
 
 ---
 
@@ -92,7 +98,7 @@ flowchart TB
 
     state["State store on disk<br/>docs/review-log/&lt;artifact-id&gt;.md<br/>YAML front matter = machine truth<br/>cycle-N/ audit bundles"]
     sdkapi["Claude Agent SDK<br/>Anthropic API"]
-    arxiv["arXiv Atom API"]
+    arxiv["Citation registries<br/>arXiv Atom API + Crossref REST"]
     artifact["Reviewed artifact<br/>+ its repository"]
 
     reviewer --> cli
@@ -108,11 +114,11 @@ flowchart TB
     agents --> models
     harness -->|"OracleLoader: safe_load, size- and depth-bounded"| oracledata
     harness -->|"PromptAssembler: search paths, packaged fallback"| prompts
-    harness -->|"FileStateStore: flock + tmp-file rename"| state
+    harness -->|"FileStateStore: symlink-safe atomic write under an<br/>advisory lock, with an optimistic cycle check"| state
     harness --> llm
     harness -->|"read, size-capped"| artifact
     llm --> sdkapi
-    harness -->|"ArxivCitationResolver, rebaseline only"| arxiv
+    harness -->|"CompositeCitationResolver: arXiv then Crossref,<br/>rebaseline only"| arxiv
 ```
 
 Layering rule, enforced by `lint-imports`: **`harness/` and `models/` must never import
@@ -156,15 +162,17 @@ flowchart TB
         statestore["StateStore<br/>FileStateStore"]
         clock["Clock<br/>SystemClock / FixedClock"]
         agentproto["ReviewAgent<br/>SuttonReviewAgent, via AgentRegistry"]
-        citations["CitationResolver<br/>ArxivCitationResolver / NullCitationResolver<br/>used by 'oracles rebaseline', not by review"]
+        citations["CitationResolver<br/>Composite(Arxiv, Crossref) / NullCitationResolver<br/>used by 'oracles rebaseline', not by review"]
     end
 
     assembler["PromptAssembler<br/>jinja2 + schema from model_json_schema"]
     renderer["OutputRenderer<br/>the published markdown contract,<br/>sorted, LF-stable, golden-tested"]
     loader["OracleLoader<br/>YAML to validated OracleTable"]
-    canonical["canonical<br/>arXiv id and DOI normalization"]
+    canonical["canonical<br/>arXiv id and DOI normalization,<br/>identifier authority binding"]
     artifactmod["artifact<br/>id resolution, size-capped read, sha256"]
     logging["logging<br/>get_logger, log_event, timed_stage"]
+    filelock["filelock<br/>advisory lock + symlink-safe atomic write<br/>both platform backends bound at module scope"]
+    migrations["migrations<br/>MigrationChain: ordered raw-dict upgrade steps<br/>between the version read and model_validate"]
 
     pipeline --> severity
     pipeline --> gates
@@ -192,6 +200,9 @@ flowchart TB
     verification --> canonical
     sq --> canonical
     citations --> canonical
+    statestore --> filelock
+    statestore --> migrations
+    loader --> migrations
 ```
 
 Notes on the shape:
@@ -206,7 +217,20 @@ Notes on the shape:
   nothing on the model's behalf.
 - `CitationResolver` is wired only by `creative-agent oracles rebaseline`; review-time
   citation resolution was cut deliberately, and unresolved rows are handled by the
-  staleness severity cap instead.
+  staleness severity cap instead — which, since DEC-F13, actually fires: a row with no
+  verified source is stale from the first review, because the grace budget defaults to zero.
+  `CompositeCitationResolver` tries arXiv first and Crossref second and reports `skipped`
+  only when every backend skipped, so a source with no resolvable identifier says so rather
+  than borrowing another backend's failure.
+- `harness/filelock.py` and `harness/migrations.py` are shared infrastructure rather than
+  enforcement. `filelock` holds the advisory lock and the symlink-safe atomic write that
+  `FileStateStore` needs, and is the only module in `src/` allowed to import `fcntl` — both
+  platform backends are bound at module scope so the non-POSIX branch is substitutable in a
+  test rather than pragma'd past the coverage gate. `migrations` is the seam both durable
+  read formats route through between the `schema_version` check and `model_validate`; its
+  chain is empty today (v1 is current for both), so it is an identity pass whose plumbing is
+  tested and the first real migration registers a step rather than inventing a mechanism
+  (DEC-F18).
 
 ---
 
@@ -286,7 +310,8 @@ sequenceDiagram
     alt verification defects remain
         P-->>CLI: raise ReviewFailedError — exit 3, never softened, never published
     else clean verification log
-        P->>S: save(new state) — atomic tmp plus rename under flock
+        P->>S: save(new state, expected_cycle=the cycle this run loaded)
+        S->>S: re-read the stored cycle under the write lock; mismatch raises StateConflictError
         P->>P: write audit bundle — calls.json and tool-evidence.json under cycle-N/
         P-->>CLI: PipelineOutcome — report, result, rendered, state_path
     end
@@ -299,11 +324,22 @@ repair loop (each repair pass re-assembles from the current sweep state), and th
 is rendered before the failure branch, so a failed review still produced a complete,
 inspectable document — it is simply not published and no state is written.
 
+Two aborts can cut the run short before any of that. Accumulated LLM cost is checked inside
+`_call`'s attempt loop, before each provider call, and each call runs under
+`asyncio.timeout(llm_timeout_seconds)`; either raises a `RunAbortedError` and exits 6 with
+nothing published. The state conflict at the end is the third, and it exists for the same
+reason: by the time `save` is reached the verdict, the report and the rendered markdown are
+all built from the snapshot loaded at the top, so a run whose history has moved underneath it
+must abort rather than publish (DEC-F14, DEC-F17).
+
 ---
 
 ## 6. Key architectural decisions
 
-Full text and rationale: [decision-log.md](decision-log.md). All ten are `CONFIRMED`.
+Full text and rationale: [decision-log.md](decision-log.md). All eighteen are `CONFIRMED`.
+F12 through F18 came out of a peer review that re-verified every claim the earlier entries
+made against the code; four of them correct a control this document previously described as
+holding when it did not, and F14 supersedes part of F4 while F15 and F16 extend F11 and F9.
 
 | ID | Decision | One-line rationale |
 |---|---|---|
@@ -318,6 +354,13 @@ Full text and rationale: [decision-log.md](decision-log.md). All ten are `CONFIR
 | [DEC-F9](decision-log.md#dec-f9--threat-model--confirmed) | The reviewed artifact is untrusted: scoped tools, allowlisted fetch, laundered output | Prompt injection and SSRF are the realistic attacks on a reviewer, so tool scope is narrow and tool honesty is checked against results, not intentions. |
 | [DEC-F10](decision-log.md#dec-f10--observability--confirmed) | Structured logging on the `creative_agent` namespace with stable event names | A wrong verdict must be traceable to the stage that decided it; prompts and artifact text are never logged, only sizes, ids, counts, durations. |
 | [DEC-F11](decision-log.md#dec-f11--real-tool-scope-enforcement-via-pretooluse--confirmed) | A `PreToolUse` hook enforces DEC-F9's scoping at the SDK call boundary, not just in the prompt | The prior scoping was advisory for `WebFetch` and fully disconnected for `Read`/`Grep`/`Glob`; `can_use_tool` is dead code under this project's `permission_mode="dontAsk"`, so `PreToolUse` is the only mechanism that actually fires. |
+| [DEC-F12](decision-log.md#dec-f12--tool-honesty-evidence-must-be-authority-bound--confirmed) | An identifier counts as retrieved only from an http(s) fetch of its own registrar, and a `canonical_id` claim is matched by identifier, never by raw string | Canonicalizing the *requested target* made the check fake-satisfiable by a decoy URL or by a local `Read` of a file the artifact's author named; the defect was at the evidence boundary, not in extraction, so `canonicalize` is unchanged. |
+| [DEC-F13](decision-log.md#dec-f13--an-unverified-doctrine-row-is-stale-from-the-start--confirmed) | The re-baseline grace budget defaults to zero, so an unverified row is stale immediately | The trigger was coupled to a counter that only rises when the operation that marks a source verified is run, so a freshly transcribed corpus — the state needing protection most — had none; fail-closed is the right default for a reviewer that refuses to soften. |
+| [DEC-F14](decision-log.md#dec-f14--optimistic-concurrency-for-review-state--confirmed-supersedes-part-of-dec-f4) | `save` carries the expected prior cycle, re-reads under its own lock and raises `StateConflictError` | Detect and fail, do not serialise: holding a lock across a minutes-long review is a hang rather than an error, and by `save` the verdict is already computed from the stale snapshot, so retrying the write would publish it. |
+| [DEC-F15](decision-log.md#dec-f15--deny-by-default-tool-scoping--confirmed-extends-dec-f11) | The `PreToolUse` hook matches every tool and denies by default; glob patterns are scoped like paths | A name-based matcher plus an allow-on-unknown fallback meant most tools were never inspected, and `Glob`'s pattern — the argument that decides where it searches — was never read at all. |
+| [DEC-F16](decision-log.md#dec-f16--prose-laundering-covers-line-and-format-characters--confirmed-extends-dec-f9) | Laundering folds line and layout characters and removes Unicode format characters; the renderer escapes every model-supplied field | Stripping only C0/C1 let model prose open a second `**VERDICT**` line and forge a `## Findings` section, so the deterministic renderer's guarantee held only for callers that had already laundered correctly. |
+| [DEC-F17](decision-log.md#dec-f17--run-level-budget-and-timeout-and-a-retryable-abort-code--confirmed) | Budget accumulates per run and every call runs under a timeout; both abort with the new `ExitCode.RUN_ABORTED = 6` | `max_budget_usd` was per call and `llm_timeout_seconds` was dead configuration; an abort is a statement about the run, and folding it into exit 3 would tell a CI consumer to read a transient stop as a finding about the document. |
+| [DEC-F18](decision-log.md#dec-f18--migration-seams-for-the-two-durable-read-formats--confirmed) | One shared `MigrationChain` sits between the version read and `model_validate` in both durable loaders | Adding a seam retroactively is harder than leaving an empty one now; the report contract is excluded because nothing reads a report back, so what it needs is a documented consumer promise, which `README.md` carries. |
 
 ---
 
@@ -380,12 +423,19 @@ Any tool whose successful results should be able to back `fetched=True` must be 
 
 ### Add a state store — the `StateStore` protocol
 
-Implement `load(artifact_id) -> ReviewState` and `save(state, summary_markdown) -> Path`.
-`FileStateStore` is the reference: markdown with `schema_version`'d YAML front matter,
-`flock` around a tmp-file-plus-rename write, and a typed `StateCorruptError` with an
-explicit `--reset-state` escape hatch instead of a silent cycle reset. A replacement must
-preserve `open_major_keys()` semantics, since `CycleEscalator` depends on them, and is
-substituted in `cli.py::review`.
+Implement `load(artifact_id) -> ReviewState` and
+`save(state, summary_markdown, *, expected_cycle=None) -> Path`. `FileStateStore` is the
+reference: markdown with `schema_version`'d YAML front matter read through the migration
+chain, a symlink-safe tmp-file-plus-rename write fsynced under an advisory lock, and a typed
+`StateCorruptError` with an explicit `--reset-state` escape hatch instead of a silent cycle
+reset. A replacement must preserve `open_major_keys()` semantics, since `CycleEscalator`
+depends on them, and is substituted in `cli.py::review`.
+
+`expected_cycle` is the cycle the caller loaded. It is a keyword with a `None` default, so a
+store that cannot detect conflicts stays substitutable — but the pipeline always passes it,
+and an implementation that accepts it must re-read under the same lock that guards the write
+and raise `StateConflictError` on a mismatch (DEC-F14). A store that silently ignores it is
+a store that can lose an escalation.
 
 ### The layering contract
 
@@ -426,10 +476,10 @@ flowchart LR
     subgraph boundary["Boundary controls — deterministic, harness-side"]
         delimit["ThreatGuard.delimit_artifact<br/>content wrapped as data;<br/>embedded closing sentinel stripped"]
         allow["ThreatGuard.fetch_domain_allowlist<br/>oracle source hosts + resolver hosts<br/>+ artifact hosts, minus internal targets"]
-        roots["ThreatGuard.allowed_read_roots<br/>artifact dir, oracle dirs, artifact repo"]
+        roots["ThreatGuard.allowed_read_roots<br/>artifact dir, oracle dirs, artifact repo;<br/>enforced per call, patterns included"]
         idcheck["artifact.validate_artifact_id<br/>single safe path segment, no traversal"]
-        launder["ThreatGuard.launder_prose<br/>control chars stripped, length capped"]
-        honesty["VerificationLogChecker<br/>fetched=True must match a successful<br/>fetch-class tool RESULT, by canonical id"]
+        launder["ThreatGuard.launder_prose<br/>control, layout and format chars;<br/>length capped; renderer escapes every field"]
+        honesty["VerificationLogChecker<br/>fetched=True must match a successful fetch<br/>of that identifier from its own registrar"]
         sections["_sections_present<br/>required sections read from the document's<br/>own headings, not from the model's claim"]
     end
 

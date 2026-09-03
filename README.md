@@ -31,7 +31,16 @@ make docker-review ARTIFACT=docs/architecture.md
 ```
 
 Exit codes: `0` clean/Info-only · `1` findings ≥ Major · `2` Blocker or charter-review STOP ·
-`3` review failed (incomplete verification log) · `4` config/oracle error · `5` unexpected error.
+`3` review failed (incomplete verification log) · `4` config/oracle error · `5` unexpected
+error · `6` run aborted (budget, timeout, or a concurrent write to the same artifact's state).
+
+`3` and `6` are both failures and they mean different things. `3` is a statement about the
+**artifact**: the review ran to completion and its verification log could not be completed,
+so the report is refused rather than softened — re-running changes nothing until the document
+or the oracle does. `6` is a statement about the **run**: it stopped before producing a
+verdict, nothing was published and no state was written, so a retry is meaningful. A consumer
+that treats every nonzero code as failure needs no change; one that branches should route `6`
+to a retry and `3` to a human.
 
 Add `--verbose` (INFO) or `--debug` (every stage and LLM call, with durations), and
 `--log-format json` to emit one JSON object per line for a log store:
@@ -39,6 +48,38 @@ Add `--verbose` (INFO) or `--debug` (every stage and LLM call, with durations), 
 ```bash
 creative-agent --debug --log-format json review design.md --offline
 ```
+
+**`--offline` cannot fail on artifact content in the default `auto` mode.** The offline
+client returns no claims, so the measurement gates score nothing; every doctrine row comes
+back `not_applicable`; and offline classify recommends advisory mode, which caps every
+finding at the oracle's advisory ceiling and exits 0. A document with three genuine Blockers
+and an admission that no baseline was measured exits 0 and reports nothing above Info. An
+offline run prints a banner to stderr saying so. Pass `--mode conformance` for an offline run
+whose severities and exit code are real; `make review-offline` and `make docker-review` are
+pass-throughs as written.
+
+**Platform:** POSIX (Linux and macOS) is what is tested, and the `pyproject.toml`
+classifiers say so. There is no Windows CI leg. The two known Windows breaks are fixed —
+advisory locking is behind `harness/filelock.py` and `assets validate`'s execute-bit check is
+POSIX-gated — but "fixed" here means "no longer known to be broken", not "verified".
+`docs/roadmap.md` 4.2 holds the full-support option and its cost.
+
+### `--output-json`: what a consumer can rely on
+
+`review --output-json <path>` writes the `ReviewReport` (`models/output.py`) as JSON, LF-
+terminated. The promise is narrow and deliberate:
+
+- **`contract_version` is the thing to pin on.** It is an integer, currently `1`, carried in
+  both the JSON and the rendered markdown header. A consumer should read it and refuse a
+  version it does not know, exactly as the oracle and state loaders do for their own formats.
+- **Nothing parses a report back.** The report contract has no read side anywhere in this
+  project, so — unlike the oracle YAML and the review state — it has no migration chain and
+  never will unless one is added (DEC-F18). A bump to `contract_version` is a change the
+  consumer must handle; there is nothing on this side to upgrade an old file.
+- **The banner is not in it.** The offline ceiling banner goes to stderr and the rendered
+  report to stdout; neither contaminates the JSON, and a test asserts it.
+- Field additions within a version are additive; a removal or a meaning change bumps
+  `contract_version` and is called out in `CHANGELOG.md`.
 
 ## Architecture
 
@@ -110,7 +151,7 @@ governing decision is logged).
 | Document | What it covers |
 |---|---|
 | [`docs/architecture.md`](docs/architecture.md) | C4 views, review sequence, extension points, trust boundaries |
-| [`docs/decision-log.md`](docs/decision-log.md) | Framework decisions DEC-F1..F11 and their rationale |
+| [`docs/decision-log.md`](docs/decision-log.md) | Framework decisions DEC-F1..F18 and their rationale |
 | [`docs/roadmap.md`](docs/roadmap.md) | What is deliberately not built yet, and what unblocks it |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release history, including the durable-format versions |
 | [`CLAUDE.md`](CLAUDE.md) | Conventions for working in this repo |
