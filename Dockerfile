@@ -50,7 +50,7 @@ COPY .github ./.github
 # every CI check, that the ignore files protect what they claim, that the shipped
 # Claude Code assets are valid. Those files are inputs to the tests, so a test stage
 # without them passes vacuously and the "green container means green CI" claim breaks.
-COPY Makefile CHANGELOG.md Dockerfile .gitignore .dockerignore .gitleaks.toml ./
+COPY Makefile CHANGELOG.md CLAUDE.md Dockerfile .gitignore .dockerignore .gitleaks.toml ./
 # One definition of the gate, called here rather than restated: a green container is a
 # green CI because both run the same target.
 CMD ["make", "gate"]

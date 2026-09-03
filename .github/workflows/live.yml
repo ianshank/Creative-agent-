@@ -24,6 +24,22 @@ jobs:
           enable-cache: true
       - run: uv python install 3.11
       - run: uv sync --all-extras --locked
+      # Without this the job is decorative: every live-marked test skips itself when the
+      # key is absent, so pytest exits 0 and the workflow reports success having verified
+      # nothing against the real SDK — the one thing it exists to do. Fail here, before
+      # pytest, so the cause is the message rather than a green run to be interpreted.
+      - name: Require ANTHROPIC_API_KEY before running anything
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set for this repository. The live" \
+                 "tests skip themselves without it, so this job would pass having" \
+                 "exercised nothing. Add the secret (Settings -> Secrets and variables" \
+                 "-> Actions) or disable this workflow; do not leave it green and empty."
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY is present; the live tests will actually run."
       - name: Run live tests
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
