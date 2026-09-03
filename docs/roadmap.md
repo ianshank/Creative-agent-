@@ -104,16 +104,28 @@ identifier's own authority host, not anywhere in an arbitrary string, and refuse
 local `Read` as a fetch for a remote identifier. Needs a decision-log entry: this changes
 what counts as evidence, which is the heart of DEC-F9.
 
-**Done — DEC-F12.** `canonical.fetched_identifier` credits an identifier only from an
-`http`/`https` fetch whose host is an authority for that identifier's scheme (host or
-dot-anchored subdomain, so `notarxiv.org` fails and `export.arxiv.org` passes), and
-`VerificationLogChecker.check_tool_honesty` matches a `canonical_id` entry by identifier
-only — a raw-target match can no longer back a scholarly claim, while an entry making no
-such claim still accepts one, so reading the artifact under review keeps working.
-Authorities are `HarnessSettings.identifier_authority_hosts`, threaded from settings at the
-composition root, so a mirror or DOI proxy is configuration. `canonicalize` is deliberately
-unchanged: it is right for identity bucketing, and the defect was trusting its output as
-proof of retrieval. Decoy-URL and local-`Read` cases are now tests rather than a blessing.
+**Done — DEC-F12, as corrected by DEC-F19.** `canonical.fetched_identifier` credits an
+identifier only from an `http`/`https` fetch whose host is a registrar for one of the
+configured identifier schemes (host or dot-anchored subdomain, so `notarxiv.org` fails and
+`export.arxiv.org` passes), reading the identifier from the host and path only — a registrar
+returns 200 for arbitrary query strings, so the decoy otherwise just moved to the registrar
+host. Cross-registrar is deliberate: `doi.org/10.48550/arXiv.<id>` is arXiv's own DOI prefix
+and a legitimate retrieval, and demanding per-scheme agreement would have failed a
+conformance review with exit 3. `VerificationLogChecker.check_tool_honesty` matches by
+identifier whenever the entry's `canonical_id` *or* its `source_url` canonicalizes, and an
+evidence target that canonicalizes can never be credited as plain-string evidence — keying
+on `canonical_id` alone made the control opt-out, since the model writes the entry and
+omitting one optional field restored the original forgery. Only an entry carrying no
+identifier at all accepts a raw-target match, so reading the artifact under review keeps
+working. Authorities are `HarnessSettings.identifier_authority_hosts`, threaded from settings
+at the composition root. `canonicalize` is deliberately unchanged: it is right for identity
+bucketing, and the defect was trusting its output as proof of retrieval. Decoy-URL and
+local-`Read` cases are now tests rather than a blessing.
+
+**Still open, the configuration half.** `identifier_authority_hosts` reaches the honesty
+checker but not `ThreatGuard.fetch_domain_allowlist`, so naming a mirror makes the checker
+accept a fetch the `PreToolUse` hook will still deny. "A mirror is a settings change" is not
+yet true end to end (DEC-F19 records this rather than half-fixing it).
 
 ### 1.2 The staleness severity cap never fires
 

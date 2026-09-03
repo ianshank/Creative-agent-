@@ -35,9 +35,13 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
   $360. `ReviewPipeline` now sums `cost_usd` across every attempt in `sweep.calls` and checks
   the total *inside* `_call`'s attempt loop, before each provider call, so one logical call
   cannot burn several times what is left. Exhaustion raises `BudgetExceededError` and the run
-  publishes nothing. The per-call value is still handed to the SDK; the run-level cap is the
-  new enforcement. A backend that reports no cost (`OfflineLLMClient`, `FakeLLMClient`)
-  contributes zero rather than aborting the run. DEC-F17.
+  publishes nothing. What the SDK receives as its own per-call cap is the **remaining** run
+  budget, carried on `AssembledPrompt`, not the raw setting: a pre-call check cannot know
+  what the call will cost, so a $2 budget with $1.90 calls would otherwise spend $3.80, and
+  passing the raw setting made one number mean "per call" in the adapter and "per run" in the
+  pipeline, for a practical bound of roughly twice the setting (DEC-F19). A backend that
+  reports no cost (`OfflineLLMClient`, `FakeLLMClient`) contributes zero rather than aborting
+  the run. DEC-F17.
 
 - **`llm_timeout_seconds` is live.** It was declared in `HarnessSettings`, documented in
   `config/settings.example.yaml`, and used nowhere in `src/` — dead configuration, so a hung
@@ -275,18 +279,22 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
   called "the control that makes the verification log worth reading," and canonicalization is
   exactly what made it fake-satisfiable. Two rules now, both deterministic. **Authority
   binding:** a canonical identifier enters the observed-evidence set only from a successful
-  fetch-class result whose target is an `http`/`https` URL *and* whose host is an authority
-  for that identifier's scheme, matched on the host or a dot-anchored subdomain so
-  `notarxiv.org` cannot pass as `arxiv.org` while `export.arxiv.org` does. A non-URL target
-  contributes no identifier. **Claims matched by kind:** an entry naming a `canonical_id` is
-  a scholarly claim and must be matched by identifier — raw-string equality cannot satisfy
-  it, which is what let a local read back a claim about a paper — while an entry with no
-  `canonical_id` makes no scholarly claim and may still be satisfied by an exact target
-  match, so reading the artifact under review keeps working. `canonicalize` itself is
-  unchanged: it is used for identity bucketing in the source-quality checker and the
-  rebaseline resolver, where a permissive substring match is correct. The defect was trusting
-  extraction from an attacker-chosen string as evidence of retrieval, so the fix lives at the
-  evidence boundary. DEC-F12.
+  fetch-class result whose target is an `http`/`https` URL *and* whose host is a registrar
+  for one of the configured identifier schemes, matched on the host or a dot-anchored
+  subdomain so `notarxiv.org` cannot pass as `arxiv.org` while `export.arxiv.org` does; the
+  identifier is read from the host and path only, never the query string or fragment. A
+  non-URL target contributes no identifier. **Claims matched by what they carry:** any entry
+  whose `canonical_id` *or* `source_url` canonicalizes to a scholarly identifier is matched
+  by identifier — raw-string equality cannot satisfy it, which is what let a local read back
+  a claim about a paper — and an evidence target that itself canonicalizes can never be
+  credited as plain-string evidence. Only an entry carrying no identifier at all is satisfied
+  by an exact target match, so reading the artifact under review keeps working.
+  `canonicalize` itself is unchanged: it is used for identity bucketing in the source-quality
+  checker and the rebaseline resolver, where a permissive substring match is correct. The
+  defect was trusting extraction from an attacker-chosen string as evidence of retrieval, so
+  the fix lives at the evidence boundary. DEC-F12, as corrected by DEC-F19 — the first
+  implementation was host-bound rather than retrieval-bound and keyed on `canonical_id`
+  alone; see the corrections below for what that still allowed.
 
 - **A concurrent review could erase the cycle-3 charter-review escalation.** `FileStateStore.
   load` took no lock, `save` locked only the tmp-write and `os.replace`, and the pipeline
@@ -371,14 +379,17 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
   while both look correct. Laundering is idempotent, which matters because prose passes
   through once per repair-loop iteration. The renderer no longer relies on its caller having
   laundered correctly: it escapes the verdict headline, the escalation message, the
-  `what_survives` and `residual_risks` bullets, the scope-item references and the
-  model-supplied `row_id`, not just table cells, and `_md_escape` now handles `\r` as well as
-  `\n` because most markdown renderers break a line on a bare carriage return. Structural
-  fields the harness assigns itself — `finding_id`, oracle row ids — are not model input and
-  are left alone, which a test asserts rather than assumes. DEC-F16.
+  `what_survives` and `residual_risks` bullets, the scope-item references, the findings
+  table's `doctrine_refs` and `gate_refs`, and the model-supplied `row_id` — not just table
+  cells — and `_md_escape` now handles `\r` as well as `\n` because most markdown renderers
+  break a line on a bare carriage return. `scope_items` are laundered at assembly like every
+  other prose block. Structural fields the harness assigns itself — `finding_id`, oracle row
+  ids — are not model input and are left alone, which a test asserts rather than assumes.
+  DEC-F16; the ref lists and the `scope_items` laundering are DEC-F19, because the first fix
+  claimed both and delivered neither.
 
-- **Eight gates that reported success while verifying nothing.** Each passed for a reason
-  unrelated to what it claimed to check.
+- **Nine checks that reported success while verifying nothing, or credited the wrong
+  outcome.** Each passed for a reason unrelated to what it claimed to check.
   - **Mutation baseline.** `scripts/check_mutation_baseline.py` gated only
     `survived`/`no_tests`/`suspicious`/`timeout`, every one of which is 0 when no mutant is
     generated, so an all-zero stats file exited 0 and read as a perfect kill rate. `total` is
@@ -436,6 +447,87 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
     let eighteen mutants' worth of enforcement core be deleted without the guard noticing,
     which is the hole the guard exists to close.
 
+- **Four holes an adversarial review found in the fixes above — DEC-F19.** DEC-F12 through
+  DEC-F18 were implemented and then attacked. Four of those entries asserted more than their
+  code delivered, so the corrections are recorded rather than edited into the originals: what
+  was believed at the time is part of the record.
+  - **A forged Blocker row reached the published report.** DEC-F16 said the renderer "escapes
+    every model-supplied field it emits". It did not escape `doctrine_refs` or `gate_refs`,
+    which are joined and interpolated raw into the findings table's Doctrine/gate cell.
+    `gate_refs` is copied verbatim from the model's `CandidateFinding` and is an
+    unconstrained `list[str]`, so one entry closed the cell and opened a forged **Blocker**
+    row — the exact defect that entry exists to close, in the exact table it names, surviving
+    the fix that named it. Both ref lists now pass through `_md_escape`, and the guard counts
+    the table's data rows rather than grepping for an escape sequence.
+  - **`scope_items` were never laundered.** DEC-F16 said the pipeline laundered them like
+    every other prose block. Nothing did: only the renderer's pipe-and-newline escape ran, so
+    a bidi override or a zero-width run reached the report and `max_prose_chars` never
+    applied. They now pass through `ThreatGuard.launder_prose` with the rest.
+  - **The `Glob` check held only for patterns whose first segment is literal.**
+    `glob_pattern_root` trimmed the partial final segment with `rsplit("/", 1)[0]`, which
+    returns `""` when the first metacharacter falls inside the first segment — and `""` reads
+    as "relative to the base directory", which is allowed. `/etc*/*`, `/h*me/user/.ssh/*` and
+    `/*` were all permitted; only `/etc/**/*` was caught, which is the form the original
+    tests used. Those tests were written to the implementation rather than against it. The
+    trailing separator is kept now, so an absolute pattern stays absolute, and brace or
+    bracket groups containing a path separator, and a leading `~`, are refused outright
+    rather than guessed at.
+  - **The tool-honesty check was opt-out, admitted a decoy on the registrar itself, and would
+    have failed legitimate reviews.** Three defects in one control. `canonical_id` is
+    optional and the model writes the entry, so the party the check constrains chose which
+    branch judged it — omitting the field restored the local-`Read` forgery verbatim.
+    `arxiv.org` and `doi.org` are on every computed allowlist unconditionally and both return
+    200 for arbitrary paths, so the decoy simply moved to the registrar and
+    `arxiv.org/?x=arxiv.org/abs/<id>` was credited. And requiring the host to be an authority
+    for the scheme *canonicalization happened to pick* refused
+    `doi.org/10.48550/arXiv.<id>` — arXiv's own DOI prefix, and the standard modern citation
+    form — so a conformance review citing a preprint through the DOI resolver DEC-F12
+    explicitly blesses would have exited 3. A port defeated the match too. See the corrected
+    rules in the tool-honesty entry above.
+  - **The budget overshoot was understated.** DEC-F17's "a single logical call cannot burn
+    several times the remaining budget" was true of the retry loop and false of the run: a
+    pre-call check cannot know what the call will cost, so a $2 budget with $1.90 calls spent
+    $3.80. Worse, the adapter still passed the raw `max_budget_usd` to the SDK as a *per
+    call* cap, so one number meant two different things and the practical bound was roughly
+    twice the setting. The remaining run budget is now carried on `AssembledPrompt` and used
+    as the backend's per-call ceiling, which bounds the overshoot at the budget itself.
+  - **Known and accepted, not fixed:** `identifier_authority_hosts` reaches the honesty
+    checker but not `ThreatGuard.fetch_domain_allowlist`, so a configured mirror is accepted
+    as evidence while the `PreToolUse` hook still denies the fetch — DEC-F12's "a mirror is a
+    settings change" is not yet true end to end, and that is recorded in `docs/roadmap.md`
+    rather than half-fixed. Deny-by-default still has no live verification, which needs the
+    API key Tranche 0 is blocked on, and `_EVIDENCE_SCHEMES` and `ALLOWED_FETCH_SCHEMES` are
+    two literals for one policy.
+
+- **The artifact *path* was as untrusted as its contents, and nothing checked it.** The
+  documented `--artifact-repo` flow reviews a checked-out worktree and git carries symlinks,
+  so the reviewed repository decides where `docs/design.md` actually points; Typer's
+  `dir_okay=False` rejects directories and nothing else. `stat().st_size` reports 0 for a
+  character device, so `docs/design.md` symlinked to `/dev/zero` passed the size cap and then
+  read unbounded — a plausible out-of-memory from a one-line symlink. `read_artifact` now
+  refuses anything that is not a regular file, and, when `--artifact-repo` is given, refuses
+  a path the operator located inside that repository that resolves outside it — so a symlink
+  at `docs/design.md` pointing at `~/.ssh/id_rsa` is refused rather than read, delimited and
+  handed to the model. The containment check is deliberately conditional on where the
+  operator pointed: reviewing a document that genuinely lives outside the repository while
+  passing `--artifact-repo` so `DecisionGate` reads that repository's decision log is a
+  legitimate pattern. Symlinks that stay inside the tree are fine — refusing every symlink
+  would break ordinary checkouts to no benefit.
+
+- **Two more gates that looked at nothing.** `ClaudeSDKAdapter.generate()` is the only place
+  the real `claude_agent_sdk.query` is bound, and it was verified by nothing: every test,
+  including the shared `LLMClient` contract suite's `sdk-mocked` leg, called the private
+  `_run` with a hand-written transport; the module is coverage-omitted under DEC-F8; and the
+  live test skipped for want of an API key. Three independent gates all declined to look at
+  the one function that touches the SDK, so a renamed or re-signatured entry point would have
+  surfaced only in a user's review. `generate()` is now exercised directly, including the
+  `ImportError`-to-`LLMTransportError` branch. Separately, the `PreToolUse` enforcement tests
+  sat behind `pytest.importorskip("claude_agent_sdk")`, and `claude-agent-sdk` is an optional
+  extra — any environment synced without `--all-extras` dropped the entire sandbox-escape
+  class and reported green, CI being safe only because `make install` happens to pass that
+  flag. The skips are gone, so a missing extra fails at import, and a test states the
+  requirement rather than leaving it implicit in an `ImportError`.
+
 - **CRLF on non-POSIX checkouts.** Four `write_text` calls emitted platform-native line
   endings and would have failed the golden tests for a reason unrelated to content; all four
   pin `newline="\n"`, and a test scans `src/` so a fifth cannot appear. A second test forbids
@@ -467,8 +559,17 @@ exit-code contract. The exit-code table gains code `6` — see the frozen-contra
   cost. The corrected text is in DEC-F12, DEC-F15 and DEC-F16 and in `docs/architecture.md`
   §8, which previously asserted the opposite of what the code did.
 
+- Those fixes were then attacked in turn, and four of them did not hold either — a forged
+  Blocker row in the published findings table, unlaundered `scope_items`, a glob check that
+  only caught patterns with a literal first segment, and an honesty check the model could
+  opt out of by omitting one optional field. DEC-F19 records what each entry claimed and
+  what the code actually did. The lesson is in the entries: a control asserted by a test
+  written *to* the implementation is not a control.
+
 - Two file-write primitives on the state path: a symlink planted at the temp or lock path
-  gave an arbitrary-file overwrite and a truncate. Fixed under **Fixed** above.
+  gave an arbitrary-file overwrite and a truncate. Fixed under **Fixed** above. The artifact
+  read path had the mirror-image gap — a symlink or character device where a document was
+  expected — and is now checked too.
 
 - Accepted and documented rather than fixed: `WebSearch` ships in the default tool set with
   an unconstrained query, so an artifact that can steer the model's search terms has an

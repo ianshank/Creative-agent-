@@ -3,7 +3,7 @@
 C4-model documentation for the `creative-agent` harness: an agent framework for
 doctrine-driven review agents, shipping with `sutton-review`.
 
-Related: [decision-log.md](decision-log.md) (framework decisions DEC-F1..F18),
+Related: [decision-log.md](decision-log.md) (framework decisions DEC-F1..F19),
 [../README.md](../README.md), [../CLAUDE.md](../CLAUDE.md).
 
 ---
@@ -336,10 +336,13 @@ must abort rather than publish (DEC-F14, DEC-F17).
 
 ## 6. Key architectural decisions
 
-Full text and rationale: [decision-log.md](decision-log.md). All eighteen are `CONFIRMED`.
+Full text and rationale: [decision-log.md](decision-log.md). All nineteen are `CONFIRMED`.
 F12 through F18 came out of a peer review that re-verified every claim the earlier entries
 made against the code; four of them correct a control this document previously described as
 holding when it did not, and F14 supersedes part of F4 while F15 and F16 extend F11 and F9.
+F19 is what happened when that work was itself attacked: four of the new entries asserted
+more than their code delivered, including a forged Blocker row that reached the published
+report through the one table cell the renderer pass missed.
 
 | ID | Decision | One-line rationale |
 |---|---|---|
@@ -361,6 +364,7 @@ holding when it did not, and F14 supersedes part of F4 while F15 and F16 extend 
 | [DEC-F16](decision-log.md#dec-f16--prose-laundering-covers-line-and-format-characters--confirmed-extends-dec-f9) | Laundering folds line and layout characters and removes Unicode format characters; the renderer escapes every model-supplied field | Stripping only C0/C1 let model prose open a second `**VERDICT**` line and forge a `## Findings` section, so the deterministic renderer's guarantee held only for callers that had already laundered correctly. |
 | [DEC-F17](decision-log.md#dec-f17--run-level-budget-and-timeout-and-a-retryable-abort-code--confirmed) | Budget accumulates per run and every call runs under a timeout; both abort with the new `ExitCode.RUN_ABORTED = 6` | `max_budget_usd` was per call and `llm_timeout_seconds` was dead configuration; an abort is a statement about the run, and folding it into exit 3 would tell a CI consumer to read a transient stop as a finding about the document. |
 | [DEC-F18](decision-log.md#dec-f18--migration-seams-for-the-two-durable-read-formats--confirmed) | One shared `MigrationChain` sits between the version read and `model_validate` in both durable loaders | Adding a seam retroactively is harder than leaving an empty one now; the report contract is excluded because nothing reads a report back, so what it needs is a documented consumer promise, which `README.md` carries. |
+| [DEC-F19](decision-log.md#dec-f19--corrections-to-f12-f15-f16-and-f17-after-adversarial-review--confirmed) | Corrections to F12, F15, F16 and F17, recorded rather than edited into the originals | Four of those entries asserted more than their code delivered — an unescaped findings-table cell, unlaundered `scope_items`, a glob check that held only for a literal first segment, an opt-out honesty branch, an authority rule that both admitted a decoy and refused `doi.org/10.48550/arXiv.<id>`, and a budget bound roughly twice the setting. A log that overstates is worse than none; what was believed at the time is part of the record. |
 
 ---
 
@@ -523,50 +527,70 @@ Where each control sits:
   unconditionally. Only `http` and `https` are fetchable. A rejected host is logged as
   `security.fetch_hosts_rejected` rather than silently dropped. Permission mode comes from
   settings and is never `bypassPermissions`.
-- **Read scoping, deny-by-default.** The `PreToolUse` hook matches **every** tool, not a
-  named set, and allows a call only when it is explicitly scoped or the tool is listed in
+- **Read scoping, deny-by-default.** The `PreToolUse` hook matches **every** tool, not a named
+  set, and allows a call only when it is explicitly scoped or the tool is listed in
   `HarnessSettings.unscoped_tools`; an unrecognised tool is denied and logged. `Read`, `Grep`
   and `Glob` are checked against the computed read roots — the artifact directory, the oracle
   directories, and the artifact repo when `--artifact-repo` is given — **including their
   path-shaped glob arguments**. `Glob` takes a required `pattern` and an optional `path`, so
-  the pattern is what decides where a search starts; scoping takes its longest leading
-  literal segment, joins it to the call's base directory, resolves it and applies the same
-  containment predicate, which denies `/etc/**/*` and `../../**/*` while allowing a plain
-  `*.md`. `Grep`'s `pattern` is a regex, not a path, and only its `glob` filters paths —
-  scoping the regex would deny a legitimate search for a path-looking string inside the
+  the pattern is what decides where a search starts; scoping takes its longest leading literal
+  segment, joins it to the call's base directory, resolves it and applies the same containment
+  predicate, which denies `/etc/**/*` and `../../**/*` while allowing a plain `*.md`. The
+  trailing separator is kept when the partial final segment is trimmed, so an absolute pattern
+  stays absolute: dropping it turned `/etc*/*` into an empty prefix, which reads as "relative
+  to the base directory" and was therefore allowed — a one-character change from the pattern
+  the original tests used walked past the whole check. Brace or bracket groups containing a
+  path separator, and a leading `~`, are refused outright rather than guessed at, since both
+  can expand to an absolute path from an empty literal prefix and no legitimate review needs
+  either (DEC-F19). `Grep`'s `pattern` is a regex, not a path, and only its `glob` filters
+  paths — scoping the regex would deny a legitimate search for a path-looking string inside the
   artifact — so per-tool argument shapes are data rather than an `in (...)` chain. A
-  present-but-empty path key is a denial rather than a fallback to the working directory,
-  and a relative path resolves against the tool call's own reported `cwd`, never this
-  process's. `WebSearch` ships in `unscoped_tools` with its residual risk accepted: its query
-  is unconstrained, so an artifact that can steer the model's search terms has an outbound
-  channel, and issuance is logged with the query's *length* and never its text. A
-  multi-tenant deployment must empty that list.
+  present-but-empty path key is a denial rather than a fallback to the working directory, and a
+  relative path resolves against the tool call's own reported `cwd`, never this process's.
+  `WebSearch` ships in `unscoped_tools` with its residual risk accepted: its query is
+  unconstrained, so an artifact that can steer the model's search terms has an outbound
+  channel, and issuance is logged with the query's *length* and never its text. A multi-tenant
+  deployment must empty that list.
 - **Output laundering.** Every LLM prose field that reaches the rendered report — finding
-  summaries, dispositions, the headline, what-survives and residual-risks — passes through
-  `launder_prose`: line breaks and tabs folded to a single space (folded before control
-  characters are deleted, so `\v` and `\f` do not splice two words together), C0/C1 control
-  characters removed, Unicode format characters removed (category `Cf`: zero-width spaces,
-  bidi overrides and isolates, the BOM), whitespace runs collapsed, and length capped at
-  `max_prose_chars`. Laundering is idempotent, which matters because prose passes through
-  once per repair-loop iteration. The renderer does not rely on its caller having laundered
-  correctly: it escapes every model-supplied field it emits — the verdict headline, the
-  escalation message, the what-survives and residual-risk bullets, scope-item references and
-  the model-supplied `row_id` — not only table cells, and escapes `\r` as well as `\n`
-  because most markdown renderers break a line on a bare carriage return. The model never
-  emits the report itself. Structural fields the harness assigns, such as `finding_id`, are
-  not model input and are deliberately left alone.
+  summaries, dispositions, the headline, what-survives, residual-risks and scope-item
+  references — passes through `launder_prose`: line breaks and tabs folded to a single space
+  (folded before control characters are deleted, so `\v` and `\f` do not splice two words
+  together), C0/C1 control characters removed, Unicode format characters removed (category
+  `Cf`: zero-width spaces, bidi overrides and isolates, the BOM), whitespace runs collapsed,
+  and length capped at `max_prose_chars`. Laundering is idempotent, which matters because prose
+  passes through once per repair-loop iteration. The renderer does not rely on its caller
+  having laundered correctly: it escapes every model-supplied field it emits — the verdict
+  headline, the escalation message, the what-survives and residual-risk bullets, scope-item
+  references and the model-supplied `row_id` — not only table cells, and escapes `\r` as well
+  as `\n` because most markdown renderers break a line on a bare carriage return. The findings
+  table's `doctrine_refs` and `gate_refs` are escaped too: `gate_refs` is copied verbatim from
+  the model's `CandidateFinding` and is an unconstrained `list[str]`, so interpolated raw one
+  entry closed the cell and opened a **forged Blocker row** in the published report — the exact
+  defect this control exists to close, in the exact table it names, surviving the first fix
+  that named it (DEC-F19). The model never emits the report itself. Structural fields the
+  harness assigns, such as `finding_id`, are not model input and are deliberately left alone.
 - **The tool-honesty check.** This is the control that makes the verification log worth
   reading, and it is **authority-bound**. `fetched=True` is verified against observed tool
   **results** with `is_error == False`; an identifier enters the observed-evidence set only
   from a successful fetch-class result whose target is an `http`/`https` URL *and* whose host
-  is an authority for that identifier's scheme, matched on the host or a dot-anchored
-  subdomain so `notarxiv.org` cannot pass as `arxiv.org` while `export.arxiv.org` does.
-  Authorities are configuration (`HarnessSettings.identifier_authority_hosts`), so an
-  institutional mirror or a DOI proxy is a settings change rather than a code change.
-  Entries are then matched by kind: an entry naming a `canonical_id` is a scholarly claim and
-  must be matched by identifier, while an entry with no `canonical_id` makes no scholarly
-  claim and may still be satisfied by an exact target match, which keeps a legitimate `Read`
-  of the artifact under review working. This document previously said the opposite — that
+  is a registrar for one of the configured identifier schemes, matched on the host or a
+  dot-anchored subdomain so `notarxiv.org` cannot pass as `arxiv.org` while `export.arxiv.org`
+  does. The identifier is then read from the **host and path only** — a registrar returns 200
+  for arbitrary query strings, so `arxiv.org/?x=arxiv.org/abs/<id>` is the model choosing a
+  string rather than evidence of what was served, and requiring per-scheme agreement instead
+  would refuse `doi.org/10.48550/arXiv.<id>`, arXiv's own DOI prefix and the standard modern
+  citation form (DEC-F19). Authorities are configuration
+  (`HarnessSettings.identifier_authority_hosts`), with one known limit recorded rather than
+  half-fixed: that setting reaches this checker but not `ThreatGuard.fetch_domain_allowlist`,
+  so a configured mirror is accepted as evidence while the `PreToolUse` hook still denies the
+  fetch — "a mirror is a settings change" is not yet true end to end. Matching is then by what
+  the entry *carries*, not by which field it fills: any entry whose `canonical_id` **or**
+  `source_url` canonicalizes to a scholarly identifier is judged by identifier, and an evidence
+  target that canonicalizes can never be credited as plain-string evidence. Branching on
+  `canonical_id` alone made the control opt-out, since the model writes the entry and omitting
+  the field restored the local-`Read` forgery verbatim (DEC-F19). Only an entry carrying no
+  identifier at all is satisfied by an exact target match, which keeps a legitimate `Read` of
+  the artifact under review working. This document previously said the opposite — that
   canonical matching meant URL noise "neither defeats nor fake-satisfies" the check.
   Canonicalization is a substring match over an arbitrary string, which is right for identity
   bucketing and wrong as proof of retrieval: it was exactly what made the check
@@ -578,14 +602,24 @@ Where each control sits:
   support existence, never content and never absence. The companion attribution sweep rejects
   invented positions ("X would argue", "X believes") for any author named in the oracle's
   sources, matched diacritic-folded. Any defect the repair budget cannot clear raises
-  `ReviewFailedError` and exit code 3 — the review refuses to publish rather than
-  softening.
+  `ReviewFailedError` and exit code 3 — the review refuses to publish rather than softening.
 - **The model is never taken at its word on structure.** Required sections are read from
   the artifact's own headings; a model claim that a section exists is logged as
   `sections.claim_unsupported` and discarded. Unknown doctrine row references are dropped
   during assembly and, in `SeverityPolicy`, contribute no corroboration — so citing a
   non-existent row can never lift a severity cap.
-
+- **The artifact *path* is untrusted, not only its contents.** The documented
+  `--artifact-repo` flow reviews a checked-out worktree and git carries symlinks, so the
+  reviewed repository chooses where `docs/design.md` actually points, and Typer's
+  `dir_okay=False` rejects directories and nothing else. `read_artifact` now refuses anything
+  that is not a regular file — `stat().st_size` reports 0 for a character device, so a
+  one-line symlink to `/dev/zero` passed the size cap and then read unbounded — and, when
+  `--artifact-repo` is given, refuses a path the operator located *inside* that repository
+  that resolves outside it. The containment check is deliberately conditional on where the
+  operator pointed: naming a document that genuinely lives outside the repository while
+  passing `--artifact-repo` so `DecisionGate` reads that repository's decision log is a
+  legitimate pattern. Symlinks that stay inside the tree are fine; refusing every symlink
+  would break ordinary checkouts to no benefit.
 - **The state path is a write target, not just a trusted file.** The state temp file and the
   lock file are opened without following symlinks — the temp file is unlinked and re-created
   with `O_EXCL`, since `unlink` removes a symlink itself rather than its target, and the lock
