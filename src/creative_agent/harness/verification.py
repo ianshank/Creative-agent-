@@ -10,8 +10,13 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from collections.abc import Mapping
 
-from creative_agent.harness.canonical import canonicalize
+from creative_agent.harness.canonical import (
+    DEFAULT_IDENTIFIER_AUTHORITIES,
+    canonicalize,
+    fetched_identifier,
+)
 from creative_agent.harness.llm.base import ToolEvidence
 from creative_agent.models.findings import Finding
 from creative_agent.models.oracle import DEFAULT_IMPERSONATION_PATTERNS
@@ -37,20 +42,48 @@ class VerificationLogChecker:
         author_names: set[str],
         fetch_tools: frozenset[str] = DEFAULT_FETCH_TOOLS,
         impersonation_patterns: tuple[str, ...] = DEFAULT_IMPERSONATION_PATTERNS,
+        identifier_authorities: Mapping[str, tuple[str, ...]] = DEFAULT_IDENTIFIER_AUTHORITIES,
     ) -> None:
         self._surnames = sorted({parts[-1] for name in author_names if (parts := name.split())})
         self._fetch_tools = fetch_tools
         self._impersonation_patterns = tuple(impersonation_patterns)
+        self._identifier_authorities = identifier_authorities
 
-    def _evidence_identifiers(self, evidence: list[ToolEvidence]) -> set[str]:
-        identifiers: set[str] = set()
-        for item in evidence:
-            if item.ok and item.tool_name in self._fetch_tools:
-                canonical = canonicalize(item.target)
-                if canonical:
-                    identifiers.add(canonical)
-                identifiers.add(item.target)
-        return identifiers
+    def _observed_identifiers(self, evidence: list[ToolEvidence]) -> set[str]:
+        """Scholarly identifiers this run actually retrieved from their own registrar.
+
+        Only authority-bound fetches count (DEC-F12). Previously every fetch target was
+        canonicalized and the resulting identifier credited, so a decoy URL on any
+        allowlisted host, or a local file whose *name* embedded an identifier, both minted
+        evidence for a paper that was never retrieved.
+        """
+        return {
+            identifier
+            for item in evidence
+            if item.ok
+            and item.tool_name in self._fetch_tools
+            and (identifier := fetched_identifier(item.target, self._identifier_authorities))
+        }
+
+    def _observed_targets(self, evidence: list[ToolEvidence]) -> set[str]:
+        """The exact strings this run successfully fetched or read.
+
+        Kept for entries that make no scholarly claim — reading the artifact under review
+        is legitimate evidence for an assertion about the artifact. It can no longer
+        satisfy an entry that names a `canonical_id`; see `check_tool_honesty`.
+        """
+        return {
+            item.target
+            for item in evidence
+            if item.ok
+            and item.tool_name in self._fetch_tools
+            and item.target
+            # A target that carries a scholarly identifier is never plain-string
+            # evidence: `refs/arxiv.org/abs/<id>.md` is a filename the artifact's own
+            # author chose, and crediting it by exact match is the local-Read forgery
+            # arriving through the permissive branch instead of the strict one.
+            and canonicalize(item.target) is None
+        }
 
     def check_completeness(
         self, findings: list[Finding], entries: list[VerificationEntry]
@@ -75,22 +108,52 @@ class VerificationLogChecker:
     def check_tool_honesty(
         self, entries: list[VerificationEntry], evidence: list[ToolEvidence]
     ) -> list[str]:
-        """fetched=True must be backed by a successful fetch-class tool result."""
-        observed = self._evidence_identifiers(evidence)
+        """fetched=True must be backed by a successful fetch-class tool result.
+
+        Claims are matched by kind (DEC-F12). An entry that names a `canonical_id` is a
+        scholarly claim and must be satisfied by an identifier this run retrieved from
+        that identifier's own registrar; a raw-string match cannot satisfy it, which is
+        what let a local `Read` back a claim about a paper. An entry with no
+        `canonical_id` makes no scholarly claim and may still be satisfied by an exact
+        target match.
+        """
+        observed_identifiers = self._observed_identifiers(evidence)
+        observed_targets = self._observed_targets(evidence)
         defects: list[str] = []
         for index, entry in enumerate(entries):
             if not entry.fetched:
                 continue
-            claimed = {
-                identifier
-                for identifier in (
-                    canonicalize(entry.canonical_id),
-                    canonicalize(entry.source_url),
-                    entry.source_url,
+            claimed_identifier = canonicalize(entry.canonical_id)
+            if claimed_identifier is not None:
+                if claimed_identifier in observed_identifiers:
+                    continue
+                defects.append(
+                    f"verification entry {index} claims fetched=True for "
+                    f"{claimed_identifier} but no successful fetch of that identifier "
+                    "from its own registrar was observed; a URL or file path that merely "
+                    "contains the identifier is not retrieval"
                 )
-                if identifier
-            }
-            if not claimed & observed:
+                continue
+            # An entry that names no `canonical_id` is only "not a scholarly claim" if its
+            # source does not carry a scholarly identifier either. Branching on
+            # `canonical_id` alone made the control opt-out: the model omits one field and
+            # a local `Read` of an author-controlled filename like
+            # `refs/arxiv.org/abs/<id>.md` backs a claim about a paper again — the original
+            # attack verbatim. A source_url that canonicalizes is therefore judged by
+            # identifier, exactly as a canonical_id is.
+            source_identifier = canonicalize(entry.source_url)
+            if source_identifier is not None:
+                if source_identifier in observed_identifiers:
+                    continue
+                defects.append(
+                    f"verification entry {index} claims fetched=True for "
+                    f"{source_identifier} but no successful fetch of that identifier from "
+                    "its own registrar was observed; a URL or file path that merely "
+                    "contains the identifier is not retrieval"
+                )
+                continue
+            claimed = {identifier for identifier in (entry.source_url,) if identifier}
+            if not (claimed & observed_targets):
                 defects.append(
                     f"verification entry {index} claims fetched=True for "
                     f"{entry.source_url or entry.canonical_id!r} but no successful "

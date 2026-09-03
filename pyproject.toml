@@ -10,6 +10,18 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "Ian Shank" }]
+# POSIX is the tested platform. `review` and `state show` need advisory file locking, and
+# `assets validate` reads the execute bit; both are handled portably (harness/filelock.py,
+# harness/assets.py) but no Windows CI leg exists, so the classifier states what is
+# actually verified rather than what might work. See docs/roadmap.md 4.2.
+classifiers = [
+    "Operating System :: POSIX",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 dependencies = [
     "pydantic>=2.7,<3",
     "pydantic-settings>=2.2,<3",
@@ -95,10 +107,18 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
-addopts = "--cov=creative_agent --cov-branch --cov-report=term-missing --cov-report=xml --cov-fail-under=90 -m 'not live'"
+# --strict-markers: an unregistered marker is a typo, and a typo'd marker silently does
+# nothing — `@pytest.mark.liv` would quietly opt a test out of nothing at all while
+# reading as if it had. With it, the typo fails collection instead.
+addopts = "--cov=creative_agent --cov-branch --cov-report=term-missing --cov-report=xml --cov-fail-under=90 -m 'not live' --strict-markers"
 markers = [
     "live: tests that call the real Claude Agent SDK (require ANTHROPIC_API_KEY; run by live.yml)",
 ]
+# Warnings are errors: a DeprecationWarning from a dependency is the notice that a future
+# upgrade will break the harness, and printed among 500 dots nobody reads it. The suite
+# currently raises none, so the list below carries no allowances — anything added here
+# needs a comment saying which dependency raises it and why it cannot be fixed instead.
+filterwarnings = ["error"]
 
 [tool.coverage.run]
 branch = true
@@ -158,6 +178,16 @@ pytest_add_cli_args_test_selection = [
     "--no-cov",
     "-p",
     "no:randomly",
+    # `filterwarnings = ["error"]` promotes an unraisable warning to a failure, and under
+    # mutmut's multi-process re-import model a garbage-collected ScandirIterator surfaces
+    # as exactly that at interpreter shutdown — observed once in a 470-mutant run. A
+    # failure for that reason would be counted as a KILL, silently hiding a mutant that
+    # actually survived: the same false-green class the population guard in
+    # scripts/check_mutation_baseline.py exists to close. Ignoring it here errs the other
+    # way, toward a survivor the gate reports, and is scoped to the mutmut invocation so
+    # the main suite keeps warnings-as-errors.
+    "-W",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
 # mutmut only copies the four files named in source_paths into mutants/ — walk_all_files()
 # walks exactly that list, nothing else. The four test files above (plus tests/factories.py)

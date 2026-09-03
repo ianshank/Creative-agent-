@@ -9,16 +9,49 @@
 model: inherit            # "inherit" uses the Claude Agent SDK default; or an alias/full ID
 fallback_model: null
 max_turns: 12
-max_budget_usd: null      # e.g. 2.50 to cap a review's spend
+# Ceiling on a whole RUN's accumulated LLM spend, not one call (DEC-F17). Cost is summed
+# across every provider attempt and checked before each one, so exhaustion stops the run
+# with exit 6 and publishes nothing. It used to be applied per call, which meant the number
+# here permitted itself multiplied by the ~18 logical calls a happy-path review makes, and
+# up to roughly 144 provider calls once the re-probe, repair and schema-retry loops compound
+# — a 2.50 setting permitted about $360. null disables the cap.
+max_budget_usd: null      # e.g. 2.50 to cap the whole review's spend
 max_regeneration_attempts: 2
+# Per-call wall-clock ceiling, in seconds. Live since DEC-F17: every provider call runs
+# under asyncio.timeout, and expiry aborts the run with exit 6 rather than hanging it. This
+# bounds one call, not the run — max_budget_usd is the run-level bound.
 llm_timeout_seconds: 600.0
 
-# --- Tool scoping (threat model, DEC-F9) -------------------------------------
+# --- Tool scoping (threat model, DEC-F9 / DEC-F15) ---------------------------
 agent_tools: [Read, Grep, Glob, WebFetch, WebSearch]
 # Which of those tools can back a `fetched=true` verification entry. WebSearch is
 # excluded deliberately: snippets support existence, never content.
 fetch_tool_names: [WebFetch, Read]
+# Tools the PreToolUse hook allows without a target check, because they carry no path or
+# host to scope. The hook denies by default (DEC-F15): WebFetch is checked against the
+# computed host allowlist, Read/Grep/Glob against the computed read roots including their
+# path-shaped glob arguments, and everything else is refused unless it is named here.
+# WebSearch is listed with its residual risk accepted: its query is unconstrained, so an
+# artifact that can steer the model's search terms has an outbound channel. Issuance is
+# logged with the query's length, never its text. Empty this list for a multi-tenant
+# deployment; adding a tool to agent_tools without scoping it here means it is denied.
+unscoped_tools: [WebSearch]
 permission_mode: dontAsk  # default | acceptEdits | plan | dontAsk | auto | bypassPermissions
+
+# --- Identifier authorities (tool honesty, DEC-F12) --------------------------
+# Which hosts may vouch for a scholarly identifier. A `fetched=true` verification entry
+# naming a canonical_id is credited only when this run fetched that identifier over
+# http(s) from one of these hosts (or a subdomain of one), so a decoy URL that merely
+# mentions `arxiv.org/abs/<id>`, or a local Read of a file named after it, proves nothing.
+# Data rather than literals: an institutional mirror or a DOI proxy belongs here, not in a
+# code change. KNOWN LIMIT (DEC-F19): this reaches the honesty checker only. The fetch
+# allowlist the PreToolUse hook enforces is built separately, so a mirror named here is
+# accepted as evidence but its fetch is still denied at the call boundary. Configuring a
+# mirror is not yet a settings change end to end. From the environment this one takes JSON:
+#   CREATIVE_AGENT_IDENTIFIER_AUTHORITY_HOSTS='{"arxiv": ["arxiv.org", "mirror.example"]}'
+identifier_authority_hosts:
+  arxiv: [arxiv.org]
+  doi: [doi.org]
 
 # --- Data search paths (packaged resources are the fallback) ------------------
 oracle_search_paths: [data/oracles]
@@ -37,8 +70,17 @@ max_oracle_depth: 32
 max_artifact_bytes: 20000000
 
 # --- Citation resolution (oracles rebaseline) --------------------------------
+# Two backends behind a composite: arXiv first, Crossref second for the DOI-only sources
+# the arXiv resolver skips. Used by `oracles rebaseline` only — review-time resolution is
+# deliberately out of scope, and unresolved rows are handled by the staleness cap instead.
 arxiv_api_url: https://export.arxiv.org/api/query
+crossref_api_url: https://api.crossref.org/works
 citation_timeout_seconds: 30.0
+# Crossref asks API clients to identify themselves; anonymous traffic is rate-limited into
+# a slower pool. Put a contact address here if you want the faster pool — the default
+# deliberately carries none, because an address belongs in an outbound header only when
+# someone puts it there on purpose.
+citation_user_agent: "creative-agent/0.1 (+https://github.com/ianshank/Creative-agent-)"
 
 # --- Observability (DEC-F10) -------------------------------------------------
 log_level: WARNING        # DEBUG | INFO | WARNING | ERROR; --verbose/--debug override

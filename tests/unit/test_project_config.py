@@ -7,10 +7,13 @@ list is the one place a module can quietly leave the gate.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
+import textwrap
 import tomllib
 from pathlib import Path, PurePosixPath
+from typing import ClassVar
 
 import pytest
 import yaml
@@ -75,6 +78,54 @@ class TestCoverageConfig:
             assert (root / prefix).exists(), f"coverage floor prefix {prefix} does not exist"
 
 
+class TestPytestStrictness:
+    """Two settings whose absence is invisible: nothing fails, things stop being checked."""
+
+    @staticmethod
+    def _pytest_config(config: dict) -> dict:
+        return config["tool"]["pytest"]["ini_options"]
+
+    def test_markers_are_strict(self, config: dict) -> None:
+        """Without --strict-markers a misspelled marker is silently inert: the test still
+        runs, the selection it was meant to control no longer applies to it, and nothing
+        anywhere says so."""
+        assert "--strict-markers" in self._pytest_config(config)["addopts"]
+
+    def test_the_default_selection_names_a_registered_marker(self, config: dict) -> None:
+        """--strict-markers checks the markers on tests, not the one in `addopts`.
+
+        `-m 'not live'` is what keeps the API-key tests out of a normal run. Misspell it
+        and the expression still evaluates — against a marker no test carries — so the
+        selection silently becomes "everything", which is the failure `--strict-markers`
+        cannot see.
+        """
+        pytest_config = self._pytest_config(config)
+        registered = {entry.split(":", 1)[0] for entry in pytest_config["markers"]}
+        selected = set(re.findall(r"-m '(?:not )?([a-z_][\w]*)'", pytest_config["addopts"]))
+        assert selected, "the default marker selection vanished from addopts"
+        assert selected <= registered, (
+            f"addopts selects on unregistered markers: {sorted(selected - registered)}"
+        )
+
+    def test_warnings_are_errors(self, config: dict) -> None:
+        """A DeprecationWarning is advance notice that an upgrade will break the harness.
+        Printed among 500 dots it is noticed at upgrade time instead, which is too late."""
+        assert self._pytest_config(config)["filterwarnings"][0] == "error"
+
+    def test_every_warning_allowance_carries_a_reason(self, config: dict) -> None:
+        """An allowance list grows silently otherwise, and each entry is a warning nobody
+        will ever see again. This asserts the shape, not the count: any entry after
+        `error` must be an explicit `ignore::` for one named category, never a blanket
+        `ignore` that switches the whole gate back off."""
+        for entry in self._pytest_config(config)["filterwarnings"][1:]:
+            assert entry.startswith("ignore::") or entry.startswith("ignore:"), (
+                f"unexpected warning filter {entry!r}"
+            )
+            assert entry not in {"ignore", "ignore::Warning"}, (
+                f"{entry!r} disables the warnings gate entirely"
+            )
+
+
 class TestLintConfig:
     def test_datetime_calls_are_banned_in_source(self, config: dict) -> None:
         """Determinism (DEC-F8): all time comes from the injected Clock."""
@@ -115,17 +166,77 @@ class TestDocumentationIsHonest:
         missing = referenced - targets
         assert not missing, f"README references non-existent make targets: {sorted(missing)}"
 
-    def test_gate_target_covers_every_ci_check(self) -> None:
-        """`make gate` is documented as 'everything CI runs'; keep that true."""
-        makefile = (self.ROOT / "Makefile").read_text(encoding="utf-8")
+    # Steps that prepare the environment rather than check anything.
+    SETUP_ACTIONS = ("actions/checkout", "astral-sh/setup-uv", "actions/upload-artifact")
+    SETUP_COMMANDS = ("uv python install", "make install")
+    # CI checks that deliberately are not `make` targets, each with the reason it cannot
+    # be one. Matched as substrings of the step's `run` command or `uses` action. A check
+    # added to CI as a raw step is otherwise invisible to the scan below — it greppped
+    # only for `run: make <target>` — so `make gate` went on claiming to be "everything
+    # CI runs" while CI quietly ran more than it. Adding one now requires saying so here.
+    CHECKS_OUTSIDE_THE_GATE: ClassVar[dict[str, str]] = {
+        "gitleaks": (
+            "needs the action's full-history clone and GITHUB_TOKEN; `make secrets` is "
+            "the local stand-in and is deliberately not a `gate` dependency"
+        ),
+        "docker": (
+            "builds and runs the container image; docker is not available in every "
+            "environment `make gate` has to run in"
+        ),
+    }
+
+    @classmethod
+    def _gate_dependencies(cls) -> set[str]:
+        makefile = (cls.ROOT / "Makefile").read_text(encoding="utf-8")
         gate_line = next(line for line in makefile.splitlines() if line.startswith("gate:"))
-        gate_deps = set(gate_line.split(":")[1].split("##")[0].split())
-        workflow = (self.ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
-        ci_targets = set(re.findall(r"run: make ([a-z][\w-]*)", workflow))
-        # install/install-unlocked are setup, not checks.
-        checks = ci_targets - {"install", "install-unlocked"}
-        assert checks <= gate_deps, (
-            f"CI runs targets `make gate` omits: {sorted(checks - gate_deps)}"
+        return set(gate_line.split(":")[1].split("##")[0].split())
+
+    @classmethod
+    def _ci_steps(cls) -> list[tuple[str, str]]:
+        """(job name, what the step runs) for every step in ci.yml."""
+        workflow = yaml.safe_load((cls.ROOT / ".github/workflows/ci.yml").read_text("utf-8"))
+        return [
+            (job_name, str(step.get("run") or step.get("uses") or ""))
+            for job_name, job in workflow["jobs"].items()
+            for step in job.get("steps", [])
+        ]
+
+    @classmethod
+    def _is_setup(cls, command: str) -> bool:
+        return command.startswith(cls.SETUP_COMMANDS) or command.startswith(cls.SETUP_ACTIONS)
+
+    def test_gate_target_covers_every_ci_check(self) -> None:
+        """`make gate` is documented as 'everything CI runs'; keep that true.
+
+        Every CI step must be one of three things: setup, a `make` target `gate` depends
+        on, or a check declared in CHECKS_OUTSIDE_THE_GATE with its reason. Anything else
+        is a check a contributor cannot reproduce locally with `make gate`.
+        """
+        gate_deps = self._gate_dependencies()
+        unaccounted: list[str] = []
+        for job_name, command in self._ci_steps():
+            if self._is_setup(command):
+                continue
+            target = re.match(r"make ([a-z][\w-]*)", command)
+            if target:
+                assert target.group(1) in gate_deps, (
+                    f"job {job_name!r} runs `make {target.group(1)}`, which `make gate` omits"
+                )
+                continue
+            if any(key in command for key in self.CHECKS_OUTSIDE_THE_GATE):
+                continue
+            unaccounted.append(f"{job_name}: {command.strip().splitlines()[0]}")
+        assert not unaccounted, (
+            "CI runs steps that are neither setup, a `make gate` dependency, nor a "
+            f"declared exception, so `make gate` no longer reproduces CI: {unaccounted}"
+        )
+
+    @pytest.mark.parametrize("exception", sorted(CHECKS_OUTSIDE_THE_GATE))
+    def test_each_declared_exception_matches_a_real_ci_step(self, exception: str) -> None:
+        """An allowlist nobody prunes turns back into a blind spot: a stale entry silently
+        widens what the test above will accept."""
+        assert any(exception in command for _, command in self._ci_steps()), (
+            f"{exception!r} is declared as a check outside the gate but no CI step runs it"
         )
 
     def test_changelog_documents_the_exit_code_contract(self) -> None:
@@ -192,10 +303,18 @@ class TestTheSuiteDoesNotMutateTheRepository:
         assert pattern in ignored, f".gitignore no longer excludes {pattern}"
 
     def test_only_the_placeholder_is_tracked_in_the_review_log(self) -> None:
-        """Catches leaked state at the point it would otherwise be committed."""
+        """Catches leaked state at the point it would otherwise be committed.
+
+        The directory used to be treated as optional — absent meant skip — which turned
+        the one detector for leaked review state into a no-op in exactly the checkout
+        where something had gone wrong enough to remove it. It is tracked (via
+        `.gitkeep`), so its absence is a defect to report, not a reason to stop looking.
+        """
         review_log = self.ROOT / "docs/review-log"
-        if not review_log.is_dir():  # pragma: no cover - present in every checkout
-            pytest.skip("no review-log directory")
+        assert review_log.is_dir(), (
+            f"{review_log} is tracked in the repository but missing from this checkout; "
+            "the leaked-state detector below cannot run without it"
+        )
         stray = [p.name for p in review_log.iterdir() if p.name != ".gitkeep"]
         assert not stray, (
             f"review state escaped into the repository: {sorted(stray)}; a test is "
@@ -250,6 +369,25 @@ class TestCiWorkflowIsWired:
         ]
         assert not unpinned, f"{workflow} uses unpinned actions: {unpinned}"
 
+    def test_the_live_workflow_fails_when_the_api_key_is_absent(self) -> None:
+        """The weekly live job has never verified anything and reported success anyway.
+
+        Every live-marked test skips itself without `ANTHROPIC_API_KEY`, so `pytest -m
+        live` exits 0 having run nothing: the one workflow whose purpose is to catch SDK
+        drift was green precisely because the secret it needs was never set. A pre-flight
+        step must fail the job first, before pytest can turn the empty run into a pass.
+        """
+        steps = self._workflow("live.yml")["jobs"]["live"]["steps"]
+        commands = [str(step.get("run", "")) for step in steps]
+        pytest_at = next(i for i, run in enumerate(commands) if "pytest -m live" in run)
+        guards = [
+            run for run in commands[:pytest_at] if "ANTHROPIC_API_KEY" in run and "exit 1" in run
+        ]
+        assert guards, (
+            "live.yml runs pytest with no preceding step that fails on a missing "
+            "ANTHROPIC_API_KEY, so the job passes having skipped every test"
+        )
+
     def test_every_job_running_make_installs_the_environment_first(self) -> None:
         """`make lint` without `make install` fails on a missing interpreter, not a defect."""
         for job_name, job in self._workflow("ci.yml").get("jobs", {}).items():
@@ -275,15 +413,101 @@ class TestContainerTestStageCanActuallyRunTheSuite:
     ROOT = PYPROJECT.parent
     # Read through `default_claude_dir()`, not a literal, so the scan below cannot see it.
     IMPLICIT_DEPENDENCIES = frozenset({".claude"})
+    # Names that stand for the repository root in a `<root> / "<path>"` expression.
+    ROOT_ALIASES = frozenset({"ROOT", "repo_root"})
+
+    @staticmethod
+    def _is_root(node: ast.expr) -> bool:
+        aliases = TestContainerTestStageCanActuallyRunTheSuite.ROOT_ALIASES
+        if isinstance(node, ast.Name):
+            return node.id in aliases
+        return isinstance(node, ast.Attribute) and node.attr in aliases
+
+    @classmethod
+    def _names_joined_to_root(cls, function: ast.FunctionDef) -> set[str]:
+        """Variables used as `<root> / name` — a path the test reads, held in a name."""
+        return {
+            node.right.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.BinOp)
+            and isinstance(node.op, ast.Div)
+            and cls._is_root(node.left)
+            and isinstance(node.right, ast.Name)
+        }
+
+    @staticmethod
+    def _parametrize_argnames(decorator: ast.Call) -> list[str]:
+        first = decorator.args[0]
+        if isinstance(first, ast.Constant) and isinstance(first.value, str):
+            return [name.strip() for name in first.value.split(",")]
+        return []
+
+    @classmethod
+    def _parametrized_root_paths(cls, function: ast.FunctionDef) -> set[str]:
+        """Path strings a `@pytest.mark.parametrize` list feeds into a `<root> / name`."""
+        wanted = cls._names_joined_to_root(function)
+        found: set[str] = set()
+        for decorator in function.decorator_list:
+            if not isinstance(decorator, ast.Call) or len(decorator.args) < 2:
+                continue
+            target = decorator.func
+            if not (isinstance(target, ast.Attribute) and target.attr == "parametrize"):
+                continue
+            argnames = cls._parametrize_argnames(decorator)
+            values = decorator.args[1]
+            if not argnames or not isinstance(values, ast.List | ast.Tuple):
+                continue
+            for index, argname in enumerate(argnames):
+                if argname not in wanted:
+                    continue
+                for row in values.elts:
+                    cell = row
+                    if len(argnames) > 1:
+                        if not isinstance(row, ast.List | ast.Tuple):
+                            continue
+                        cell = row.elts[index]
+                    if isinstance(cell, ast.Constant) and isinstance(cell.value, str):
+                        found.add(cell.value)
+        return found
+
+    @classmethod
+    def _dependencies_in_source(cls, source: str) -> set[str]:
+        """Top-level context paths one test module reads.
+
+        Two forms, both of which a test uses to open a file from the repository root:
+
+        - an inline literal, `self.ROOT / "Makefile"`, matched textually;
+        - a parametrized list feeding a name, `@parametrize("document", [...])` with
+          `self.ROOT / document` in the body. The scan used to see only the first form,
+          so `CLAUDE.md` — read exclusively through a parametrize list — was invisible to
+          it. The Dockerfile did not copy CLAUDE.md, `make docker-test` failed, and the
+          two tests above reported no missing dependency at all: the guard against a
+          vacuous container had a blind spot of exactly the shape it exists to catch.
+        """
+        found = set(re.findall(r"(?:ROOT|repo_root)\s*/\s*\"([^\"]+)\"", source))
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.FunctionDef):
+                found |= cls._parametrized_root_paths(node)
+        return {PurePosixPath(literal).parts[0] for literal in found}
+
+    @staticmethod
+    def _synthetic(source: str) -> str:
+        """A fixture module for the scan, written so the scan cannot see it on disk.
+
+        The samples below are Python that reads files from a repository root — which is
+        exactly what `_repo_root_dependencies` hunts for across `tests/`. Spelled
+        `ROOT_ALIAS` in the file and renamed to `ROOT` only at runtime, so scanning this
+        module does not pick up the fixtures' invented filenames and demand COPY lines
+        for them.
+        """
+        return textwrap.dedent(source).replace("ROOT_ALIAS", "ROOT")
 
     @classmethod
     def _repo_root_dependencies(cls) -> set[str]:
         """Top-level context paths the suite reads, discovered from the tests themselves."""
         found = set(cls.IMPLICIT_DEPENDENCIES)
         for path in sorted((cls.ROOT / "tests").rglob("*.py")):
-            source = path.read_text(encoding="utf-8")
-            for literal in re.findall(r"(?:ROOT|repo_root)\s*/\s*\"([^\"]+)\"", source):
-                found.add(PurePosixPath(literal).parts[0])
+            found |= cls._dependencies_in_source(path.read_text(encoding="utf-8"))
         return found
 
     @classmethod
@@ -332,9 +556,95 @@ class TestContainerTestStageCanActuallyRunTheSuite:
         )
 
     def test_the_scan_finds_the_dependencies_it_is_meant_to(self) -> None:
-        """Guards the regex above: if it silently matched nothing, both tests would pass."""
+        """Guards the scan above: if it silently matched nothing, both tests would pass.
+
+        `CLAUDE.md` is the case that proves the parametrized-list resolution, not just the
+        literal regex: the suite reads it only through a `@parametrize` list, so before
+        that resolution existed the scan could not see it — and did not notice that the
+        Dockerfile never copied it.
+        """
         discovered = self._repo_root_dependencies()
-        for expected in (".github", "Makefile", "README.md", ".claude"):
+        for expected in (".github", "Makefile", "README.md", ".claude", "CLAUDE.md"):
             assert expected in discovered, (
                 f"the dependency scan no longer sees {expected}; the tests above are inert"
             )
+
+    def test_the_scan_resolves_a_parametrized_path_list(self) -> None:
+        """The blind spot itself, on a synthetic module so it cannot be masked.
+
+        A path held in a parametrize list is exactly as much of a build-context
+        dependency as one written inline; a scan that reads only literals reports a clean
+        result while the container is missing a file the suite opens.
+        """
+        source = self._synthetic(
+            """
+            class TestSomething:
+                ROOT_ALIAS = Path("/repo")
+
+                @pytest.mark.parametrize("document", ["PARAMETRIZED.md", "docs/x.md"])
+                def test_reads_it(self, document: str) -> None:
+                    assert (self.ROOT_ALIAS / document).is_file()
+
+                def test_reads_a_literal(self) -> None:
+                    assert (self.ROOT_ALIAS / "LITERAL.md").is_file()
+            """
+        )
+        assert self._dependencies_in_source(source) == {"PARAMETRIZED.md", "docs", "LITERAL.md"}
+
+    def test_the_scan_ignores_parametrized_values_that_are_not_paths(self) -> None:
+        """The failure direction: over-collecting would demand COPY lines for strings
+        that are never opened, and the noise would get the whole guard deleted."""
+        source = self._synthetic(
+            """
+            class TestSomething:
+                ROOT_ALIAS = Path("/repo")
+
+                @pytest.mark.parametrize("pattern", ["docs/review-log/*/cycle-*/"])
+                def test_gitignore_mentions_it(self, pattern: str) -> None:
+                    assert pattern in (self.ROOT_ALIAS / ".gitignore").read_text()
+            """
+        )
+        assert self._dependencies_in_source(source) == {".gitignore"}
+
+
+class TestPlatformSupportIsDeclaredHonestly:
+    """The project silently claimed portability it has never tested (roadmap 4.2).
+
+    README, the architecture doc and `pyproject.toml` carried no platform statement and no
+    Operating System classifier, while `harness/state.py` imported `fcntl` at module scope
+    and `harness/assets.py` checked an execute bit Windows never sets. Both are handled
+    portably now, but no Windows CI leg exists, so the metadata states what is verified.
+    """
+
+    ROOT: ClassVar[Path] = PYPROJECT.parent
+
+    def _pyproject(self) -> dict:
+        return tomllib.loads((self.ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    def test_the_operating_system_classifier_is_present(self) -> None:
+        classifiers = self._pyproject()["project"]["classifiers"]
+        assert any(c.startswith("Operating System :: POSIX") for c in classifiers)
+
+    def test_no_module_in_src_imports_fcntl_at_module_scope_outside_filelock(self) -> None:
+        """A single POSIX-only import made `review` and `state show` unimportable.
+
+        Locking is now behind `harness/filelock.py`, which binds both platform backends
+        defensively. A new bare `import fcntl` anywhere else would reintroduce the break.
+        """
+        offenders = [
+            path.relative_to(self.ROOT)
+            for path in (self.ROOT / "src").rglob("*.py")
+            if path.name != "filelock.py"
+            and re.search(r"^import fcntl\b", path.read_text(encoding="utf-8"), re.MULTILINE)
+        ]
+        assert offenders == []
+
+    def test_every_text_write_in_src_pins_lf_newlines(self) -> None:
+        """A CRLF-writing checkout would fail the golden tests for a spurious reason."""
+        offenders: list[str] = []
+        for path in (self.ROOT / "src").rglob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            for match in re.finditer(r"\.write_text\((.*?)\)\n", source, re.DOTALL):
+                if 'newline="\\n"' not in match.group(1):
+                    offenders.append(f"{path.relative_to(self.ROOT)}: {match.group(1)[:60]}")
+        assert offenders == [], f"write_text without newline=: {offenders}"

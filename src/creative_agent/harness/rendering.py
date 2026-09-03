@@ -17,7 +17,24 @@ def _sorted_findings(findings: list[Finding]) -> list[Finding]:
 
 
 def _md_escape(text: str) -> str:
-    return text.replace("|", "\\|").replace("\n", " ").strip()
+    """Neutralise the two characters that let a value escape its cell or its line.
+
+    `\\r` is here because most markdown renderers break a line on a bare carriage return,
+    so escaping only `\\n` left `"clean\\r| forged | row |"` able to add a table row.
+    ThreatGuard.launder_prose already folds both, but this is the renderer's own
+    guarantee and must not depend on an upstream caller having laundered correctly.
+    """
+    return text.replace("|", "\\|").replace("\r", " ").replace("\n", " ").strip()
+
+
+def _bullet(text: str) -> str:
+    """A list item built from model-supplied prose.
+
+    Bullets were previously interpolated raw, so a newline in `what_survives` or
+    `residual_risks` ended the list and let the rest of the value render as top-level
+    markdown — a forged `## Findings` section among other things (DEC-F16).
+    """
+    return f"- {_md_escape(text)}"
 
 
 class OutputRenderer:
@@ -32,7 +49,7 @@ class OutputRenderer:
         if status == "unverified_flagged":
             status = self._unverified_marker
         return (
-            f"| {_md_escape(entry.assertion)} | {entry.row_id or '—'} | "
+            f"| {_md_escape(entry.assertion)} | {_md_escape(entry.row_id or '—')} | "
             f"{_md_escape(source)} | {entry.confidence} | "
             f"{'fetched' if entry.fetched else 'not fetched'} | {_md_escape(status)} |"
         )
@@ -50,13 +67,15 @@ class OutputRenderer:
             f"(contract v{report.contract_version})"
         )
         lines.append("")
-        lines.append(f"**VERDICT** [{mode_bit}] [{verdict.confidence}]: {verdict.headline}")
+        lines.append(
+            f"**VERDICT** [{mode_bit}] [{verdict.confidence}]: {_md_escape(verdict.headline)}"
+        )
         lines.append("")
 
         if report.escalation is not None:
             lines.append("## STOP — charter review triggered")
             lines.append("")
-            lines.append(report.escalation.message)
+            lines.append(_md_escape(report.escalation.message))
             lines.append("")
 
         lines.append("## Findings")
@@ -65,7 +84,17 @@ class OutputRenderer:
             lines.append("| ID | Severity | Finding | Doctrine/gate | Required disposition |")
             lines.append("|---|---|---|---|---|")
             for finding in _sorted_findings(report.findings):
-                refs = ", ".join([*finding.doctrine_refs, *finding.gate_refs]) or "—"
+                # gate_refs is copied verbatim from the model's CandidateFinding and is
+                # an unconstrained list[str]; doctrine_refs is filtered against known
+                # rows but is model-supplied too. Interpolated raw, one entry could
+                # close this cell and open a forged Blocker row in the findings table —
+                # the exact defect DEC-F16 exists to close, in the exact table it names.
+                refs = (
+                    ", ".join(
+                        _md_escape(ref) for ref in [*finding.doctrine_refs, *finding.gate_refs]
+                    )
+                    or "—"
+                )
                 severity = Severity.parse(finding.severity).name.title()
                 if finding.cap_reason:
                     severity += f" (was {Severity.parse(finding.original_severity).name.title()})"
@@ -79,11 +108,11 @@ class OutputRenderer:
 
         lines.append("## What survives")
         lines.append("")
-        lines.extend([f"- {item}" for item in report.what_survives] or ["- (none stated)"])
+        lines.extend([_bullet(item) for item in report.what_survives] or ["- (none stated)"])
         lines.append("")
         lines.append("## Residual risks")
         lines.append("")
-        lines.extend([f"- {item}" for item in report.residual_risks] or ["- (none stated)"])
+        lines.extend([_bullet(item) for item in report.residual_risks] or ["- (none stated)"])
         lines.append("")
 
         if report.row_dispositions:
@@ -103,7 +132,7 @@ class OutputRenderer:
             lines.append("")
             for item in report.scope_items:
                 status = "supplied" if item.supplied else "NOT SUPPLIED — unverified"
-                lines.append(f"- {item.reference}: {status}")
+                lines.append(f"- {_md_escape(item.reference)}: {status}")
             lines.append("")
 
         lines.append("## Verification log")

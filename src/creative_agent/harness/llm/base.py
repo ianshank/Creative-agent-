@@ -40,6 +40,12 @@ class AssembledPrompt(SchemaModel):
     allowed_tools: list[str] = Field(default_factory=list)
     fetch_domain_allowlist: list[str] = Field(default_factory=list)
     allowed_read_roots: list[Path] = Field(default_factory=list)
+    # What is left of the RUN budget when this call is issued (DEC-F17). The pipeline
+    # checks the budget before each call, but a pre-call check cannot know what the
+    # call will cost: with a $2 budget and $1.90 calls the run spent $3.80 before
+    # stopping. Handing the remainder to the backend as its own per-call cap bounds
+    # the overshoot at the budget itself. None means unbounded.
+    remaining_budget_usd: float | None = None
     contract_version: int = LLM_CALL_CONTRACT_VERSION
 
 

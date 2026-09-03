@@ -8,6 +8,7 @@ The findings table is assembled by this module, never emitted whole by the model
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -17,12 +18,18 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from creative_agent.config import HarnessSettings
-from creative_agent.errors import LLMOutputError, ReviewFailedError
+from creative_agent.errors import (
+    BudgetExceededError,
+    LLMOutputError,
+    LLMTimeoutError,
+    ReviewFailedError,
+)
 from creative_agent.harness.artifact import content_sha256, read_artifact, resolve_artifact_id
 from creative_agent.harness.consistency import ConsistencyChecker
 from creative_agent.harness.decisions import DecisionGate
 from creative_agent.harness.gates import MeasurementGateChecker
 from creative_agent.harness.llm.base import (
+    AssembledPrompt,
     CallKind,
     RawLLMResult,
     ToolEvidence,
@@ -49,6 +56,7 @@ from creative_agent.models.sweeps import (
     ClassifyResult,
     JudgementSweepResult,
     RowDisposition,
+    ScopeItem,
     SourceQualityResult,
     SynthesisResult,
 )
@@ -107,6 +115,10 @@ class ReviewPipeline:
             oracle.source_author_names(),
             fetch_tools=frozenset(settings.fetch_tool_names),
             impersonation_patterns=tuple(oracle.attribution.impersonation_patterns),
+            identifier_authorities={
+                scheme: tuple(hosts)
+                for scheme, hosts in settings.identifier_authority_hosts.items()
+            },
         )
         self._decision_gate = DecisionGate(oracle, settings.decision_log_filename)
         self._escalator = CycleEscalator(oracle)
@@ -120,6 +132,82 @@ class ReviewPipeline:
         self._renderer = OutputRenderer(oracle.protocol.unverified_marker)
 
     # ---- LLM call helper -------------------------------------------------
+
+    @staticmethod
+    def _spent_usd(sweep: _SweepState) -> float:
+        """Total cost recorded across every provider call this run has made.
+
+        `cost_usd` was logged per call and stored per call and never summed against
+        anything, so `max_budget_usd` — which the SDK applies per *call* — permitted the
+        setting multiplied by the number of calls a review makes: 18 on the happy path,
+        and up to roughly 144 provider calls once the re-probe, the repair loop and the
+        schema-retry loop compound (DEC-F17).
+        """
+        total = 0.0
+        for call in sweep.calls:
+            cost = call.get("cost_usd")
+            # A backend that reports no cost contributes nothing rather than aborting the
+            # run: OfflineLLMClient and FakeLLMClient both leave it None by design.
+            if isinstance(cost, int | float):
+                total += float(cost)
+        return total
+
+    def _remaining_budget(self, sweep: _SweepState) -> float | None:
+        """What is left of `max_budget_usd` for this run, or None when uncapped."""
+        budget = self._settings.max_budget_usd
+        if budget is None:
+            return None
+        return max(budget - self._spent_usd(sweep), 0.0)
+
+    def _check_budget(self, sweep: _SweepState, *, kind: CallKind, ref: str) -> None:
+        budget = self._settings.max_budget_usd
+        if budget is None:
+            return
+        spent = self._spent_usd(sweep)
+        if spent < budget:
+            return
+        log_event(
+            _LOG,
+            logging.ERROR,
+            "llm.budget_exhausted",
+            kind=kind.value,
+            ref=ref,
+            spent_usd=round(spent, 6),
+            budget_usd=budget,
+            calls=len(sweep.calls),
+        )
+        raise BudgetExceededError(
+            f"review budget of ${budget:.2f} exhausted after {len(sweep.calls)} LLM calls "
+            f"(${spent:.4f} spent); stopped before the {kind.value} call. Nothing was "
+            "published. Raise max_budget_usd or narrow the review."
+        )
+
+    async def _generate_within_timeout(
+        self, prompt: AssembledPrompt, *, kind: CallKind, ref: str
+    ) -> RawLLMResult:
+        """Run one provider call under `llm_timeout_seconds`.
+
+        The setting was declared in `HarnessSettings` and documented in
+        `config/settings.example.yaml` and used nowhere in `src/` — dead configuration
+        until now (DEC-F17). A hung call previously blocked the review indefinitely.
+        """
+        timeout = self._settings.llm_timeout_seconds
+        try:
+            async with asyncio.timeout(timeout):
+                return await self._llm.generate(prompt)
+        except TimeoutError as exc:
+            log_event(
+                _LOG,
+                logging.ERROR,
+                "llm.call_timeout",
+                kind=kind.value,
+                ref=ref,
+                timeout_seconds=timeout,
+            )
+            raise LLMTimeoutError(
+                f"{kind.value} call exceeded llm_timeout_seconds ({timeout}s); the review "
+                "was stopped before producing a verdict and nothing was published"
+            ) from exc
 
     async def _call(
         self,
@@ -144,10 +232,18 @@ class ReviewPipeline:
                 allowed_read_roots=context.get("read_roots", []),  # type: ignore[arg-type]
                 context={**context, "repair_defects": defects},
             )
+            prompt = prompt.model_copy(
+                update={"remaining_budget_usd": self._remaining_budget(sweep)}
+            )
+            # Budget is checked *inside* the attempt loop, before each provider call, so a
+            # single logical call cannot burn several times the remaining budget: `_call`
+            # retries up to max_regeneration_attempts + 1 times and every attempt reaches
+            # the wire (DEC-F17).
+            self._check_budget(sweep, kind=kind, ref=ref)
             with timed_stage(
                 _LOG, "llm.call", kind=kind.value, ref=ref, attempt=attempt + 1
             ) as call_log:
-                raw: RawLLMResult = await self._llm.generate(prompt)
+                raw: RawLLMResult = await self._generate_within_timeout(prompt, kind=kind, ref=ref)
                 call_log["model"] = raw.model
                 call_log["cost_usd"] = raw.cost_usd
                 call_log["tool_results"] = len(raw.tool_evidence)
@@ -314,7 +410,13 @@ class ReviewPipeline:
 
     async def _run(self, request: ReviewRequest, review_log: dict[str, object]) -> PipelineOutcome:
         state = self._state_store.load(request.artifact_id)
-        artifact_text = read_artifact(request.artifact_path, self._settings.max_artifact_bytes)
+        artifact_text = read_artifact(
+            request.artifact_path,
+            self._settings.max_artifact_bytes,
+            # A reviewed worktree is untrusted, and git carries symlinks: an artifact
+            # path that resolves outside the repository under review is refused.
+            containment_root=request.artifact_repo,
+        )
         fetch_domains = self._guard.fetch_domain_allowlist(artifact_text)
         rejected_hosts = self._guard.rejected_fetch_hosts(artifact_text)
         read_roots = self._guard.allowed_read_roots(
@@ -571,7 +673,10 @@ class ReviewPipeline:
             ],
             what_survives=self._guard.launder_all(final_synthesis.what_survives),
             residual_risks=self._guard.launder_all(final_synthesis.residual_risks),
-            scope_items=sweep.judgement.scope if sweep.judgement else [],
+            # DEC-F16 claimed these were laundered and they were not: only the
+            # renderer's pipe/newline escape ran, so a bidi override or a zero-width
+            # run reached the report and the length cap never applied.
+            scope_items=self._laundered_scope(sweep),
             verification_log=self._all_entries(sweep),
             escalation=escalation,
         )
@@ -598,7 +703,12 @@ class ReviewPipeline:
         new_state = state.model_copy(
             update={"cycle": current_cycle, "history": [*state.history, new_record]}
         )
-        state_path = self._state_store.save(new_state, rendered)
+        # Pass the cycle we loaded so the store can refuse a lost update (DEC-F14). The
+        # findings, the escalation verdict and `rendered` above were all computed from
+        # that snapshot; if a concurrent review has advanced it, publishing this run would
+        # discard their history and, worse, would act on a recurrence count that is no
+        # longer true. `StateConflictError` aborts the run without writing anything.
+        state_path = self._state_store.save(new_state, rendered, expected_cycle=state.cycle)
         self._write_audit_bundle(request, current_cycle, sweep)
 
         severity_counts: dict[str, int] = {}
@@ -635,15 +745,30 @@ class ReviewPipeline:
             state_path=str(state_path),
         )
 
+    def _laundered_scope(self, sweep: _SweepState) -> list[ScopeItem]:
+        """Scope references are model prose and pass through ThreatGuard like the rest."""
+        if sweep.judgement is None:
+            return []
+        return [
+            item.model_copy(update={"reference": self._guard.launder_prose(item.reference)})
+            for item in sweep.judgement.scope
+        ]
+
     def _write_audit_bundle(self, request: ReviewRequest, cycle: int, sweep: _SweepState) -> None:
         bundle_dir = self._settings.review_log_dir / request.artifact_id / f"cycle-{cycle}"
         bundle_dir.mkdir(parents=True, exist_ok=True)
+        # newline="\n" on every write: the audit bundle and the report are compared
+        # byte-for-byte by the golden tests, and a Windows checkout would otherwise
+        # emit CRLF and fail them for a reason that has nothing to do with content.
         (bundle_dir / "calls.json").write_text(
-            json.dumps(sweep.calls, indent=2, default=str) + "\n", encoding="utf-8"
+            json.dumps(sweep.calls, indent=2, default=str) + "\n",
+            encoding="utf-8",
+            newline="\n",
         )
         (bundle_dir / "tool-evidence.json").write_text(
             json.dumps([e.model_dump() for e in sweep.evidence], indent=2) + "\n",
             encoding="utf-8",
+            newline="\n",
         )
 
 

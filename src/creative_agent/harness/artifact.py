@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
 from pathlib import Path
 
 from creative_agent.errors import ConfigError
@@ -33,14 +35,52 @@ def validate_artifact_id(candidate: str, *, source: str) -> str:
     return candidate
 
 
-def read_artifact(path: Path, max_bytes: int) -> str:
-    """Read an artifact, refusing oversized files before loading them into memory."""
+def read_artifact(path: Path, max_bytes: int, *, containment_root: Path | None = None) -> str:
+    """Read an artifact, refusing anything that is not a bounded regular file.
+
+    Three refusals, all of which the reviewed repository can trigger. The documented
+    `--artifact-repo` flow reviews a checked-out worktree, and git carries symlinks, so
+    the artifact path is as untrusted as the artifact's contents (DEC-F9).
+
+    - **Not a regular file.** `stat().st_size` reports 0 for a character device, so
+      `docs/design.md` symlinked to `/dev/zero` passed the size cap and then read
+      unbounded. A directory or a fifo would misbehave differently and just as usefully.
+    - **A symlink out of the reviewed tree.** A path the operator located *inside*
+      `containment_root` must still resolve inside it, so a symlink at `docs/design.md`
+      pointing at `~/.ssh/id_rsa` is refused rather than read, delimited and handed to the
+      model. The check is deliberately conditional on where the operator pointed: naming a
+      document that lives outside the repository, while passing `--artifact-repo` so the
+      repository's own decision log is what `DecisionGate` reads, is a legitimate pattern
+      and is not what this defends against. Symlinks that stay inside the tree are fine —
+      refusing every symlink would break ordinary checkouts to no benefit.
+    - **Oversized**, as before, checked twice in case the file grows between the two calls.
+    """
     try:
-        size = path.stat().st_size
+        info = path.stat()
     except OSError as exc:
         raise ConfigError(f"cannot read artifact {path}: {exc}") from exc
-    if size > max_bytes:
-        raise ConfigError(f"artifact {path} exceeds {max_bytes} bytes ({size} bytes)")
+    if not stat.S_ISREG(info.st_mode):
+        raise ConfigError(
+            f"artifact {path} is not a regular file; a device, fifo or directory cannot be "
+            "reviewed and its reported size is not its content length"
+        )
+    if containment_root is not None:
+        try:
+            root = containment_root.resolve()
+            # abspath normalises `..` and the working directory without following symlinks:
+            # this is where the operator SAID the file is, which is what decides whether
+            # containment applies at all. `resolve()` below is where it actually is.
+            declared = Path(os.path.abspath(path))
+            if declared.is_relative_to(root) and not path.resolve().is_relative_to(root):
+                raise ConfigError(
+                    f"artifact {path} is inside the artifact repository {root} but resolves "
+                    f"to {path.resolve()}, outside it; a symlink out of the reviewed tree is "
+                    "not reviewable content"
+                )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ConfigError(f"cannot resolve artifact {path}: {exc}") from exc
+    if info.st_size > max_bytes:
+        raise ConfigError(f"artifact {path} exceeds {max_bytes} bytes ({info.st_size} bytes)")
     try:
         data = path.read_bytes()
     except OSError as exc:

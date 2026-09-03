@@ -37,7 +37,21 @@ class StateStore(Protocol):
 
     def load(self, artifact_id: str) -> ReviewState: ...
 
-    def save(self, state: ReviewState, summary_markdown: str = "") -> Path: ...
+    def save(
+        self,
+        state: ReviewState,
+        summary_markdown: str = "",
+        *,
+        expected_cycle: int | None = None,
+    ) -> Path:
+        """Persist state, optionally refusing a lost update (DEC-F14).
+
+        `expected_cycle` is the cycle the caller loaded. An implementation that supports
+        it must re-read under the same lock that guards the write and raise
+        `StateConflictError` on a mismatch. The keyword is optional so a store that cannot
+        detect conflicts stays substitutable; the pipeline always passes it.
+        """
+        ...
 
 
 @runtime_checkable

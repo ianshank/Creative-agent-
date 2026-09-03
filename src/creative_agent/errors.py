@@ -10,7 +10,7 @@ from enum import IntEnum
 
 
 class ExitCode(IntEnum):
-    """CLI exit codes. 0/1/2 encode review outcomes, 3-5 encode failures."""
+    """CLI exit codes. 0/1/2 encode review outcomes, 3-6 encode failures."""
 
     CLEAN = 0
     FINDINGS_MAJOR = 1
@@ -18,6 +18,12 @@ class ExitCode(IntEnum):
     REVIEW_FAILED = 3
     CONFIG_ERROR = 4
     UNEXPECTED_ERROR = 5
+    # The run stopped before producing a verdict (budget, timeout, or a concurrent write
+    # to the same artifact's state). Nothing was published and a retry is meaningful —
+    # deliberately distinct from REVIEW_FAILED, which is a statement about the artifact
+    # rather than about the run. Added under DEC-F17; the table is a frozen contract, so
+    # this is a versioned addition, not an incidental one.
+    RUN_ABORTED = 6
 
 
 class CreativeAgentError(Exception):
@@ -62,3 +68,30 @@ class ReviewFailedError(CreativeAgentError):
     """
 
     exit_code = ExitCode.REVIEW_FAILED
+
+
+class RunAbortedError(CreativeAgentError):
+    """The run stopped before producing a verdict; nothing was published (DEC-F17).
+
+    Distinct from ReviewFailedError, which says something about the *artifact*. This says
+    something about the *run*, so a CI consumer can retry instead of treating a transient
+    stop as a finding about the document.
+    """
+
+    exit_code = ExitCode.RUN_ABORTED
+
+
+class BudgetExceededError(RunAbortedError):
+    """The run's accumulated LLM spend reached `max_budget_usd` before it finished."""
+
+
+class LLMTimeoutError(RunAbortedError):
+    """A single LLM call exceeded `llm_timeout_seconds`."""
+
+
+class StateConflictError(RunAbortedError):
+    """Another review advanced this artifact's state while this one was running (DEC-F14).
+
+    The verdict and escalation decision were computed against history that no longer
+    exists, so the run aborts rather than publishing over the concurrent writer.
+    """

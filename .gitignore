@@ -42,3 +42,6 @@ docs/review-log/.*.lock
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Subagent worktrees (created by Claude Code isolation, never part of the project).
+.claude/worktrees/

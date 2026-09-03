@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from importlib import resources
 from pathlib import Path
 
@@ -9,10 +10,22 @@ import yaml
 from pydantic import ValidationError
 
 from creative_agent.errors import ConfigError, OracleValidationError
+from creative_agent.harness.logging import get_logger, log_event
+from creative_agent.harness.migrations import MigrationChain
 from creative_agent.models.oracle import OracleTable
 
-SUPPORTED_ORACLE_SCHEMA_VERSIONS = {1}
+CURRENT_ORACLE_SCHEMA_VERSION = 1
+# Migration seam (DEC-F18). No steps yet: v1 is current, so this is an identity pass whose
+# plumbing is tested. The first `schema_version: 2` registers a step here.
+ORACLE_MIGRATIONS = MigrationChain(
+    format_name="oracle", current_version=CURRENT_ORACLE_SCHEMA_VERSION, steps={}
+)
+# Kept as a module constant: it is part of this module's public surface and is imported by
+# tests and by the CLI's diagnostics. Derived from the chain so the two can never drift.
+SUPPORTED_ORACLE_SCHEMA_VERSIONS = ORACLE_MIGRATIONS.supported_versions
 DEFAULT_MAX_YAML_DEPTH = 32
+
+_LOG = get_logger(__name__)
 
 
 def _check_depth(node: object, depth: int = 0, max_depth: int = DEFAULT_MAX_YAML_DEPTH) -> None:
@@ -24,6 +37,30 @@ def _check_depth(node: object, depth: int = 0, max_depth: int = DEFAULT_MAX_YAML
     elif isinstance(node, list):
         for value in node:
             _check_depth(value, depth + 1, max_depth)
+
+
+def _warn_on_uncapped_unverified_rows(table: OracleTable, path: Path) -> None:
+    """Warn when unresolved doctrine can still carry a Blocker (DEC-F13).
+
+    A row with no verified source relies on the staleness cap to hold its findings down.
+    A nonzero `freshness.max_rebaselines_without_verification` suppresses that cap, which
+    is how ten unresolved rows in the shipped oracle went uncapped without anyone noticing.
+    Silence about weak doctrine is the failure mode; this makes it greppable.
+    """
+    uncapped = table.unverified_blocker_rows()
+    if not uncapped or table.freshness.max_rebaselines_without_verification <= 0:
+        return
+    log_event(
+        _LOG,
+        logging.WARNING,
+        "oracle.unverified_rows_uncapped",
+        oracle_id=table.oracle_id,
+        path=str(path),
+        rows=",".join(uncapped),
+        row_count=len(uncapped),
+        grace_budget=table.freshness.max_rebaselines_without_verification,
+        rebaseline_count=table.freshness.rebaseline_count,
+    )
 
 
 class OracleLoader:
@@ -67,13 +104,14 @@ class OracleLoader:
             raise OracleValidationError(f"{path}: oracle root must be a mapping")
         _check_depth(raw, max_depth=self._max_depth)
         version = raw.get("schema_version")
-        if version not in SUPPORTED_ORACLE_SCHEMA_VERSIONS:
+        if version not in ORACLE_MIGRATIONS.supported_versions:
             raise OracleValidationError(
                 f"{path}: unsupported schema_version {version!r}; "
-                f"supported: {sorted(SUPPORTED_ORACLE_SCHEMA_VERSIONS)}"
+                f"supported: {sorted(ORACLE_MIGRATIONS.supported_versions)}"
             )
+        raw = ORACLE_MIGRATIONS.migrate(raw, from_version=version, source=str(path))
         try:
-            return OracleTable.model_validate(raw)
+            table = OracleTable.model_validate(raw)
         except ValidationError as exc:
             first = exc.errors()[0]
             location = ".".join(str(part) for part in first["loc"])
@@ -81,6 +119,8 @@ class OracleLoader:
                 f"{path}: invalid oracle at {location or '<root>'}: {first['msg']} "
                 f"({exc.error_count()} error(s) total)"
             ) from exc
+        _warn_on_uncapped_unverified_rows(table, path)
+        return table
 
     def load(self, oracle_id: str) -> OracleTable:
         """Load by oracle_id; first match across the search path wins."""

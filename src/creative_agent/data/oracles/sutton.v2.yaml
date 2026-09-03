@@ -2,11 +2,19 @@
 # This file is DATA consumed by the generic oracle engine; the spec's prose rules are
 # captured as schema fields so nothing normative lives only in a prompt.
 #
-# Verification state: sources marked `verified: true` were resolved against arXiv during
-# the initial transcription (2026-08-22) with author lists diffed. Sources marked
-# `verified: false` carry citation text from the spec and MUST be resolved by
+# Verification state: sources marked `verified: true` were resolved against the paper's own
+# title page with author lists diffed; each carries `last_verified` and a note saying how.
+# Sources marked `verified: false` carry citation text from the spec and MUST be resolved by
 # `creative-agent oracles rebaseline sutton` — transcription without resolution is the
 # exact defect class (v1's three wrong author lists) this oracle exists to catch.
+#
+# Unverified rows are NOT trusted in the meantime: `freshness.max_rebaselines_without_
+# verification` is 0 (DEC-F13), so an unverified row is stale immediately and its findings
+# are capped at `severity_policy.unverified_row_cap`. Some rows are expected to stay
+# unverified forever — a blog post (D1), a book chapter (D3), an OpenReview workshop paper
+# (D4), an author-hosted PDF (D7's second source, D10) and an unpublished talk (D12) have
+# no resolvable archival identifier. For those the cap is the correct end state, not a
+# backlog item; D6's Nature DOI and D9's Elsevier DOI need the DOI resolver.
 
 schema_version: 1
 oracle_id: sutton
@@ -25,9 +33,13 @@ conformance:
   advisory_severity_cap: info
 
 freshness:
-  last_rebaselined: 2026-08-22
-  rebaseline_count: 0
-  max_rebaselines_without_verification: 2
+  last_rebaselined: 2026-09-02
+  rebaseline_count: 1
+  # Grace budget of zero (DEC-F13): a row with no verified source is stale immediately and
+  # its findings are capped at `severity_policy.unverified_row_cap`. The previous value of
+  # 2 meant the cap never fired, because `rebaseline_count` only rises when the rebaseline
+  # command runs — and running it is what marks a source verified.
+  max_rebaselines_without_verification: 0
 
 severity_policy:
   tier_caps:
@@ -270,8 +282,13 @@ rows:
         authors: [Richard S. Sutton, Michael Bowling, Patrick M. Pilarski]
         arxiv_id: "2208.11173"
         tier: AP
-        verified: false
-        notes: Well-known preprint; diff author list at rebaseline.
+        verified: true
+        last_verified: 2026-09-02
+        notes: >
+          Resolved 2026-09-02 against the paper's own title page; author list matches
+          exactly. arxiv.org was unreachable from the review environment (egress proxy),
+          so the full text was fetched through the alphaXiv mirror and the author list
+          diffed by hand rather than by the arXiv resolver.
     check: Is there a phase boundary anywhere? Justified, or inherited from batch practice?
     failure_mode: Pre-train-then-deploy pipelines relabelled "lifelong".
 
@@ -381,8 +398,14 @@ rows:
           - Adam White
         arxiv_id: "2202.03466"
         tier: PR
-        verified: false
-        notes: Diff full author list at rebaseline (spec emphasizes David Szepesvari).
+        verified: true
+        last_verified: 2026-09-02
+        notes: >
+          Resolved 2026-09-02 against the paper's own title page; all seven authors match
+          in order, David Szepesvari included — the Alberta Plan's own bibliography omits
+          him, so the spec was right to emphasise the full list. Fetched through the
+          alphaXiv mirror because arxiv.org is blocked by the review environment's egress
+          proxy; author list diffed by hand.
     check: >
       For each intrinsic goal: what is the terminating feature, and what is the stopping
       bonus?
@@ -441,8 +464,12 @@ rows:
         authors: [Richard S. Sutton, Michael Bowling, Patrick M. Pilarski]
         arxiv_id: "2208.11173"
         tier: AP
-        verified: false
-        notes: Same preprint as D5.
+        verified: true
+        last_verified: 2026-09-02
+        notes: >
+          Same preprint as D5, resolved with it on 2026-09-02. The row's non-obvious claim
+          was checked directly against the paper: step 11 of the roadmap is
+          "Prototype-AI III: Oak", spelled "Oak" there, which is what this citation says.
     check: What gets deleted, on what utility signal, at what rate?
     failure_mode: Monotonically growing memory with no eviction.
 
