@@ -8,6 +8,7 @@ The findings table is assembled by this module, never emitted whole by the model
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -17,12 +18,18 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from creative_agent.config import HarnessSettings
-from creative_agent.errors import LLMOutputError, ReviewFailedError
+from creative_agent.errors import (
+    BudgetExceededError,
+    LLMOutputError,
+    LLMTimeoutError,
+    ReviewFailedError,
+)
 from creative_agent.harness.artifact import content_sha256, read_artifact, resolve_artifact_id
 from creative_agent.harness.consistency import ConsistencyChecker
 from creative_agent.harness.decisions import DecisionGate
 from creative_agent.harness.gates import MeasurementGateChecker
 from creative_agent.harness.llm.base import (
+    AssembledPrompt,
     CallKind,
     RawLLMResult,
     ToolEvidence,
@@ -107,6 +114,10 @@ class ReviewPipeline:
             oracle.source_author_names(),
             fetch_tools=frozenset(settings.fetch_tool_names),
             impersonation_patterns=tuple(oracle.attribution.impersonation_patterns),
+            identifier_authorities={
+                scheme: tuple(hosts)
+                for scheme, hosts in settings.identifier_authority_hosts.items()
+            },
         )
         self._decision_gate = DecisionGate(oracle, settings.decision_log_filename)
         self._escalator = CycleEscalator(oracle)
@@ -120,6 +131,75 @@ class ReviewPipeline:
         self._renderer = OutputRenderer(oracle.protocol.unverified_marker)
 
     # ---- LLM call helper -------------------------------------------------
+
+    @staticmethod
+    def _spent_usd(sweep: _SweepState) -> float:
+        """Total cost recorded across every provider call this run has made.
+
+        `cost_usd` was logged per call and stored per call and never summed against
+        anything, so `max_budget_usd` — which the SDK applies per *call* — permitted the
+        setting multiplied by the number of calls a review makes: 18 on the happy path,
+        and up to roughly 144 provider calls once the re-probe, the repair loop and the
+        schema-retry loop compound (DEC-F17).
+        """
+        total = 0.0
+        for call in sweep.calls:
+            cost = call.get("cost_usd")
+            # A backend that reports no cost contributes nothing rather than aborting the
+            # run: OfflineLLMClient and FakeLLMClient both leave it None by design.
+            if isinstance(cost, int | float):
+                total += float(cost)
+        return total
+
+    def _check_budget(self, sweep: _SweepState, *, kind: CallKind, ref: str) -> None:
+        budget = self._settings.max_budget_usd
+        if budget is None:
+            return
+        spent = self._spent_usd(sweep)
+        if spent < budget:
+            return
+        log_event(
+            _LOG,
+            logging.ERROR,
+            "llm.budget_exhausted",
+            kind=kind.value,
+            ref=ref,
+            spent_usd=round(spent, 6),
+            budget_usd=budget,
+            calls=len(sweep.calls),
+        )
+        raise BudgetExceededError(
+            f"review budget of ${budget:.2f} exhausted after {len(sweep.calls)} LLM calls "
+            f"(${spent:.4f} spent); stopped before the {kind.value} call. Nothing was "
+            "published. Raise max_budget_usd or narrow the review."
+        )
+
+    async def _generate_within_timeout(
+        self, prompt: AssembledPrompt, *, kind: CallKind, ref: str
+    ) -> RawLLMResult:
+        """Run one provider call under `llm_timeout_seconds`.
+
+        The setting was declared in `HarnessSettings` and documented in
+        `config/settings.example.yaml` and used nowhere in `src/` — dead configuration
+        until now (DEC-F17). A hung call previously blocked the review indefinitely.
+        """
+        timeout = self._settings.llm_timeout_seconds
+        try:
+            async with asyncio.timeout(timeout):
+                return await self._llm.generate(prompt)
+        except TimeoutError as exc:
+            log_event(
+                _LOG,
+                logging.ERROR,
+                "llm.call_timeout",
+                kind=kind.value,
+                ref=ref,
+                timeout_seconds=timeout,
+            )
+            raise LLMTimeoutError(
+                f"{kind.value} call exceeded llm_timeout_seconds ({timeout}s); the review "
+                "was stopped before producing a verdict and nothing was published"
+            ) from exc
 
     async def _call(
         self,
@@ -144,10 +224,15 @@ class ReviewPipeline:
                 allowed_read_roots=context.get("read_roots", []),  # type: ignore[arg-type]
                 context={**context, "repair_defects": defects},
             )
+            # Budget is checked *inside* the attempt loop, before each provider call, so a
+            # single logical call cannot burn several times the remaining budget: `_call`
+            # retries up to max_regeneration_attempts + 1 times and every attempt reaches
+            # the wire (DEC-F17).
+            self._check_budget(sweep, kind=kind, ref=ref)
             with timed_stage(
                 _LOG, "llm.call", kind=kind.value, ref=ref, attempt=attempt + 1
             ) as call_log:
-                raw: RawLLMResult = await self._llm.generate(prompt)
+                raw: RawLLMResult = await self._generate_within_timeout(prompt, kind=kind, ref=ref)
                 call_log["model"] = raw.model
                 call_log["cost_usd"] = raw.cost_usd
                 call_log["tool_results"] = len(raw.tool_evidence)

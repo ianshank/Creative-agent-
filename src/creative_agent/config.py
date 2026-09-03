@@ -129,9 +129,17 @@ class HarnessSettings(BaseSettings):
     max_oracle_depth: int = 32
     max_artifact_bytes: int = 20_000_000
 
-    # Citation resolution (oracles rebaseline).
+    # Citation resolution (oracles rebaseline). The Crossref backend resolves the DOI-only
+    # sources the arXiv resolver skips — four of the shipped oracle's sources carry a DOI
+    # and no arXiv id, so no code path could verify them at all before (DEC-F13's cap makes
+    # that a severity bug, not just a gap).
     arxiv_api_url: str = "https://export.arxiv.org/api/query"
+    crossref_api_url: str = "https://api.crossref.org/works"
     citation_timeout_seconds: float = 30.0
+    # Crossref asks API clients to identify themselves; anonymous traffic is rate-limited
+    # into a slower pool. Deliberately not defaulted to the operator's email — an address
+    # belongs in an outbound header only when someone puts it there on purpose.
+    citation_user_agent: str = "creative-agent/0.1 (+https://github.com/ianshank/Creative-agent-)"
 
     # Observability (DEC-F10). Level and format are configuration, never literals at a
     # call site; --verbose/--debug on the CLI raise the level for one invocation.

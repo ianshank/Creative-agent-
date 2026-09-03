@@ -202,3 +202,46 @@ class TestAssetsCommand:
             app, ["assets", "validate", "--claude-dir", str(tmp_path / "absent")]
         )
         assert result.exit_code == int(ExitCode.CONFIG_ERROR)
+
+
+class TestOfflineCeilingBanner:
+    """An offline run cannot fail on artifact content, and nothing said so (plan 3.3).
+
+    `OfflineLLMClient` returns no claims, so the measurement gates — the entire
+    quantitative bar and the only source of a compute-budget Blocker — score nothing;
+    every doctrine row comes back not_applicable; and offline classify recommends
+    advisory, which caps everything at the oracle's advisory ceiling and exits 0. Anyone
+    wiring `--offline` into CI as a gate is running a pass-through, so the run now says so.
+    """
+
+    # The banner is written to stderr so it reaches an operator without contaminating the
+    # rendered report, which is a byte-stable published contract. CliRunner merges the two
+    # by default, so these assert on the merged output and on the report's own structure.
+    NOTE = "NOTE: this was an offline run"
+
+    def test_an_offline_auto_run_warns_that_it_cannot_fail(self, env: Path) -> None:
+        result = runner.invoke(app, ["review", str(env), "--offline"])
+        assert result.exit_code == 0, result.output
+        assert self.NOTE in result.output
+        assert "could not have failed on content" in result.output
+        assert "--mode conformance" in result.output
+
+    def test_the_banner_follows_the_report_rather_than_interleaving_with_it(
+        self, env: Path
+    ) -> None:
+        """The report must remain readable and complete before any commentary."""
+        result = runner.invoke(app, ["review", str(env), "--offline"])
+        assert result.output.index("## Verification log") < result.output.index(self.NOTE)
+
+    def test_the_banner_is_absent_from_the_machine_readable_report(
+        self, env: Path, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "report.json"
+        runner.invoke(app, ["review", str(env), "--offline", "--output-json", str(out)])
+        assert self.NOTE not in out.read_text(encoding="utf-8")
+
+    def test_conformance_mode_drops_the_cannot_fail_sentence(self, env: Path) -> None:
+        """Forced conformance exercises real severities, so that caveat would be wrong."""
+        result = runner.invoke(app, ["review", str(env), "--offline", "--mode", "conformance"])
+        assert self.NOTE in result.output
+        assert "could not have failed on content" not in result.output

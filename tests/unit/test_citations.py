@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from urllib.parse import quote
 
 import httpx
 import respx
 
 from creative_agent.harness.citations import (
     ArxivCitationResolver,
+    CompositeCitationResolver,
+    CrossrefCitationResolver,
     NullCitationResolver,
     OracleRebaseliner,
 )
@@ -156,3 +159,175 @@ class TestRebaseliner:
         assert any("unreachable" in line for line in report)
         # The freshness counter still advances: staleness pressure is the design.
         assert updated.freshness.rebaseline_count == 1
+
+
+CROSSREF = "https://crossref.example/works"
+UA = "creative-agent-test/0"
+
+
+def crossref_resolver() -> CrossrefCitationResolver:
+    return CrossrefCitationResolver(CROSSREF, timeout_seconds=5.0, user_agent=UA)
+
+
+def crossref_body(authors: list[dict[str, str]], title: str = "Loss of plasticity") -> dict:
+    return {"message": {"title": [title], "author": authors}}
+
+
+class TestCrossrefResolver:
+    """Four of the shipped oracle's sources carry a DOI and no arXiv id.
+
+    `ArxivCitationResolver` returns `skipped` whenever `arxiv_id` is absent, so nothing
+    could ever verify them. Once the staleness cap fires (DEC-F13) that is a severity bug:
+    a peer-reviewed paper's findings get capped at Minor because nobody transcribed a
+    resolvable identifier, not because the evidence is weak.
+    """
+
+    DOI = "10.1038/s41586-024-07711-7"
+
+    async def test_a_source_without_a_doi_is_skipped(self) -> None:
+        result = await crossref_resolver().resolve(make_source(doi=None, arxiv_id="2001.1"))
+        assert result.status == "skipped"
+
+    @respx.mock
+    async def test_a_matching_author_list_resolves(self) -> None:
+        respx.get(f"{CROSSREF}/{self.DOI.replace('/', '%2F')}").mock(
+            return_value=httpx.Response(
+                200, json=crossref_body([{"given": "Jane", "family": "Doe"}])
+            )
+        )
+        result = await crossref_resolver().resolve(
+            make_source(doi=self.DOI, arxiv_id=None, authors=["Jane Doe"])
+        )
+        assert result.status == "resolved"
+        assert result.resolved_authors == ["Jane Doe"]
+
+    @respx.mock
+    async def test_a_differing_author_list_is_a_mismatch(self) -> None:
+        """The defect class this machinery exists to catch."""
+        respx.get(f"{CROSSREF}/{self.DOI.replace('/', '%2F')}").mock(
+            return_value=httpx.Response(
+                200,
+                json=crossref_body(
+                    [{"given": "Jane", "family": "Doe"}, {"given": "Ada", "family": "Byron"}]
+                ),
+            )
+        )
+        result = await crossref_resolver().resolve(
+            make_source(doi=self.DOI, arxiv_id=None, authors=["Jane Doe"])
+        )
+        assert result.status == "mismatch"
+
+    @respx.mock
+    async def test_surnames_are_diacritic_folded(self) -> None:
+        respx.get(f"{CROSSREF}/{self.DOI.replace('/', '%2F')}").mock(
+            return_value=httpx.Response(
+                200, json=crossref_body([{"given": "J. Fernando", "family": "Hernández-García"}])
+            )
+        )
+        result = await crossref_resolver().resolve(
+            make_source(doi=self.DOI, arxiv_id=None, authors=["J. Fernando Hernandez-Garcia"])
+        )
+        assert result.status == "resolved"
+
+    @respx.mock
+    async def test_a_transport_failure_is_unreachable_never_a_mismatch(self) -> None:
+        """Reporting a network failure as MISMATCH would accuse a correct citation."""
+        respx.get(f"{CROSSREF}/{self.DOI.replace('/', '%2F')}").mock(
+            return_value=httpx.Response(404)
+        )
+        result = await crossref_resolver().resolve(
+            make_source(doi=self.DOI, arxiv_id=None, authors=["Jane Doe"])
+        )
+        assert result.status == "unreachable"
+
+    @respx.mock
+    async def test_an_unexpected_payload_is_unreachable(self) -> None:
+        respx.get(f"{CROSSREF}/{self.DOI.replace('/', '%2F')}").mock(
+            return_value=httpx.Response(200, json={"not": "what we expect"})
+        )
+        result = await crossref_resolver().resolve(
+            make_source(doi=self.DOI, arxiv_id=None, authors=["Jane Doe"])
+        )
+        assert result.status == "unreachable"
+
+    @respx.mock
+    async def test_a_source_declaring_no_authors_is_not_auto_verified(self) -> None:
+        """Otherwise an undeclared author list launders itself past the staleness cap."""
+        respx.get(f"{CROSSREF}/{self.DOI.replace('/', '%2F')}").mock(
+            return_value=httpx.Response(
+                200, json=crossref_body([{"given": "Jane", "family": "Doe"}])
+            )
+        )
+        result = await crossref_resolver().resolve(
+            make_source(doi=self.DOI, arxiv_id=None, authors=[])
+        )
+        assert result.status == "unreachable"
+
+    @respx.mock
+    async def test_a_record_with_no_authors_to_diff_is_unreachable(self) -> None:
+        respx.get(f"{CROSSREF}/{self.DOI.replace('/', '%2F')}").mock(
+            return_value=httpx.Response(200, json=crossref_body([]))
+        )
+        result = await crossref_resolver().resolve(
+            make_source(doi=self.DOI, arxiv_id=None, authors=["Jane Doe"])
+        )
+        assert result.status == "unreachable"
+
+    @respx.mock
+    async def test_the_doi_is_url_encoded(self) -> None:
+        """A DOI contains slashes and may contain parentheses; both must survive."""
+        doi = "10.1016/S0004-3702(99)00052-1"
+        route = respx.get(f"{CROSSREF}/{quote(doi, safe='')}").mock(
+            return_value=httpx.Response(
+                200, json=crossref_body([{"given": "Richard", "family": "Sutton"}])
+            )
+        )
+        await crossref_resolver().resolve(
+            make_source(doi=doi, arxiv_id=None, authors=["Richard S. Sutton"])
+        )
+        assert route.called
+
+
+class TestCompositeResolver:
+    """A source resolves against whichever backend can identify it."""
+
+    async def test_the_first_non_skipping_backend_wins(self) -> None:
+        composite = CompositeCitationResolver(
+            [NullCitationResolver(), _Always("resolved", "second")]
+        )
+        result = await composite.resolve(make_source())
+        assert result.status == "resolved"
+        assert result.detail == "second"
+
+    async def test_all_skipped_reports_skipped_with_every_reason(self) -> None:
+        """A source with no resolvable identifier must not borrow another backend's failure."""
+        composite = CompositeCitationResolver(
+            [_Always("skipped", "no arXiv id"), _Always("skipped", "no DOI")]
+        )
+        result = await composite.resolve(make_source())
+        assert result.status == "skipped"
+        assert "no arXiv id" in result.detail
+        assert "no DOI" in result.detail
+
+    async def test_an_unreachable_backend_stops_the_chain(self) -> None:
+        """Unreachable is an answer, not an abstention; falling through would hide it."""
+        composite = CompositeCitationResolver(
+            [_Always("unreachable", "arxiv down"), _Always("resolved", "never reached")]
+        )
+        result = await composite.resolve(make_source())
+        assert result.status == "unreachable"
+
+    async def test_an_empty_composite_reports_skipped(self) -> None:
+        result = await CompositeCitationResolver([]).resolve(make_source())
+        assert result.status == "skipped"
+
+
+class _Always:
+    """A resolver that always answers the same way."""
+
+    def __init__(self, status: str, detail: str) -> None:
+        self._status = status
+        self._detail = detail
+
+    async def resolve(self, ref: object) -> ResolutionResult:
+        return ResolutionResult(self._status, detail=self._detail)

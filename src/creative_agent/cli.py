@@ -140,7 +140,12 @@ def oracles_rebaseline(
     """
     import yaml as yaml_module
 
-    from creative_agent.harness.citations import ArxivCitationResolver, OracleRebaseliner
+    from creative_agent.harness.citations import (
+        ArxivCitationResolver,
+        CompositeCitationResolver,
+        CrossrefCitationResolver,
+        OracleRebaseliner,
+    )
     from creative_agent.harness.clock import SystemClock
 
     try:
@@ -150,7 +155,19 @@ def oracles_rebaseline(
         _fail(exc)
     except (ValidationError, SettingsError) as exc:
         _fail(ConfigError(f"invalid settings: {exc}"))
-    resolver = ArxivCitationResolver(settings.arxiv_api_url, settings.citation_timeout_seconds)
+    # arXiv first, Crossref second: a source carrying both identifiers resolves against
+    # the preprint server, and a DOI-only source — which the arXiv backend skips, and
+    # which nothing could verify before — falls through to Crossref.
+    resolver = CompositeCitationResolver(
+        [
+            ArxivCitationResolver(settings.arxiv_api_url, settings.citation_timeout_seconds),
+            CrossrefCitationResolver(
+                settings.crossref_api_url,
+                settings.citation_timeout_seconds,
+                settings.citation_user_agent,
+            ),
+        ]
+    )
     rebaseliner = OracleRebaseliner(resolver, SystemClock())
     updated, report = asyncio.run(rebaseliner.rebaseline(table))
     for line in report:
@@ -291,6 +308,8 @@ def review(
         _fail(ConfigError(f"invalid settings: {exc}"))
 
     typer.echo(outcome.rendered)
+    if offline:
+        typer.echo(_offline_ceiling_banner(mode), err=True)
     if output_json is not None:
         output_json.write_text(outcome.report.model_dump_json(indent=2) + "\n", encoding="utf-8")
     severities = [Severity.parse(f.severity) for f in outcome.result.findings]
@@ -298,6 +317,34 @@ def review(
         raise typer.Exit(code=int(ExitCode.BLOCKER_OR_STOP))
     if any(s >= Severity.MAJOR for s in severities):
         raise typer.Exit(code=int(ExitCode.FINDINGS_MAJOR))
+
+
+def _offline_ceiling_banner(mode: str) -> str:
+    """Say plainly what an offline run cannot do (plan item 3.3).
+
+    An offline review is structurally incapable of failing on artifact content in `auto`
+    mode, and nothing said so anywhere a user would look. `OfflineLLMClient` returns no
+    claims, so `MeasurementGateChecker` — the whole quantitative bar, and the only source
+    of a compute-budget Blocker — yields nothing; every doctrine row comes back
+    `not_applicable`; and offline classify recommends `advisory`, which caps every finding
+    at the oracle's advisory ceiling and exits 0. A document with three genuine Blockers
+    and an admission that no baseline was measured exits 0 and reports nothing above Info.
+
+    Anyone wiring `--offline` into CI as a gate is running a pass-through, so the banner
+    goes to stderr: it must reach an operator without contaminating the report on stdout,
+    which is a byte-stable published contract.
+    """
+    lines = [
+        "NOTE: this was an offline run. Deterministic checks only \u2014 no doctrine sweep,",
+        "no measurement-gate scoring, and no citation or claim judgement was performed.",
+    ]
+    if mode == "auto":
+        lines.append(
+            "Offline runs resolve to advisory mode, which caps every finding at the "
+            "oracle's advisory ceiling, so this run could not have failed on content. "
+            "Pass --mode conformance for a run whose severities and exit code are real."
+        )
+    return "\n".join(lines)
 
 
 @agents_app.command("list")

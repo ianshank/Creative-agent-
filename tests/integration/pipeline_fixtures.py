@@ -146,22 +146,36 @@ def base_scripts(
     rows: dict[str, list[dict[str, Any]]] | None = None,
     synthesis_count: int = 1,
     evidence: list[ToolEvidence] | None = None,
+    cost_usd: float | None = None,
 ) -> dict[str, list[RawLLMResult | Exception]]:
-    """Scripts for a mini-oracle run (rows D1, D2), overridable per test."""
+    """Scripts for a mini-oracle run (rows D1, D2), overridable per test.
+
+    `cost_usd` stamps every scripted result with the same per-call cost, which is what a
+    run-budget test needs: the budget accumulates across calls (DEC-F17), so the abort
+    point is a function of how many calls have happened, not of any single one. Default
+    None matches a backend that reports no cost at all.
+    """
     rows = rows or {}
+    priced: dict[str, Any] = {"cost_usd": cost_usd} if cost_usd is not None else {}
     scripts: dict[str, list[RawLLMResult | Exception]] = {
-        script_key(CallKind.CLASSIFY): [raw(CallKind.CLASSIFY, classify or classify_payload())],
-        script_key(CallKind.CLAIMS): [raw(CallKind.CLAIMS, {"claims": []})],
-        script_key(CallKind.SOURCE_QUALITY): [raw(CallKind.SOURCE_QUALITY, empty_sq_payload())],
-        script_key(CallKind.JUDGEMENT): [raw(CallKind.JUDGEMENT, empty_judgement_payload())],
+        script_key(CallKind.CLASSIFY): [
+            raw(CallKind.CLASSIFY, classify or classify_payload(), **priced)
+        ],
+        script_key(CallKind.CLAIMS): [raw(CallKind.CLAIMS, {"claims": []}, **priced)],
+        script_key(CallKind.SOURCE_QUALITY): [
+            raw(CallKind.SOURCE_QUALITY, empty_sq_payload(), **priced)
+        ],
+        script_key(CallKind.JUDGEMENT): [
+            raw(CallKind.JUDGEMENT, empty_judgement_payload(), **priced)
+        ],
         script_key(CallKind.SYNTHESIS): [
-            raw(CallKind.SYNTHESIS, synthesis_payload()) for _ in range(synthesis_count)
+            raw(CallKind.SYNTHESIS, synthesis_payload(), **priced) for _ in range(synthesis_count)
         ],
     }
     for row_id in ("D1", "D2"):
         payloads = rows.get(row_id, [row_payload(row_id)])
         scripts[script_key(CallKind.ROW, row_id)] = [
-            raw(CallKind.ROW, p, tool_evidence=evidence or []) for p in payloads
+            raw(CallKind.ROW, p, tool_evidence=evidence or [], **priced) for p in payloads
         ]
     return scripts
 
@@ -171,10 +185,18 @@ def build_pipeline(
     fake: FakeLLMClient,
     oracle: OracleTable | None = None,
     max_regen: int = 1,
+    **settings_overrides: Any,
 ) -> tuple[ReviewPipeline, FileStateStore]:
+    """Build a pipeline over a fake backend.
+
+    `settings_overrides` lets a test set any HarnessSettings field (a run budget, a
+    timeout) without a second constructor — the defaults stay exactly as they were, so
+    every existing caller is unaffected.
+    """
     settings = HarnessSettings(
         review_log_dir=tmp_path / "review-log",
         max_regeneration_attempts=max_regen,
+        **settings_overrides,
     )
     store = FileStateStore(settings.review_log_dir)
     pipeline = ReviewPipeline(

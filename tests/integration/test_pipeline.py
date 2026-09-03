@@ -1,11 +1,18 @@
 """End-to-end pipeline runs against the fake LLM — one test per spec scenario."""
 
+import asyncio
 import json
 from pathlib import Path
 
 import pytest
 
-from creative_agent.errors import LLMOutputError, ReviewFailedError
+from creative_agent.errors import (
+    BudgetExceededError,
+    ExitCode,
+    LLMOutputError,
+    LLMTimeoutError,
+    ReviewFailedError,
+)
 from creative_agent.harness.llm.base import CallKind, ToolEvidence
 from creative_agent.harness.llm.fake import FakeLLMClient, script_key
 from creative_agent.models.findings import Severity
@@ -459,3 +466,70 @@ class TestPipelineBranches:
         } <= anchors
         assert outcome.report.scope_items[0].reference == "companion safety analysis"
         assert "companion safety analysis" in outcome.rendered
+
+
+class TestRunBudgetAndTimeout:
+    """`max_budget_usd` was per call and `llm_timeout_seconds` was dead (DEC-F17).
+
+    A review makes 18 logical calls on the happy path and up to ~144 provider calls once
+    the classify re-probe, the repair loop and `_call`'s own schema-retry loop compound, so
+    a per-call budget permitted the setting multiplied by that. `cost_usd` was logged and
+    stored per call and never summed against anything.
+    """
+
+    async def test_a_run_under_budget_completes(self, tmp_path: Path) -> None:
+        fake = FakeLLMClient(base_scripts(cost_usd=0.001))
+        pipeline, _ = build_pipeline(tmp_path, fake, max_budget_usd=10.0)
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert outcome.report.cycle == 1
+
+    async def test_an_exhausted_budget_aborts_the_run(self, tmp_path: Path) -> None:
+        fake = FakeLLMClient(base_scripts(cost_usd=1.0))
+        pipeline, _ = build_pipeline(tmp_path, fake, max_budget_usd=2.0)
+        with pytest.raises(BudgetExceededError) as excinfo:
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert "budget" in str(excinfo.value).lower()
+
+    async def test_an_aborted_run_publishes_nothing(self, tmp_path: Path) -> None:
+        """The never-soften rule: a partial sweep must not reach state or the report."""
+        fake = FakeLLMClient(base_scripts(cost_usd=1.0))
+        pipeline, store = build_pipeline(tmp_path, fake, max_budget_usd=2.0)
+        with pytest.raises(BudgetExceededError):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert store.load("design").cycle == 0
+        assert not store.path_for("design").exists()
+
+    async def test_no_budget_configured_means_no_limit(self, tmp_path: Path) -> None:
+        fake = FakeLLMClient(base_scripts(cost_usd=1_000.0))
+        pipeline, _ = build_pipeline(tmp_path, fake, max_budget_usd=None)
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert outcome.report.cycle == 1
+
+    async def test_a_backend_reporting_no_cost_does_not_abort(self, tmp_path: Path) -> None:
+        """OfflineLLMClient and FakeLLMClient both leave cost_usd None by design."""
+        fake = FakeLLMClient(base_scripts())
+        pipeline, _ = build_pipeline(tmp_path, fake, max_budget_usd=0.01)
+        outcome = await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert outcome.report.cycle == 1
+
+    async def test_a_hanging_call_times_out_instead_of_blocking_forever(
+        self, tmp_path: Path
+    ) -> None:
+        class Hanging:
+            async def generate(self, prompt: object) -> object:
+                await asyncio.sleep(3600)
+                raise AssertionError("unreachable")
+
+        pipeline, store = build_pipeline(
+            tmp_path, FakeLLMClient(base_scripts()), llm_timeout_seconds=0.01
+        )
+        pipeline._llm = Hanging()  # type: ignore[assignment]
+        with pytest.raises(LLMTimeoutError):
+            await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+        assert not store.path_for("design").exists()
+
+    async def test_budget_and_timeout_aborts_share_the_retryable_exit_code(self) -> None:
+        """A CI consumer must be able to tell "retry" from "the document is wrong"."""
+        assert BudgetExceededError.exit_code is ExitCode.RUN_ABORTED
+        assert LLMTimeoutError.exit_code is ExitCode.RUN_ABORTED
+        assert ReviewFailedError.exit_code is not ExitCode.RUN_ABORTED

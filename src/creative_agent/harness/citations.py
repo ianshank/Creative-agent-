@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import logging
 import unicodedata
+from urllib.parse import quote
 from xml.etree.ElementTree import Element
 
 import httpx
 from defusedxml import ElementTree as SafeET
 
 from creative_agent.harness.logging import get_logger, log_event
-from creative_agent.harness.protocols import Clock, ResolutionResult
+from creative_agent.harness.protocols import CitationResolver, Clock, ResolutionResult
 from creative_agent.models.oracle import FreshnessMeta, OracleTable, SourceRef
 
 _ATOM = "{http://www.w3.org/2005/Atom}"
@@ -89,6 +90,127 @@ class ArxivCitationResolver:
                 detail=f"declared surnames {declared} != resolved {resolved}",
             )
         return ResolutionResult("resolved", resolved_authors=authors, resolved_title=title)
+
+
+class CrossrefCitationResolver:
+    """Resolves DOI-identified sources via the Crossref REST API.
+
+    Four of the shipped oracle's sources carry a DOI and no arXiv id, so no code path
+    could ever verify them: `ArxivCitationResolver` returns `skipped` whenever `arxiv_id`
+    is absent. Once the staleness cap actually fires (DEC-F13) that becomes a severity
+    bug rather than a gap — a peer-reviewed paper's findings would be capped at Minor not
+    because the evidence is weak but because nobody transcribed a resolvable identifier.
+
+    Mirrors `ArxivCitationResolver`'s contract exactly, including its two hard-won
+    refusals: an entry that declares no authors is `unreachable`, never auto-verified,
+    and a transport or shape failure is `unreachable`, never `mismatch` — reporting a
+    typo'd identifier as an author mismatch would accuse it of the fabricated-citation
+    defect class.
+    """
+
+    def __init__(self, api_url: str, timeout_seconds: float, user_agent: str) -> None:
+        self._api_url = api_url.rstrip("/")
+        self._timeout = timeout_seconds
+        self._user_agent = user_agent
+
+    async def resolve(self, ref: SourceRef) -> ResolutionResult:
+        if not ref.doi:
+            return ResolutionResult("skipped", detail="no DOI")
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout) as client:
+                response = await client.get(
+                    f"{self._api_url}/{quote(ref.doi, safe='')}",
+                    headers={"User-Agent": self._user_agent, "Accept": "application/json"},
+                    follow_redirects=True,
+                )
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
+            return ResolutionResult("unreachable", detail=f"crossref request failed: {exc}")
+        try:
+            message = response.json()["message"]
+        except (ValueError, KeyError, TypeError) as exc:
+            return ResolutionResult("unreachable", detail=f"unexpected Crossref payload: {exc}")
+
+        title = _first_title(message)
+        authors = _crossref_authors(message)
+        if not title:
+            return ResolutionResult("unreachable", detail="Crossref record carries no title")
+        declared = [folded for a in ref.authors if (folded := _fold_surname(a))]
+        resolved = [folded for a in authors if (folded := _fold_surname(a))]
+        if not declared:
+            # Same refusal as the arXiv resolver: an undeclared author list must never be
+            # laundered into a verified source, which would lift the staleness cap free.
+            return ResolutionResult(
+                "unreachable",
+                resolved_authors=authors,
+                resolved_title=title,
+                detail="source declares no authors; cannot verify attribution",
+            )
+        if not resolved:
+            return ResolutionResult(
+                "unreachable",
+                resolved_title=title,
+                detail="Crossref record lists no authors to diff against",
+            )
+        if declared != resolved:
+            return ResolutionResult(
+                "mismatch",
+                resolved_authors=authors,
+                resolved_title=title,
+                detail=f"declared surnames {declared} != resolved {resolved}",
+            )
+        return ResolutionResult("resolved", resolved_authors=authors, resolved_title=title)
+
+
+def _first_title(message: dict[str, object]) -> str:
+    titles = message.get("title")
+    if isinstance(titles, list) and titles:
+        return str(titles[0]).strip()
+    if isinstance(titles, str):
+        return titles.strip()
+    return ""
+
+
+def _crossref_authors(message: dict[str, object]) -> list[str]:
+    """Crossref splits names into `given`/`family`; some records carry only `name`."""
+    raw = message.get("author")
+    if not isinstance(raw, list):
+        return []
+    names: list[str] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        given = str(entry.get("given", "")).strip()
+        family = str(entry.get("family", "")).strip()
+        whole = str(entry.get("name", "")).strip()
+        full = f"{given} {family}".strip() or whole
+        if full:
+            names.append(full)
+    return names
+
+
+class CompositeCitationResolver:
+    """Dispatches a SourceRef to whichever backend can identify it.
+
+    Order matters only for a source carrying both identifiers, where the first backend
+    that does not skip wins. `skipped` is the composite's answer only when *every*
+    backend skipped, so a source with no resolvable identifier at all still reports
+    honestly rather than borrowing another backend's failure.
+    """
+
+    def __init__(self, resolvers: list[CitationResolver]) -> None:
+        self._resolvers = list(resolvers)
+
+    async def resolve(self, ref: SourceRef) -> ResolutionResult:
+        details: list[str] = []
+        for resolver in self._resolvers:
+            result = await resolver.resolve(ref)
+            if result.status != "skipped":
+                return result
+            details.append(result.detail)
+        return ResolutionResult(
+            "skipped", detail="; ".join(d for d in details if d) or "no resolver applies"
+        )
 
 
 class NullCitationResolver:
