@@ -19,7 +19,6 @@ from pydantic import BaseModel, ValidationError
 
 from creative_agent.config import HarnessSettings
 from creative_agent.errors import (
-    BudgetExceededError,
     LLMOutputError,
     LLMTimeoutError,
     ReviewFailedError,
@@ -30,6 +29,8 @@ from creative_agent.harness.artifact import (
     resolve_artifact_id,
     validate_artifact_path,
 )
+from creative_agent.harness.budget import RunBudget
+from creative_agent.harness.classification import ModeResolver
 from creative_agent.harness.consistency import ConsistencyChecker
 from creative_agent.harness.decisions import DecisionGate
 from creative_agent.harness.gates import MeasurementGateChecker
@@ -51,7 +52,7 @@ from creative_agent.harness.sourcequality import SourceQualityChecker
 from creative_agent.harness.state import CycleEscalator
 from creative_agent.harness.verification import VerificationLogChecker
 from creative_agent.models.findings import Finding, FindingKey, Severity, normalize_slug
-from creative_agent.models.oracle import ArtifactClassRule, OracleTable
+from creative_agent.models.oracle import OracleTable
 from creative_agent.models.output import ReviewReport, Verdict
 from creative_agent.models.review import ReviewMode, ReviewRequest, ReviewResult
 from creative_agent.models.state import CycleRecord, HistoricalFinding
@@ -82,6 +83,10 @@ class _SweepState:
     judgement: JudgementSweepResult | None = None
     evidence: list[ToolEvidence] = field(default_factory=list)
     calls: list[dict[str, object]] = field(default_factory=list)
+    # The run's spend cap, carried with the sweep because it is per-run state like the
+    # rest of this dataclass. `calls` stays as the audit record written to the bundle;
+    # the budget no longer has to be re-derived from it on every call (DEC-F41).
+    budget: RunBudget = field(default_factory=lambda: RunBudget(None))
 
 
 @dataclass
@@ -112,6 +117,7 @@ class ReviewPipeline:
         self._settings = settings
         self._state_store = state_store
         self._clock = clock
+        self._modes = ModeResolver(oracle)
         self._severity_policy = SeverityPolicy(oracle)
         self._gate_checker = MeasurementGateChecker(oracle)
         self._sq_checker = SourceQualityChecker(oracle.source_quality)
@@ -142,55 +148,6 @@ class ReviewPipeline:
         self._renderer = OutputRenderer(oracle.protocol.unverified_marker)
 
     # ---- LLM call helper -------------------------------------------------
-
-    @staticmethod
-    def _spent_usd(sweep: _SweepState) -> float:
-        """Total cost recorded across every provider call this run has made.
-
-        `cost_usd` was logged per call and stored per call and never summed against
-        anything, so `max_budget_usd` — which the SDK applies per *call* — permitted the
-        setting multiplied by the number of calls a review makes: 18 on the happy path,
-        and up to roughly 144 provider calls once the re-probe, the repair loop and the
-        schema-retry loop compound (DEC-F17).
-        """
-        total = 0.0
-        for call in sweep.calls:
-            cost = call.get("cost_usd")
-            # A backend that reports no cost contributes nothing rather than aborting the
-            # run: OfflineLLMClient and FakeLLMClient both leave it None by design.
-            if isinstance(cost, int | float):
-                total += float(cost)
-        return total
-
-    def _remaining_budget(self, sweep: _SweepState) -> float | None:
-        """What is left of `max_budget_usd` for this run, or None when uncapped."""
-        budget = self._settings.max_budget_usd
-        if budget is None:
-            return None
-        return max(budget - self._spent_usd(sweep), 0.0)
-
-    def _check_budget(self, sweep: _SweepState, *, kind: CallKind, ref: str) -> None:
-        budget = self._settings.max_budget_usd
-        if budget is None:
-            return
-        spent = self._spent_usd(sweep)
-        if spent < budget:
-            return
-        log_event(
-            _LOG,
-            logging.ERROR,
-            "llm.budget_exhausted",
-            kind=kind.value,
-            ref=ref,
-            spent_usd=round(spent, 6),
-            budget_usd=budget,
-            calls=len(sweep.calls),
-        )
-        raise BudgetExceededError(
-            f"review budget of ${budget:.2f} exhausted after {len(sweep.calls)} LLM calls "
-            f"(${spent:.4f} spent); stopped before the {kind.value} call. Nothing was "
-            "published. Raise max_budget_usd or narrow the review."
-        )
 
     async def _generate_within_timeout(
         self, prompt: AssembledPrompt, *, kind: CallKind, ref: str
@@ -242,14 +199,12 @@ class ReviewPipeline:
                 allowed_read_roots=context.get("read_roots", []),  # type: ignore[arg-type]
                 context={**context, "repair_defects": defects},
             )
-            prompt = prompt.model_copy(
-                update={"remaining_budget_usd": self._remaining_budget(sweep)}
-            )
+            prompt = prompt.model_copy(update={"remaining_budget_usd": sweep.budget.remaining()})
             # Budget is checked *inside* the attempt loop, before each provider call, so a
             # single logical call cannot burn several times the remaining budget: `_call`
             # retries up to max_regeneration_attempts + 1 times and every attempt reaches
             # the wire (DEC-F17).
-            self._check_budget(sweep, kind=kind, ref=ref)
+            sweep.budget.check(kind=kind.value, ref=ref)
             with timed_stage(
                 _LOG, "llm.call", kind=kind.value, ref=ref, attempt=attempt + 1
             ) as call_log:
@@ -261,6 +216,7 @@ class ReviewPipeline:
             sweep.calls.append(
                 {"kind": kind.value, "ref": ref, "model": raw.model, "cost_usd": raw.cost_usd}
             )
+            sweep.budget.record(raw.cost_usd)
             try:
                 return parse_payload(raw, model_type)
             except ValidationError as exc:
@@ -283,50 +239,6 @@ class ReviewPipeline:
 
     # ---- deterministic helpers ------------------------------------------
 
-    def _sections_present(self, text: str, classify: ClassifyResult) -> set[str]:
-        """Which required sections the artifact actually contains.
-
-        Determined from the document's own headings ONLY. The model also reports what it
-        saw, but a required-section obligation is a deterministic gate: honouring the
-        model's word would let the reviewer of an untrusted artifact clear a Blocker by
-        asserting it. Disagreement is logged, never obeyed.
-        """
-        headings = {m.group("title").strip().casefold() for m in _HEADING.finditer(text)}
-        declared = {
-            section for rule in self._oracle.artifact_classes for section in rule.requires_sections
-        }
-        present = {
-            section
-            for section in declared
-            if any(section.casefold() in heading for heading in headings)
-        }
-        unsupported = {n for n in classify.sections_present if n in declared} - present
-        if unsupported:
-            log_event(
-                _LOG,
-                logging.WARNING,
-                "sections.claim_unsupported",
-                claimed=sorted(unsupported),
-                found=sorted(present),
-            )
-        return present
-
-    def _resolve_mode(
-        self, request: ReviewRequest, classify: ClassifyResult, artifact_text: str
-    ) -> tuple[ReviewMode, bool]:
-        """Fail-closed mode rule (DEC-F6) + marker-based uncertainty flag."""
-        if request.mode != "auto":
-            return request.mode, False
-        folded = artifact_text.casefold()
-        markers_present = any(
-            marker.casefold() in folded for marker in self._oracle.conformance.markers
-        )
-        evidence = (classify.conformance_evidence or "").strip()
-        evidence_found = bool(evidence) and _squash(evidence) in _squash(artifact_text)
-        if classify.mode_recommendation == "conformance" and evidence_found:
-            return "conformance", False
-        return "advisory", markers_present
-
     def _candidate_to_finding(
         self,
         candidate: CandidateFinding,
@@ -335,12 +247,41 @@ class ReviewPipeline:
         origin: str = "llm",
     ) -> Finding:
         known_rows = {row.id for row in self._oracle.rows}
+        # `GatePolicy.all_gate_refs` exists precisely so gate references "can be
+        # cross-validated instead of being free-form strings" — its own comment — and until
+        # now it had zero call sites. Only `doctrine_row` supports were filtered, so a
+        # `gate_failure` support carried whatever `ref` the model wrote. That is a severity
+        # lever, not cosmetic: `SeverityPolicy` counts any `gate_failure` support as a
+        # blocker basis and drops the tier cap the moment one non-doctrine support exists,
+        # so naming a gate that does not exist promoted a Major to a Blocker and exit 2.
+        # The model writes this field and the artifact under review can steer the model,
+        # which is the threat model DEC-F9 assumes (DEC-F31).
+        known_gates = self._oracle.gate_policy.all_gate_refs()
         doctrine_refs = [r for r in candidate.doctrine_refs if r in known_rows]
         if not doctrine_refs and default_row:
             doctrine_refs = [default_row]
         supports = [
-            s for s in candidate.supports if s.kind != "doctrine_row" or s.ref in known_rows
+            s
+            for s in candidate.supports
+            if (s.kind != "doctrine_row" or s.ref in known_rows)
+            and (s.kind != "gate_failure" or s.ref in known_gates)
         ]
+        gate_refs = [g for g in candidate.gate_refs if g in known_gates]
+        dropped = (
+            len(candidate.supports) - len(supports) + len(candidate.gate_refs) - len(gate_refs)
+        )
+        if dropped:
+            # An unknown reference is the model inventing doctrine, and a reviewer reading
+            # only the report would never see that it was dropped. Counts, never the
+            # strings: the refs are model prose (DEC-F10).
+            log_event(
+                _LOG,
+                logging.WARNING,
+                "findings.unknown_refs_dropped",
+                origin=origin,
+                dropped=dropped,
+                anchor_slug=normalize_slug(candidate.anchor) or "finding",
+            )
         key_row = doctrine_refs[0] if doctrine_refs else self._oracle.protocol.placeholder_row_id
         return Finding(
             finding_id=f"F{index}",
@@ -349,7 +290,7 @@ class ReviewPipeline:
             original_severity=candidate.severity,
             summary=self._guard.launder_prose(candidate.summary),
             doctrine_refs=doctrine_refs,
-            gate_refs=candidate.gate_refs,
+            gate_refs=gate_refs,
             supports=supports,
             disposition_required=self._guard.launder_prose(candidate.disposition_required)
             if candidate.disposition_required
@@ -480,12 +421,12 @@ class ReviewPipeline:
             **self._agent.build_context(request, self._oracle, state),
         }
 
-        sweep = _SweepState()
+        sweep = _SweepState(budget=RunBudget(self._settings.max_budget_usd))
 
         # Step 3: classify + fail-closed mode (with one re-probe).
         classify = await self._call(sweep, CallKind.CLASSIFY, ClassifyResult, base_context)
         classify = await self._validated_class(sweep, classify, base_context)
-        mode, mode_uncertain = self._resolve_mode(request, classify, artifact_text)
+        mode, mode_uncertain = self._modes.resolve(request.mode, classify, artifact_text)
         if mode == "advisory" and mode_uncertain and request.mode == "auto":
             reprobe = await self._call(
                 sweep,
@@ -498,7 +439,7 @@ class ReviewPipeline:
                     "sentence exactly, or confirm the artifact does not claim conformance"
                 ],
             )
-            mode, mode_uncertain2 = self._resolve_mode(request, reprobe, artifact_text)
+            mode, mode_uncertain2 = self._modes.resolve(request.mode, reprobe, artifact_text)
             mode_uncertain = mode == "advisory" and mode_uncertain2
             # The same validator as the first probe. Assigning `reprobe` unchecked meant a
             # model that answered validly once and invalidly on the re-probe reached the
@@ -509,7 +450,7 @@ class ReviewPipeline:
             classify = await self._validated_class(sweep, reprobe, base_context)
 
         class_context = {**base_context, "mode": mode, "artifact_class": classify.artifact_class}
-        class_rule = self._class_rule(classify.artifact_class)
+        class_rule = self._modes.class_rule(classify.artifact_class)
 
         # Steps 4-5 (deterministic sweeps).
         deterministic: list[CandidateFinding] = [
@@ -542,7 +483,7 @@ class ReviewPipeline:
 
             # Step 7: claims + gates.
             claims_result = await self._call(sweep, CallKind.CLAIMS, ClaimsResult, class_context)
-            sections = self._sections_present(artifact_text, classify)
+            sections = self._modes.sections_present(artifact_text, classify)
             deterministic.extend(
                 self._gate_checker.findings_for(
                     claims_result.claims, classify.artifact_class, sections
@@ -669,7 +610,12 @@ class ReviewPipeline:
             )
 
         final_synthesis = sweep.synthesis
-        assert final_synthesis is not None
+        if final_synthesis is None:
+            # Unreachable on every path today — synthesis is assigned before this point —
+            # but an `assert` is the wrong guard for a None dereference: `python -O`
+            # removes it, and the lines below would then raise an AttributeError, which is
+            # not a CreativeAgentError and would therefore be reported as exit 5.
+            raise LLMOutputError("synthesis produced no result; nothing to publish")
         current_cycle = state.cycle + 1
         report = ReviewReport(
             artifact_id=request.artifact_id,
@@ -782,7 +728,7 @@ class ReviewPipeline:
         none, which is the shape of defect DEC-F24 is about — a value the model chose,
         validated at the call site that happened to be written first.
         """
-        known = {c.name for c in self._oracle.artifact_classes}
+        known = self._modes.known_classes()
         if classify.artifact_class in known:
             return classify
         retried = await self._call(
@@ -799,13 +745,6 @@ class ReviewPipeline:
                 f"classify returned unknown artifact class {retried.artifact_class!r}"
             )
         return retried
-
-    def _class_rule(self, artifact_class: str) -> ArtifactClassRule:
-        """The oracle rule for a class, as a typed failure rather than a StopIteration."""
-        for rule in self._oracle.artifact_classes:
-            if rule.name == artifact_class:
-                return rule
-        raise LLMOutputError(f"classify returned unknown artifact class {artifact_class!r}")
 
     def _scope_items(self, sweep: _SweepState) -> list[ScopeItem]:
         """Scope items as the judgement returned them; laundering is DEC-F22's boundary."""
@@ -827,10 +766,6 @@ class ReviewPipeline:
             encoding="utf-8",
             newline="\n",
         )
-
-
-def _squash(text: str) -> str:
-    return re.sub(r"\s+", " ", text).strip().casefold()
 
 
 def _mentions_row(defect: str, row_id: str) -> bool:

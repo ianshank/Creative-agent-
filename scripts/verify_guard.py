@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -55,6 +56,20 @@ from pathlib import Path
 EXIT_GUARD_HOLDS = 0
 EXIT_GUARD_WEAK = 1
 EXIT_CANNOT_CHECK = 2
+
+# pytest's own exit codes. Only ONE of these means "the named tests ran and failed", and
+# that distinction is the whole verdict: this tool once reported GUARD HOLDS for a revert
+# that left an `IndentationError`, because a collection error (2) is nonzero and nonzero
+# was read as "the test caught it". The reassuring answer for a broken revert is the worst
+# thing this tool can do — it is the instrument a whole branch of decisions rests on.
+_PYTEST_OK = 0
+_PYTEST_TESTS_FAILED = 1
+_PYTEST_EXIT_MEANINGS = {
+    2: "pytest could not collect the tests (a syntax or import error in the reverted tree)",
+    3: "pytest hit an internal error",
+    4: "pytest was called incorrectly",
+    5: "pytest collected no tests — the selector matches nothing",
+}
 
 
 @dataclass(frozen=True)
@@ -93,21 +108,49 @@ def load_spec(path: Path) -> Guard:
     )
 
 
-def run_tests(tests: tuple[str, ...]) -> bool:
-    """True when the named tests pass.
+# Coverage plumbing the parent process may have set. pytest-cov instruments subprocesses
+# through these, so a child inherits them and writes to the SAME data file — which
+# corrupted the parent's measurement nondeterministically when this tool was exercised from
+# inside a covered test run: `cli.py` swung between 88% and 69% across identical runs, and
+# the coverage floors then failed on a different module each time. A gate that fails at
+# random is a gate that gets switched off, which is the failure this whole tool is about.
+# Clearing them is also just correct: `--no-cov` says this child's coverage is not wanted.
+_COVERAGE_ENV_VARS = (
+    "COV_CORE_SOURCE",
+    "COV_CORE_CONFIG",
+    "COV_CORE_DATAFILE",
+    "COV_CORE_CONTEXT",
+    "COVERAGE_FILE",
+    "COVERAGE_PROCESS_START",
+)
+
+
+def _child_env() -> dict[str, str]:
+    """The parent's environment without the coverage instrumentation it may carry."""
+    return {k: v for k, v in os.environ.items() if k not in _COVERAGE_ENV_VARS}
+
+
+def run_tests(tests: tuple[str, ...]) -> int:
+    """pytest's exit code for the named tests.
+
+    The code, not a boolean. A boolean collapses "the tests failed" together with "the
+    tests could not run", and those are opposite verdicts: the first means the guard
+    holds, the second means nothing was measured.
 
     `--no-cov` because a coverage floor failure would read as a test failure and make the
     revert look guarded when it is not — the tool would then report a guard that holds
     for a reason unrelated to the guard, which is the exact confusion it exists to remove.
     `-p no:randomly` keeps the two runs comparable.
+
     """
     completed = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "--no-cov", "-p", "no:randomly", *tests],
         capture_output=True,
         text=True,
         check=False,
+        env=_child_env(),
     )
-    return completed.returncode == 0
+    return completed.returncode
 
 
 def apply(guard: Guard) -> dict[Path, str]:
@@ -142,13 +185,22 @@ def restore(originals: dict[Path, str]) -> None:
         path.write_text(text, encoding="utf-8")
 
 
+def _describe(code: int) -> str:
+    """Why a pytest run that neither passed nor failed did neither."""
+    return _PYTEST_EXIT_MEANINGS.get(code, f"pytest exited {code}")
+
+
 def check(guard: Guard) -> int:
     print(f"guard: {guard.name}")
     print(f"  tests: {' '.join(guard.tests)}")
 
-    if not run_tests(guard.tests):
-        print("  FAIL: the named tests do not pass on the current tree.")
-        print("  Nothing can be concluded from a revert while the baseline is red.")
+    baseline = run_tests(guard.tests)
+    if baseline != _PYTEST_OK:
+        if baseline == _PYTEST_TESTS_FAILED:
+            print("  FAIL: the named tests do not pass on the current tree.")
+            print("  Nothing can be concluded from a revert while the baseline is red.")
+        else:
+            print(f"  ERROR: {_describe(baseline)}.")
         return EXIT_CANNOT_CHECK
     print("  baseline: pass")
 
@@ -159,7 +211,7 @@ def check(guard: Guard) -> int:
         return EXIT_CANNOT_CHECK
 
     try:
-        still_passing = run_tests(guard.tests)
+        reverted = run_tests(guard.tests)
     finally:
         # Restore in `finally` so a KeyboardInterrupt mid-run cannot leave the tree
         # reverted, but *verify* the restore outside it: a `return` inside `finally`
@@ -171,9 +223,9 @@ def check(guard: Guard) -> int:
         names = ", ".join(str(p) for p in unrestored)
         print(f"  ERROR: not restored: {names}; check these before committing.")
         return EXIT_CANNOT_CHECK
-    print("  reverted: " + ("pass" if still_passing else "fail"))
 
-    if still_passing:
+    if reverted == _PYTEST_OK:
+        print("  reverted: pass")
         print()
         print("  GUARD IS WEAK. The behaviour was removed and the tests still passed.")
         print("  The test is asserting something other than what its name claims —")
@@ -182,6 +234,20 @@ def check(guard: Guard) -> int:
         print("  Rewrite it to assert the outcome, then run this again.")
         return EXIT_GUARD_WEAK
 
+    if reverted != _PYTEST_TESTS_FAILED:
+        # The finding this tool exists to avoid giving. A revert that leaves the module
+        # un-importable makes pytest exit 2, which is nonzero — and reading nonzero as
+        # "the test caught it" certified a test that asserts its own input as a holding
+        # guard. Say what happened instead: the revert has to be one the tree can still
+        # run, or it measures nothing.
+        print(f"  reverted: {_describe(reverted)}")
+        print()
+        print("  CANNOT CHECK. The revert did not produce a running test suite, so the")
+        print("  tests never expressed an opinion. Narrow the revert until the tree still")
+        print("  imports — remove a condition's effect, not its syntax.")
+        return EXIT_CANNOT_CHECK
+
+    print("  reverted: fail")
     print("  GUARD HOLDS: removing the behaviour fails the test.")
     return EXIT_GUARD_HOLDS
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from pathlib import Path
 from typing import Annotated, NoReturn
@@ -17,6 +18,52 @@ from creative_agent.errors import ConfigError, CreativeAgentError, ExitCode
 from creative_agent.harness.oracle import OracleLoader
 
 app = typer.Typer(name="creative-agent", no_args_is_help=True, add_completion=False)
+
+
+def registered_subcommands() -> set[str]:
+    """Every subcommand name this CLI actually exposes.
+
+    Read from the live Typer app rather than listed as a constant, so renaming a command
+    updates this by construction. The asset validator uses it to fail an asset that
+    invokes a command that no longer exists (DEC-F29), which only works if the list is
+    right — and a hard-coded list here would be one more thing that can disagree with the
+    code.
+    """
+    names = {group.name for group in app.registered_groups if group.name}
+    names.update(
+        command.name or (command.callback.__name__ if command.callback else "")
+        for command in app.registered_commands
+    )
+    return {name for name in names if name}
+
+
+def _report_failure(exc: BaseException, code: ExitCode, prefix: str) -> None:
+    """Tell the operator on stderr AND leave a record in the structured log (DEC-F34).
+
+    Both, because they have different readers. `typer.echo(err=True)` is for the person at
+    a terminal; `log_event` is for the deployment that sets `CREATIVE_AGENT_LOG_FORMAT=json`
+    and collects logs — the container default, where nobody reads stderr. Until now every
+    typed failure produced no structured telemetry at all, so a review refused for a
+    security reason (an artifact symlinked out of the reviewed tree, a device where a
+    document was expected) was invisible in aggregate. The DEC-F23 incident is the case in
+    point: the fix stops the read, and nothing recorded that a refusal happened.
+
+    The error TYPE and the exit code are logged, never the message: an exception string can
+    quote a path from an untrusted repository, and DEC-F10 keeps untrusted text out of the
+    log stream. The operator on stderr gets the full message.
+    """
+    from creative_agent.harness.logging import get_logger, log_event
+
+    typer.echo(f"{prefix}: {exc}", err=True)
+    log_event(
+        get_logger("creative_agent.cli"),
+        logging.ERROR,
+        "cli.failed",
+        error_type=type(exc).__name__,
+        exit_code=int(code),
+    )
+
+
 oracles_app = typer.Typer(no_args_is_help=True)
 app.add_typer(oracles_app, name="oracles", help="Inspect and validate oracle data files.")
 agents_app = typer.Typer(no_args_is_help=True)
@@ -203,12 +250,22 @@ def assets_validate(
     These are executable configuration — a malformed agent or a non-executable hook fails
     silently mid-session — so they get the same treatment as oracle data.
     """
+    from creative_agent.harness.asset_references import ReferenceContext
     from creative_agent.harness.assets import collect, default_claude_dir
 
     target = claude_dir or default_claude_dir()
     if not target.is_dir():
         _fail(ConfigError(f"no .claude directory at {target}"))
-    inventory, defects = collect(target)
+    # Body-reference checks (DEC-F29) resolve against the repository the .claude tree sits
+    # in, and the subcommand list comes from the live Typer app rather than a literal — so
+    # renaming a command makes every asset that invokes it fail here, which is the point.
+    inventory, defects = collect(
+        target,
+        references=ReferenceContext(
+            repo_root=target.parent,
+            known_subcommands=frozenset(registered_subcommands()),
+        ),
+    )
     typer.echo(
         f"{target}: {len(inventory.agents)} agent(s), {len(inventory.skills)} skill(s), "
         f"{len(inventory.hooks)} hook(s)"
@@ -256,10 +313,10 @@ def review(
     from creative_agent.agents import build_registry
     from creative_agent.harness.artifact import read_artifact, resolve_artifact_id
     from creative_agent.harness.clock import SystemClock
+    from creative_agent.harness.exitcodes import exit_code_for
     from creative_agent.harness.pipeline import ReviewPipeline
     from creative_agent.harness.protocols import LLMClient
     from creative_agent.harness.state import FileStateStore
-    from creative_agent.models.findings import Severity
     from creative_agent.models.review import ReviewRequest
 
     try:
@@ -327,11 +384,11 @@ def review(
             encoding="utf-8",
             newline="\n",
         )
-    severities = [Severity.parse(f.severity) for f in outcome.result.findings]
-    if outcome.result.escalation is not None or Severity.BLOCKER in severities:
-        raise typer.Exit(code=int(ExitCode.BLOCKER_OR_STOP))
-    if any(s >= Severity.MAJOR for s in severities):
-        raise typer.Exit(code=int(ExitCode.FINDINGS_MAJOR))
+    # One function, table-tested (DEC-F38). Computed inline here, exit 1 was reachable
+    # only by driving the whole CLI with a monkeypatched pipeline, and nothing did.
+    code = exit_code_for(outcome.result)
+    if code is not ExitCode.CLEAN:
+        raise typer.Exit(code=int(code))
 
 
 def _offline_ceiling_banner(mode: str) -> str:
@@ -436,10 +493,10 @@ def main() -> int:
     except typer.Abort:
         return int(ExitCode.UNEXPECTED_ERROR)
     except CreativeAgentError as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        _report_failure(exc, ExitCode(exc.exit_code), "error")
         return int(exc.exit_code)
     except Exception as exc:  # the exit-code contract demands a defined code for anything
-        print(f"unexpected error: {exc}", file=sys.stderr)
+        _report_failure(exc, ExitCode.UNEXPECTED_ERROR, "unexpected error")
         return int(ExitCode.UNEXPECTED_ERROR)
     if isinstance(return_value, int):
         return return_value

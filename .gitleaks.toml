@@ -22,10 +22,13 @@ description = "Known-safe fixtures and documentation"
 paths = [
   # Lockfiles carry hashes that trip entropy heuristics.
   '''uv\.lock''',
-  # Golden files and recorded fixtures are deterministic test data, reviewed by hand.
-  '''tests/golden/.*''',
-  '''tests/fixtures/.*''',
 ]
+# `tests/golden/` and `tests/fixtures/` used to be allowlisted wholesale, which disabled
+# EVERY rule — the upstream default set included — for exactly the trees this file's own
+# header calls risky ("a pasted key in a fixture is a real risk"). Recorded SDK transcripts
+# live in `tests/fixtures/`, and a recorded transcript is precisely where a real key gets
+# pasted. The regexes below cover the actual false positives instead, so the rules still
+# run over that content.
 regexes = [
   # The example config documents env var NAMES, never values.
   '''ANTHROPIC_API_KEY=\.\.\.''',

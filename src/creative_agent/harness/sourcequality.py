@@ -9,10 +9,9 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from urllib.parse import urlparse
 
 from creative_agent.harness.canonical import canonicalize
-from creative_agent.harness.policy import URL_PATTERN
+from creative_agent.harness.policy import URL_PATTERN, host_matches_suffix, host_of
 from creative_agent.models.findings import SupportRef
 from creative_agent.models.oracle import SourceQualityConfig
 from creative_agent.models.sweeps import CandidateFinding
@@ -22,6 +21,11 @@ _REF_TOKEN = r"\[\d{1,4}\]"  # noqa: S105 — a citation-marker regex, not a sec
 # and the harvester that decides what the session may fetch must agree on what a URL is,
 # or a citation is judged by one and unreachable by the other.
 _URL = URL_PATTERN
+# How many vendor URLs a finding names before eliding the rest. A presentation limit, not
+# doctrine: the finding is about the presence of vendor citations, and a summary listing
+# forty URLs is unreadable. Named rather than inline because `PLR2004` — the lint for
+# CLAUDE.md's "no hard-coded thresholds" rule — is now enabled for `src/` (DEC-F33).
+_MAX_LISTED_VENDOR_URLS = 5
 
 
 class SourceQualityChecker:
@@ -86,8 +90,12 @@ class SourceQualityChecker:
         hits: list[str] = []
         for match in _URL.finditer(text):
             url = match.group(0).rstrip(".,;")
-            host = (urlparse(url).hostname or "").lower()
-            if any(host == d or host.endswith(f".{d}") for d in self._config.vendor_domains):
+            # Guarded and shared (DEC-F32). This was the one unguarded copy of three, so
+            # `http://[::1]/health` in an artifact — which `URL_PATTERN` matches as the
+            # unbalanced `http://[::1` — raised ValueError out of a deterministic check and
+            # ended an offline review with exit 5.
+            host = host_of(url)
+            if host and any(host_matches_suffix(host, d) for d in self._config.vendor_domains):
                 hits.append(url)
         return sorted(set(hits))
 
@@ -99,8 +107,8 @@ class SourceQualityChecker:
             CandidateFinding(
                 severity=self._config.vendor_page_severity,
                 summary=(
-                    f"Vendor page(s) cited ({', '.join(urls[:5])}"
-                    + (", …" if len(urls) > 5 else "")
+                    f"Vendor page(s) cited ({', '.join(urls[:_MAX_LISTED_VENDOR_URLS])}"
+                    + (", …" if len(urls) > _MAX_LISTED_VENDOR_URLS else "")
                     + f"): {self._config.vendor_page_note}"
                 ),
                 anchor="vendor-pages-cited",

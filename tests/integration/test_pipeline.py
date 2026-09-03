@@ -981,3 +981,136 @@ class TestObservabilityThatWouldMatterInAnIncident:
         with pytest.raises(LLMTransportError, match="provider unreachable"):
             await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
         assert store.load("design").cycle == 0
+
+
+class TestAModelCannotInventDoctrineToLiftASeverityCap:
+    """DEC-F31: `gate_failure` support refs were never validated against the gate policy.
+
+    `GatePolicy.all_gate_refs` exists so that "support refs can be cross-validated instead
+    of being free-form strings" — its own comment — and it had zero call sites.
+    `_candidate_to_finding` filtered `doctrine_row` supports against the known rows and
+    let `gate_failure` through with whatever `ref` the model wrote.
+
+    That is a severity lever. `SeverityPolicy` counts any `gate_failure` support as a
+    blocker basis, and drops the tier cap as soon as one non-doctrine support exists — so
+    a made-up gate name promotes a capped Major to a published Blocker and exit 2. The
+    model writes this field, and the artifact under review can steer the model: that is
+    the threat model DEC-F9 assumes, not a hypothetical.
+    """
+
+    @staticmethod
+    def _finding_with_gate(ref: str) -> dict[str, Any]:
+        finding = finding_payload(severity="blocker", row_id="D2")
+        finding["supports"] = [
+            {"kind": "doctrine_row", "ref": "D2"},
+            {"kind": "gate_failure", "ref": ref},
+        ]
+        finding["gate_refs"] = [ref]
+        return finding
+
+    @staticmethod
+    def _capped_tier_oracle() -> Any:
+        """D2 at tier T, which the tier cap holds to Major on doctrine support alone.
+
+        The cap is what makes the bypass observable: on a PR/AP row a Blocker is already
+        legitimate, so a fabricated gate reference changes nothing there and a test built
+        on one would pass against the defect.
+        """
+        oracle = make_oracle()
+        rows = [r.model_copy(update={"tier": "T"}) if r.id == "D2" else r for r in oracle.rows]
+        return oracle.model_copy(update={"rows": rows})
+
+    async def _run_with_gate(self, tmp_path: Path, ref: str) -> Any:
+        scripts = base_scripts(
+            rows={
+                "D2": [
+                    row_payload(
+                        "D2",
+                        "miss",
+                        findings=[self._finding_with_gate(ref)],
+                        entries=[verified_entry("D2")],
+                    )
+                ]
+            },
+            evidence=[
+                ToolEvidence(
+                    tool_name="WebFetch", target="https://arxiv.org/abs/2001.00001", ok=True
+                )
+            ],
+        )
+        pipeline, _ = build_pipeline(
+            tmp_path, FakeLLMClient(scripts), oracle=self._capped_tier_oracle()
+        )
+        return await pipeline.run(request_for(tmp_path, CONFORMANT_ARTIFACT))
+
+    async def test_an_invented_gate_name_cannot_mint_a_blocker(self, tmp_path: Path) -> None:
+        outcome = await self._run_with_gate(tmp_path, "totally_invented_gate")
+        (finding,) = outcome.result.findings
+        assert finding.severity < Severity.BLOCKER, (
+            "a gate the oracle does not declare lifted the tier cap and published a Blocker"
+        )
+        assert "totally_invented_gate" not in outcome.rendered
+        assert [s.ref for s in finding.supports] == ["D2"]
+
+    async def test_a_declared_gate_still_supports_the_finding(self, tmp_path: Path) -> None:
+        """The refusal must not be so broad that a legitimate gate failure stops counting.
+
+        `observable` is a real gate in the factory oracle; a finding resting on it is
+        exactly what the blocker-basis rule is for, and dropping it would silently weaken
+        every genuine gate failure — a worse defect, and a quieter one.
+        """
+        outcome = await self._run_with_gate(tmp_path, "observable")
+        (finding,) = outcome.result.findings
+        assert "observable" in finding.gate_refs
+        assert {s.ref for s in finding.supports} == {"D2", "observable"}
+
+    async def test_dropping_an_unknown_ref_is_logged(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Silently discarding model output is how a reviewer stops being auditable.
+
+        Counts only, never the strings: the refs are model prose, and DEC-F10 forbids
+        logging that.
+        """
+        with caplog.at_level(logging.WARNING, logger="creative_agent.harness.pipeline"):
+            await self._run_with_gate(tmp_path, "totally_invented_gate")
+        records = [r for r in caplog.records if "unknown_refs_dropped" in r.getMessage()]
+        assert records, "an invented doctrine reference was dropped with no record"
+        assert all("totally_invented_gate" not in r.getMessage() for r in records)
+
+
+class TestTheContainmentCheckDoesNotTravelWithTheRead:
+    """G1: the pipeline's own containment check was deletable with the suite green.
+
+    Its comment states the invariant it exists for — "the check must not travel with the
+    read, or removing it from the CLI would remove it from the product" — and every
+    containment test drives the CLI, which refuses first, so the pipeline's refusal was
+    never observed. The case it protects is the documented one: an embedder constructing
+    `ReviewPipeline` directly and supplying `artifact_text`, which is exactly the caller
+    `ReviewRequest.artifact_text` was added for.
+    """
+
+    async def test_a_pipeline_given_text_still_refuses_an_out_of_tree_path(
+        self, tmp_path: Path
+    ) -> None:
+        repo = tmp_path / "worktree"
+        (repo / "docs").mkdir(parents=True)
+        secret = tmp_path / "outside" / "id_rsa"
+        secret.parent.mkdir()
+        secret.write_text("PRIVATE KEY", encoding="utf-8")
+        artifact = repo / "docs" / "design.md"
+        artifact.symlink_to(secret)
+
+        pipeline, store = build_pipeline(tmp_path, FakeLLMClient(base_scripts()))
+        request = request_for(tmp_path, CONFORMANT_ARTIFACT).model_copy(
+            update={
+                "artifact_path": artifact,
+                "artifact_repo": repo,
+                # The text is supplied, so the pipeline never reads the file — and must
+                # still refuse the path it was handed text for.
+                "artifact_text": CONFORMANT_ARTIFACT,
+            }
+        )
+        with pytest.raises(ConfigError, match="outside it"):
+            await pipeline.run(request)
+        assert store.load("design").cycle == 0

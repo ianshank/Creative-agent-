@@ -639,6 +639,12 @@ class TestGlobEscapesThatSurvivedTheFirstFix:
             "[a]/../../../etc/*",
             "**/../../**/*.pem",
             "{a,b}/../../../etc/*",
+            # DEC-F26 names three refusals; the original list exercised two. Deleting the
+            # backslash clause left the whole suite green — "enumerates the shapes the
+            # code already caught", one level down from the defect that entry is about.
+            "C:\\Windows\\**",
+            "..\\..\\etc\\passwd",
+            "*\\..\\secrets",
         ],
     )
     async def test_a_traversal_after_a_metacharacter_is_denied(

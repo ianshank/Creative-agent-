@@ -11,10 +11,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, get_origin
 
 import yaml
-from pydantic import Field, field_validator
+from pydantic import Field, ValidationInfo, field_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import (
     BaseSettings,
@@ -201,22 +201,25 @@ class HarnessSettings(BaseSettings):
             return parsed
         return value
 
-    @field_validator(
-        "agent_tools",
-        "fetch_tool_names",
-        "unscoped_tools",
-        "oracle_search_paths",
-        "prompt_search_paths",
-        "blocked_host_suffixes",
-        mode="before",
-    )
+    @field_validator("*", mode="before")
     @classmethod
-    def _split_scalar_lists(cls, value: Any) -> Any:
-        """Accept `a,b` and `a:b` for list fields, not just JSON.
+    def _split_scalar_lists(cls, value: Any, info: ValidationInfo) -> Any:
+        """Accept `a,b` and `a:b` for every list field, not just JSON.
 
-        pydantic-settings only parses JSON for complex types, which made the documented
-        env syntax (`CREATIVE_AGENT_AGENT_TOOLS=Read,Grep`) fail with a parse error.
+        pydantic-settings only parses JSON for complex types, which made the documented env
+        syntax (`CREATIVE_AGENT_AGENT_TOOLS=Read,Grep`) fail with a parse error.
+
+        Applied to every list-annotated field rather than to a named six. The named form was
+        the same defect this codebase keeps finding elsewhere — a list of things to include,
+        which is wrong the moment someone adds the seventh. `protocol_tools` was that
+        seventh: DEC-F20 justified it as a list "so that an SDK that renames or adds a
+        protocol tool is a settings change", and the documented env shorthand rejected it
+        with a type error, so that was true of the YAML file and false of the environment.
+        Selecting by *shape* means the next list field works the day it is added.
         """
+        field = cls.model_fields.get(info.field_name or "")
+        if field is None or get_origin(field.annotation) is not list:
+            return value
         if isinstance(value, str):
             text = value.strip()
             if not text:

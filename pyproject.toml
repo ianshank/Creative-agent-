@@ -61,11 +61,15 @@ line-length = 100
 src = ["src", "tests"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "PL", "RUF", "DTZ", "S", "TID"]
-ignore = [
-    "S101",    # assert use — pytest idiom; bandit context not applicable in tests
-    "PLR2004", # magic values in tests/comparisons are acceptable where named constants add noise
-]
+# T20 (flake8-print) enforces CLAUDE.md's "never `print`" rule, which until now was
+# enforced by nothing and was already violated in `cli.py`'s top-level error handler.
+select = ["E", "F", "I", "UP", "B", "SIM", "PL", "RUF", "DTZ", "S", "TID", "T20"]
+# Deliberately empty. `S101` (assert) and `PLR2004` (magic value in a comparison) were
+# ignored here with comments that justified them "in tests" — while applying to `src/` too.
+# PLR2004 is the lint for CLAUDE.md's headline convention ("never hard-code severity caps,
+# gate lists, or thresholds in Python"), so the repository had globally disabled its own
+# enforcement of its own first rule. Both are now per-file ignores under `tests/**`.
+ignore = []
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
 "datetime.datetime.now".msg = "Inject harness.protocols.Clock instead (determinism policy, DEC-F8)."
@@ -73,8 +77,10 @@ ignore = [
 "datetime.date.today".msg = "Inject harness.protocols.Clock instead (determinism policy, DEC-F8)."
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S", "PLR0913", "DTZ001", "DTZ011"]
-"scripts/**" = ["S", "PLC0415"]
+"tests/**" = ["S", "PLR0913", "PLR0917", "DTZ001", "DTZ011", "S101", "PLR2004", "T20"]
+# scripts are console tools: printing IS their output channel, and the harness logger is
+# for the library. They are not imported by `src/`.
+"scripts/**" = ["S", "PLC0415", "T20", "PLR2004"]
 # Greek-letter character classes in the symbol-definition regexes are intentional.
 "src/creative_agent/harness/consistency.py" = ["RUF001"]
 # The pipeline orchestrates many injected components; the arg/statement counts are the

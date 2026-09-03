@@ -398,3 +398,56 @@ class TestTheEscalationExitCodeIsMapped:
         monkeypatch.setattr(pipeline_module.ReviewPipeline, "run", escalating)
         result = runner.invoke(app, ["review", str(env), "--offline", "--reset-state"])
         assert result.exit_code == int(ExitCode.BLOCKER_OR_STOP), result.output
+
+
+class TestAssetsCommandEnforcesBodyReferences:
+    """G6: the DEC-F29 checks were opt-in, and nothing held the opt-in.
+
+    Replacing the CLI's `collect(target, references=...)` with `collect(target)` left all
+    25 asset-reference tests green while `make assets` silently stopped checking every
+    asset body — because the end-to-end test built its own `ReferenceContext` instead of
+    going through the CLI. Third instance on this branch of "the leaf is tested, the
+    opt-in is not", and the parameter defaults to skipping the check.
+    """
+
+    @staticmethod
+    def _claude_tree(tmp_path: Path, body: str) -> Path:
+        claude = tmp_path / ".claude"
+        skill = claude / "skills" / "probe"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: probe\ndescription: >\n  A probe skill with a long enough "
+            "description to be trigger-worthy for the validator.\n---\n\n" + body,
+            encoding="utf-8",
+        )
+        (claude / "agents").mkdir()
+        (claude / "agents" / "probe-agent.md").write_text(
+            "---\nname: probe-agent\ndescription: >\n  A probe agent with a long enough "
+            "description to be trigger-worthy for the validator.\n---\n\nBody.\n",
+            encoding="utf-8",
+        )
+        hooks = claude / "hooks"
+        hooks.mkdir()
+        hook = hooks / "probe.sh"
+        hook.write_text("#!/usr/bin/env bash\nset -e\n", encoding="utf-8")
+        hook.chmod(0o755)
+        (claude / "settings.json").write_text("{}\n", encoding="utf-8")
+        return claude
+
+    def test_a_stale_path_reference_fails_the_cli(self, tmp_path: Path) -> None:
+        claude = self._claude_tree(tmp_path, "Run `scripts/does-not-exist.py` first.\n")
+        result = runner.invoke(app, ["assets", "validate", "--claude-dir", str(claude)])
+        assert result.exit_code != 0, result.output
+        assert "does-not-exist.py" in result.output
+
+    def test_an_unregistered_subcommand_fails_the_cli(self, tmp_path: Path) -> None:
+        claude = self._claude_tree(tmp_path, "Run `creative-agent verify-everything`.\n")
+        result = runner.invoke(app, ["assets", "validate", "--claude-dir", str(claude)])
+        assert result.exit_code != 0, result.output
+        assert "verify-everything" in result.output
+
+    def test_a_clean_asset_tree_passes(self, tmp_path: Path) -> None:
+        """The control: the failures above must come from the reference, not the fixture."""
+        claude = self._claude_tree(tmp_path, "Run `make gate` before pushing.\n")
+        result = runner.invoke(app, ["assets", "validate", "--claude-dir", str(claude)])
+        assert result.exit_code == 0, result.output

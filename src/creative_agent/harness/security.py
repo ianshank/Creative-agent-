@@ -20,7 +20,12 @@ from urllib.parse import urlparse
 from pydantic import BaseModel
 
 from creative_agent.harness.canonical import DEFAULT_IDENTIFIER_AUTHORITIES
-from creative_agent.harness.policy import EVIDENCE_SCHEMES, URL_PATTERN
+from creative_agent.harness.policy import (
+    EVIDENCE_SCHEMES,
+    URL_PATTERN,
+    host_matches_suffix,
+    host_of,
+)
 from creative_agent.models.oracle import OracleTable
 
 _URL = URL_PATTERN
@@ -84,11 +89,10 @@ DEFAULT_BLOCKED_HOST_SUFFIXES: tuple[str, ...] = (
 )
 
 
-def _host_of(url: str) -> str | None:
-    try:
-        return (urlparse(url).hostname or "").lower() or None
-    except ValueError:
-        return None
+# One definition, shared with the bibliography checker and the identifier authority check
+# (DEC-F32). Three copies existed and only two were guarded, so a bracketed IPv6 URL in an
+# artifact crashed the deterministic sweep with exit 5.
+_host_of = host_of
 
 
 def is_fetch_allowed(url: str, allowlist: list[str]) -> bool:
@@ -287,9 +291,7 @@ def is_internal_host(host: str, blocked_suffixes: tuple[str, ...]) -> bool:
             or address.is_reserved
             or address.is_unspecified
         )
-    if any(
-        candidate == suffix.lstrip(".") or candidate.endswith(suffix) for suffix in blocked_suffixes
-    ):
+    if any(host_matches_suffix(candidate, suffix) for suffix in blocked_suffixes):
         return True
     return "." not in candidate
 
@@ -445,10 +447,27 @@ class ThreatGuard:
         return model.model_copy(update=updates) if updates else model
 
     def _launder_value(self, value: object, exclude: frozenset[str]) -> object:
+        """Recurse through every container shape a model field can hold.
+
+        `dict` and `tuple` were missing, so DEC-F22's "any model output model is covered
+        the day it is added" was true of `str`, `BaseModel` and `list` and false of the
+        other two. No report field is dict-typed today — `models/gates.py` already has one
+        on a model the LLM writes — which is exactly why the gap mattered: the guarantee is
+        what the next person relies on when they add one, and a boundary with holes in it
+        is a field list wearing a boundary's name.
+        """
         if isinstance(value, str):
             return self.launder_prose(value)
         if isinstance(value, BaseModel):
             return self.launder_model(value, exclude)
         if isinstance(value, list):
             return [self._launder_value(item, exclude) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._launder_value(item, exclude) for item in value)
+        if isinstance(value, dict):
+            # Keys as well as values: a key is model-chosen text that a renderer can emit.
+            return {
+                self._launder_value(key, exclude): self._launder_value(item, exclude)
+                for key, item in value.items()
+            }
         return value

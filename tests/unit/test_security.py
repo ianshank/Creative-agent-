@@ -3,7 +3,9 @@
 from pathlib import Path
 
 import pytest
+from pydantic import Field
 
+from creative_agent.harness.policy import host_matches_suffix, host_of
 from creative_agent.harness.security import (
     DEFAULT_BLOCKED_HOST_SUFFIXES,
     ThreatGuard,
@@ -13,6 +15,8 @@ from creative_agent.harness.security import (
     is_internal_host,
     is_path_within_roots,
 )
+from creative_agent.harness.sourcequality import SourceQualityChecker
+from creative_agent.models.base import SchemaModel
 from tests.factories import make_oracle, make_row, make_source
 
 
@@ -474,3 +478,103 @@ class TestLaunderProseRemovesLayoutCharacters:
     def test_the_length_cap_still_applies(self) -> None:
         guard = ThreatGuard(make_oracle(), max_prose_chars=10)
         assert len(guard.launder_prose("x" * 100)) == 10
+
+
+class TestUrlParsingCannotCrashAReview:
+    """DEC-F32: one unguarded `urlparse` of three ended reviews with exit 5.
+
+    `URL_PATTERN` excludes `]` from its character class, so `http://[::1]/health` in an
+    artifact matches as `http://[::1` — an unbalanced bracket that `urlparse` rejects with
+    `ValueError("Invalid IPv6 URL")`. `security` and `canonical` guarded the call;
+    `sourcequality` did not, and it runs in the *deterministic* sweep, so an ordinary
+    sentence in a reviewed document crashed an offline review with "unexpected error".
+
+    Three copies of one call, two of them right, is the drift `policy.py` exists to stop —
+    so these are tested at the shared helper and at each caller.
+    """
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://[::1",  # what URL_PATTERN actually captures from `http://[::1]/x`
+            "http://[fe80::1%25eth0",
+            "http://",
+            "https://",
+            "not-a-url-at-all",
+        ],
+    )
+    def test_a_malformed_url_yields_no_host_rather_than_raising(self, url: str) -> None:
+        assert host_of(url) is None
+
+    def test_a_bracketed_ipv6_url_in_an_artifact_does_not_crash_the_sweep(self) -> None:
+        """The end-to-end shape of the defect, at the checker that had the unguarded copy."""
+        checker = SourceQualityChecker(make_oracle().source_quality)
+        text = "The service listens on http://[::1]/health for probes."
+        assert checker.check(text) == []
+        assert checker.vendor_urls(text) == []
+
+    def test_a_malformed_url_does_not_crash_the_allowlist_harvester(self) -> None:
+        guard = ThreatGuard(make_oracle(), max_prose_chars=4000)
+        text = "See http://[::1]/health and https://arxiv.org/abs/2001.00001."
+        assert "arxiv.org" in guard.fetch_domain_allowlist(text)
+
+    @pytest.mark.parametrize(
+        ("host", "suffix", "expected"),
+        [
+            ("export.arxiv.org", "arxiv.org", True),
+            ("arxiv.org", "arxiv.org", True),
+            ("notarxiv.org", "arxiv.org", False),
+            ("EXPORT.ARXIV.ORG", "arxiv.org", True),
+            ("box.internal", ".internal", True),
+            ("box.internal", "internal", True),
+            ("notinternal", ".internal", False),
+            ("anything", "", False),
+        ],
+    )
+    def test_suffix_matching_is_anchored_and_leading_dot_tolerant(
+        self, host: str, suffix: str, expected: bool
+    ) -> None:
+        """The three former copies disagreed: only one handled a leading dot, and an
+        unanchored `endswith` made `notlocalhost` an internal host."""
+        assert host_matches_suffix(host, suffix) is expected
+
+
+class TestTheLaunderingBoundaryCoversEveryContainerShape:
+    """DEC-F22 promised "any model output model"; dict and tuple were not covered.
+
+    `_launder_value` recursed through `str`, `BaseModel` and `list` and returned `dict`
+    and `tuple` untouched — so a bidi override or a newline in a dict-valued field reached
+    the report intact. No report field is dict-typed today, and `models/gates.py` already
+    has one on a model the LLM writes: the guarantee is what the next person relies on
+    when they add one, which is precisely why a boundary with holes is worse than an
+    honest field list.
+    """
+
+    BIDI = "\u202e"
+    ZERO_WIDTH = "\u200b"
+
+    class _Nested(SchemaModel):
+        notes: dict[str, str] = Field(default_factory=dict)
+        tags: tuple[str, ...] = ()
+
+    def _guard(self) -> ThreatGuard:
+        return ThreatGuard(make_oracle(), max_prose_chars=4000)
+
+    def test_a_dict_valued_field_is_laundered(self) -> None:
+        model = self._Nested(notes={"a": f"evil{self.BIDI}text\nrow"})
+        laundered = self._guard().launder_model(model)
+        value = laundered.notes["a"]
+        assert self.BIDI not in value
+        assert "\n" not in value
+
+    def test_a_dict_key_is_laundered_too(self) -> None:
+        """A key is model-chosen text a renderer can emit."""
+        model = self._Nested(notes={f"key{self.ZERO_WIDTH}": "fine"})
+        laundered = self._guard().launder_model(model)
+        assert all(self.ZERO_WIDTH not in key for key in laundered.notes)
+
+    def test_a_tuple_valued_field_is_laundered_and_stays_a_tuple(self) -> None:
+        model = self._Nested(tags=(f"evil{self.BIDI}text", "clean"))
+        laundered = self._guard().launder_model(model)
+        assert isinstance(laundered.tags, tuple)
+        assert self.BIDI not in laundered.tags[0]

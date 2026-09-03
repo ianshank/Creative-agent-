@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from urllib.parse import urlparse
 
 # Schemes a fetch may use, and the only schemes whose results are retrieval evidence.
 # A `file://` or `ftp://` target is never evidence for a scholarly identifier, whatever
@@ -40,6 +41,39 @@ EVIDENCE_SCHEMES = frozenset({"http", "https"})
 # class excludes the characters that ordinarily terminate a URL in prose — quotes, angle
 # brackets, and the closing halves of brackets a citation is wrapped in.
 URL_PATTERN = re.compile(r"https?://[^\s\"'<>\])]+", re.IGNORECASE)
+
+
+def host_of(url: str) -> str | None:
+    """The lowercased hostname of `url`, or None when it has none or will not parse.
+
+    Guarded, because `urlparse` raises. `URL_PATTERN` excludes `]` from its character
+    class, so `http://[::1]/health` in an artifact matches as `http://[::1` — an unbalanced
+    bracket that `urlparse` rejects with `ValueError("Invalid IPv6 URL")`. That fired in
+    the *deterministic* source-quality sweep, so an ordinary sentence in a reviewed
+    document ended an offline review with exit 5, "unexpected error" — the same
+    misclassification DEC-F24 closed for a different module.
+
+    This existed three times: guarded in `security` and `canonical`, unguarded in
+    `sourcequality`. One definition is the fix, not a fourth `try/except` (DEC-F32).
+    """
+    try:
+        return (urlparse(url).hostname or "").lower() or None
+    except ValueError:
+        return None
+
+
+def host_matches_suffix(host: str, suffix: str) -> bool:
+    """True when `host` is `suffix` itself or a subdomain of it.
+
+    Anchored on a dot so `notarxiv.org` cannot pass as `arxiv.org` while
+    `export.arxiv.org` does, and tolerant of a leading dot in the suffix so `.internal`
+    and `internal` mean the same thing. This was written three times with three different
+    shapes — only one of which handled the leading dot — which is the drift this module
+    exists to stop (DEC-F32).
+    """
+    normalized = suffix.lstrip(".").lower()
+    candidate = host.lower()
+    return bool(normalized) and (candidate == normalized or candidate.endswith(f".{normalized}"))
 
 
 def fold_name(text: str) -> str:

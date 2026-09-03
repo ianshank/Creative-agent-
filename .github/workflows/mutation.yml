@@ -33,14 +33,10 @@ jobs:
           enable-cache: true
       - run: uv python install 3.11
       - run: uv sync --all-extras --locked
+      # One definition of the gate, in the Makefile — the rule CLAUDE.md and the Makefile
+      # header both state, and which this workflow restated in four steps until DEC-F37.
+      # `make mutation` runs mutmut, reports, exports the stats and enforces the baseline
+      # in that order, so the four steps were a copy that could drift. The drift guard in
+      # tests/unit/test_project_config.py now reads every workflow, not only ci.yml.
       - name: Run mutation testing on the enforcement core
-        run: uv run mutmut run --max-children 4
-      - name: Report results
-        if: always()
-        run: uv run mutmut results || true
-      - name: Export CI/CD stats
-        if: always()
-        run: uv run mutmut export-cicd-stats
-      - name: Enforce the kill-rate baseline
-        if: always()
-        run: uv run python scripts/check_mutation_baseline.py
+        run: make mutation

@@ -12,8 +12,11 @@ from __future__ import annotations
 import json
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
+from scripts import verify_guard
 from scripts.verify_guard import (
     EXIT_CANNOT_CHECK,
     EXIT_GUARD_HOLDS,
@@ -171,3 +174,102 @@ class TestSpecFiles:
         spec.write_text(json.dumps({"name": "x", "tests": ["a"]}), encoding="utf-8")
         with pytest.raises(SystemExit, match="needs both"):
             load_spec(spec)
+
+
+class TestARevertThatDoesNotRunIsNotAKill:
+    """The tool's own worst failure: reporting GUARD HOLDS for a broken revert.
+
+    `run_tests` used to return `returncode == 0`, so *any* nonzero pytest exit read as
+    "the named tests failed" and therefore as "the guard holds". pytest exits nonzero for
+    collection errors (2), internal errors (3), usage errors (4) and no-tests-collected
+    (5) — none of which is a test expressing an opinion.
+
+    Reproduced against this very tool: a revert deleting an `if` header leaves an
+    `IndentationError`, and the canonical *weak* test — the one asserting its own input,
+    which this file elsewhere requires be reported weak — was certified as holding.
+
+    This is the direction that matters. A tool that under-reports gets ignored; a tool
+    that hands out false reassurance gets believed, and it is the instrument that
+    `CLAUDE.md`, the `guard-check` skill and the `gap-auditor` agent all now rest on.
+    """
+
+    def test_a_revert_that_breaks_the_syntax_cannot_read_as_holding(self, toy: Path) -> None:
+        (toy / "test_weak.py").write_text(WEAK_TEST + "\n", encoding="utf-8")
+        args = [
+            "--file",
+            "toy.py",
+            "--find",
+            '    if name == "StructuredOutput":',
+            "--replace",
+            "",
+            "--test",
+            "test_weak.py",
+        ]
+        assert main(args) == EXIT_CANNOT_CHECK
+
+    def test_a_revert_that_empties_the_selector_is_reported_as_cannot_check(
+        self, toy: Path
+    ) -> None:
+        """pytest exits 5 for "no tests ran". A selector matching nothing must never be
+        read as a passing baseline or as a caught revert."""
+        (toy / "test_strong.py").write_text(STRONG_TEST + "\n", encoding="utf-8")
+        args = _revert_args(toy, "test_strong.py::TestNoSuchClass")
+        assert main(args) == EXIT_CANNOT_CHECK
+
+    def test_a_still_running_revert_is_still_reported_normally(self, toy: Path) -> None:
+        """The refusal must not swallow the real verdicts.
+
+        Deleting the `return True` leaves valid syntax and removes the behaviour, so the
+        strong test must still be reported as holding — a tool that answers CANNOT CHECK
+        to everything is as useless as one that answers HOLDS to everything.
+        """
+        (toy / "test_strong.py").write_text(STRONG_TEST + "\n", encoding="utf-8")
+        args = [
+            "--file",
+            "toy.py",
+            "--find",
+            "        return True\n",
+            "--replace",
+            "        return False\n",
+            "--test",
+            "test_strong.py",
+        ]
+        assert main(args) == EXIT_GUARD_HOLDS
+
+    def test_the_child_run_is_not_subject_to_the_repositorys_coverage_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--no-cov` and the coverage-env scrub are both load-bearing and both invisible.
+
+        Without `--no-cov` an in-repo baseline fails on the coverage floor and every guard
+        reports exit 2. Without the env scrub the child inherits pytest-cov's subprocess
+        instrumentation and corrupts the PARENT's measurement — which it did, making
+        `cli.py` swing between 88% and 69% across identical runs until the floors started
+        failing on a different module each time. A gate that fails at random gets switched
+        off, which is the failure this whole tool is about.
+        """
+        captured: dict[str, Any] = {}
+
+        def fake_run(argv: list[str], **kwargs: Any) -> Any:
+            captured["argv"] = argv
+            captured["env"] = kwargs.get("env", {})
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        monkeypatch.setattr(verify_guard.subprocess, "run", fake_run)
+        monkeypatch.setenv("COVERAGE_FILE", "/tmp/should-not-propagate")
+        monkeypatch.setenv("COV_CORE_SOURCE", "creative_agent")
+        verify_guard.run_tests(("some_test.py",))
+        assert "--no-cov" in captured["argv"]
+        assert not {"COVERAGE_FILE", "COV_CORE_SOURCE"} & set(captured["env"])
+
+    def test_a_file_that_cannot_be_restored_is_reported_as_cannot_check(
+        self, toy: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A silent failed restore leaves the operator committing a reverted tree."""
+        (toy / "test_strong.py").write_text(STRONG_TEST + "\n", encoding="utf-8")
+        original_restore = verify_guard.restore
+        monkeypatch.setattr(verify_guard, "restore", lambda originals: None)
+        try:
+            assert main(_revert_args(toy, "test_strong.py")) == EXIT_CANNOT_CHECK
+        finally:
+            original_restore({toy / "toy.py": SOURCE + "\n"})
